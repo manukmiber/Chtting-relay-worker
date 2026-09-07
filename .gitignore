@@ -1,0 +1,20 @@
+node_modules/
+npm-debug.log*
+
+# runtime state (never commit)
+config/config.json
+config/*.local.json
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.jsonl
+data/logs/
+data/tokenizers/*
+!data/tokenizers/.gitkeep
+data/tunnel/
+*.pid
+
+.env
+.env.*
+.DS_Store
