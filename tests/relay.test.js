@@ -244,6 +244,36 @@ test('a streaming backend can be buffered into one response, still measuring TTF
   assert.ok(row.ttft_ms >= 40, `TTFT is measured even for buffered replies, got ${row.ttft_ms}`);
 });
 
+test('multi-byte characters survive a stream torn mid-character', async (t) => {
+  // 7-byte network slices land inside the 3-byte and 4-byte sequences below
+  const reply = '你好世界！Halo dunia — émoji 🚀🔥 selesai.';
+  const s = await setup({ text: reply, byteChunkSize: 7, chunkDelayMs: 1 });
+  t.after(() => s.close());
+
+  const res = await s.call({ model: PUBLIC_MODEL, messages: [{ role: 'user', content: '你好' }], stream: true });
+  const raw = await res.text();
+  assert.equal(collectStreamText(raw), reply, 'no replacement characters from a torn UTF-8 sequence');
+  assert.ok(!raw.includes('\ufffd'), 'the stream carries no U+FFFD replacement characters');
+
+  const row = s.env.app.store.list({ limit: 1 }).rows[0];
+  assert.equal(row.status, 200);
+  assert.ok(row.completion_tokens > 0);
+});
+
+test('multi-byte content is counted with the backend vocabulary', async (t) => {
+  const s = await setup({ text: '你好世界' }, { tokenizer: 'deepseek' });
+  t.after(() => s.close());
+
+  const res = await s.call({ model: PUBLIC_MODEL, messages: [{ role: 'user', content: '你好世界，这是测试。' }] });
+  assert.equal(res.status, 200);
+
+  const row = s.env.app.store.list({ limit: 1 }).rows[0];
+  // falls back to the estimator when the vocabulary is not installed, which is
+  // still a real count - only the `exact` flag differs
+  assert.ok(row.local_prompt > 0);
+  assert.ok(['deepseek', 'approx'].includes(row.tokenizer));
+});
+
 test('enforces the per-model input token ceiling', async (t) => {
   const s = await setup({}, { limits: { maxInputTokens: 5, maxOutputTokens: 0 } });
   t.after(() => s.close());

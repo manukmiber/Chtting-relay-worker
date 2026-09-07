@@ -13,6 +13,9 @@ export async function startMockBackend({
   usage = { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
   status = 200,
   errorBody = null,
+  // write the SSE bytes in fixed-size slices, so a multi-byte character can be
+  // torn across two network chunks the way a real network does it
+  byteChunkSize = 0,
 } = {}) {
   const received = [];
 
@@ -54,7 +57,13 @@ export async function startMockBackend({
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     });
-    const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    const send = (obj) => {
+      const frame = Buffer.from(`data: ${JSON.stringify(obj)}\n\n`, 'utf8');
+      if (!byteChunkSize) { res.write(frame); return; }
+      for (let i = 0; i < frame.length; i += byteChunkSize) {
+        res.write(frame.subarray(i, i + byteChunkSize));
+      }
+    };
     const base = { id: 'chatcmpl-mock', object: 'chat.completion.chunk', created: 1700000000, model: body.model };
 
     await sleep(firstChunkDelayMs);
