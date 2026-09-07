@@ -33,13 +33,24 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # Only first-party actions plus the runner's own rustup: a repository
+      # that restricts which actions may run would refuse this workflow at
+      # startup if it depended on third-party ones.
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
         with:
-          key: release-${{ matrix.arch }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.arch }}-
 
       # The runner exports ANDROID_NDK_LATEST_HOME, which the script finds.
       - name: Cross-compile
