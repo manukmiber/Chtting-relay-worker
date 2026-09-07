@@ -91,13 +91,12 @@ impl Upstream {
     pub fn endpoint_url(backend: &Backend, endpoint: &str) -> String {
         let base = backend.base_url.trim_end_matches('/');
         let path = endpoint.trim_start_matches('/');
-        let already_versioned = base
-            .rsplit('/')
-            .next()
-            .is_some_and(|last| {
-                let mut chars = last.chars();
-                chars.next() == Some('v') && chars.clone().count() > 0 && chars.all(|c| c.is_ascii_digit())
-            });
+        let already_versioned = base.rsplit('/').next().is_some_and(|last| {
+            let mut chars = last.chars();
+            chars.next() == Some('v')
+                && chars.clone().count() > 0
+                && chars.all(|c| c.is_ascii_digit())
+        });
         if already_versioned {
             // Drop a leading version segment from the endpoint.
             let trimmed = match path.split_once('/') {
@@ -123,7 +122,11 @@ impl Upstream {
             .header("content-type", "application/json")
             .header(
                 "accept",
-                if stream { "text/event-stream" } else { "application/json" },
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
             );
 
         for (k, v) in &backend.headers {
@@ -166,8 +169,7 @@ impl Upstream {
                     let status = res.status().as_u16();
                     let retryable = status == 429 || status >= 500;
                     if attempt < max_attempts && retryable {
-                        let wait = retry_after(&res)
-                            .unwrap_or_else(|| backoff(attempt));
+                        let wait = retry_after(&res).unwrap_or_else(|| backoff(attempt));
                         self.logger.warn(format!(
                             "upstream {} returned {status}, retry {attempt}/{} in {}ms",
                             backend.id,
@@ -199,7 +201,11 @@ impl Upstream {
             message: format!(
                 "backend \"{}\" unreachable: {}",
                 backend.name,
-                if last_error.is_empty() { "unknown error".into() } else { last_error }
+                if last_error.is_empty() {
+                    "unknown error".into()
+                } else {
+                    last_error
+                }
             ),
             attempts: max_attempts,
         })
@@ -272,9 +278,20 @@ impl Upstream {
             }
         }
 
-        if let Some(Sent::Failed { status, body, backend, .. }) = last_http_failure {
+        if let Some(Sent::Failed {
+            status,
+            body,
+            backend,
+            ..
+        }) = last_http_failure
+        {
             // Report the backend's own status, not a generic 502 over the top.
-            return Ok(Sent::Failed { status, body, backend, attempts });
+            return Ok(Sent::Failed {
+                status,
+                body,
+                backend,
+                attempts,
+            });
         }
         Err(UpstreamError {
             status: 502,
@@ -332,7 +349,10 @@ mod tests {
     #[test]
     fn a_base_url_that_already_carries_a_version_is_not_doubled() {
         assert_eq!(
-            Upstream::endpoint_url(&backend("https://api.deepseek.com/v1"), "v1/chat/completions"),
+            Upstream::endpoint_url(
+                &backend("https://api.deepseek.com/v1"),
+                "v1/chat/completions"
+            ),
             "https://api.deepseek.com/v1/chat/completions"
         );
         assert_eq!(

@@ -329,7 +329,10 @@ pub struct Defaults {
 pub struct RequestTransform {
     /// `Some(Some(true))` always streams upstream, `Some(Some(false))` never
     /// does, `Some(None)` explicitly follows the caller, `None` inherits.
-    #[serde(deserialize_with = "double_option::deserialize", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        deserialize_with = "double_option::deserialize",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub force_stream: Option<Option<bool>>,
     pub drop_params: Option<Vec<String>>,
     pub rename_params: Option<BTreeMap<String, String>>,
@@ -341,10 +344,7 @@ impl RequestTransform {
     /// Field-by-field override of the global defaults.
     pub fn merged(defaults: &Self, route: &Self) -> ResolvedRequestTransform {
         ResolvedRequestTransform {
-            force_stream: route
-                .force_stream
-                .or(defaults.force_stream)
-                .flatten(),
+            force_stream: route.force_stream.or(defaults.force_stream).flatten(),
             drop_params: route
                 .drop_params
                 .clone()
@@ -592,10 +592,11 @@ impl Config {
         if want.is_empty() {
             return None;
         }
-        self.models
-            .iter()
-            .find(|m| m.id == want)
-            .or_else(|| self.models.iter().find(|m| m.aliases.iter().any(|a| a == want)))
+        self.models.iter().find(|m| m.id == want).or_else(|| {
+            self.models
+                .iter()
+                .find(|m| m.aliases.iter().any(|a| a == want))
+        })
     }
 
     pub fn find_backend(&self, id: &str) -> Option<&Backend> {
@@ -635,8 +636,9 @@ impl ConfigStore {
     pub async fn load(file: &Path) -> Result<Self> {
         let cfg = if tokio::fs::try_exists(file).await.unwrap_or(false) {
             let raw = tokio::fs::read_to_string(file).await?;
-            let parsed: Value = serde_json::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("config at {} is not valid JSON: {e}", file.display()))?;
+            let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
+                anyhow::anyhow!("config at {} is not valid JSON: {e}", file.display())
+            })?;
             let merged = deep_merge(&serde_json::to_value(Config::default())?, &parsed);
             normalize(serde_json::from_value(merged)?)
         } else {
@@ -797,7 +799,11 @@ pub fn normalize(mut cfg: Config) -> Config {
             b.id = new_id("be");
         }
         if b.name.is_empty() {
-            b.name = if b.id.is_empty() { "backend".into() } else { b.id.clone() };
+            b.name = if b.id.is_empty() {
+                "backend".into()
+            } else {
+                b.id.clone()
+            };
         }
         if b.kind.is_empty() {
             b.kind = "openai".into();

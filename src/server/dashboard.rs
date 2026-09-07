@@ -23,7 +23,9 @@ use crate::config::{mask_item, unmask_secrets};
 use crate::state::AppState;
 use crate::store::schema;
 use crate::tokenizer::chat::PROFILE_NAMES;
-use crate::util::{new_client_key, new_id, percentile, random_hex, round, safe_equal, start_of_today};
+use crate::util::{
+    new_client_key, new_id, percentile, random_hex, round, safe_equal, start_of_today,
+};
 
 /// The dashboard's assets, compiled into the binary so there is no "where did
 /// `public/` go" failure mode when the relay is started from another directory.
@@ -55,9 +57,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/state", get(app_state))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/models", get(list_collection).post(upsert_collection))
-        .route("/api/backends", get(list_collection).post(upsert_collection))
+        .route(
+            "/api/backends",
+            get(list_collection).post(upsert_collection),
+        )
         .route("/api/keys", get(list_collection).post(upsert_collection))
-        .route("/api/systemPrompts", get(list_collection).post(upsert_collection))
+        .route(
+            "/api/systemPrompts",
+            get(list_collection).post(upsert_collection),
+        )
         .route("/api/{collection}/{id}", delete(delete_item))
         .route("/api/keys/generate", post(generate_key))
         .route("/api/keys/{id}/reveal", get(reveal_key))
@@ -132,10 +140,7 @@ fn error(status: u16, message: &str) -> Response {
         .into_response()
 }
 
-async fn login(
-    State(dash): State<Arc<Dashboard>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn login(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> Response {
     let cfg = dash.state.config.current();
     let expected = &cfg.dashboard.password;
     let given = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
@@ -275,10 +280,7 @@ async fn list_collection(State(dash): State<Arc<Dashboard>>, request: Request) -
     Json(dash.state.config.redacted()[name].clone()).into_response()
 }
 
-async fn upsert_collection(
-    State(dash): State<Arc<Dashboard>>,
-    request: Request,
-) -> Response {
+async fn upsert_collection(State(dash): State<Arc<Dashboard>>, request: Request) -> Response {
     let name = collection_name(request.uri().path()).to_string();
     let body = match read_json(request).await {
         Ok(v) => v,
@@ -509,18 +511,30 @@ fn summary(conn: &rusqlite::Connection, since: i64, until: i64) -> anyhow::Resul
     let mut total = Vec::new();
     let mut tps = Vec::new();
     for row in stmt.query_map([since, until], |r| {
-        Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+        Ok((
+            r.get::<_, f64>(0)?,
+            r.get::<_, f64>(1)?,
+            r.get::<_, f64>(2)?,
+        ))
     })? {
         let (a, b, c) = row?;
-        if a > 0.0 { ttft.push(a); }
-        if b > 0.0 { total.push(b); }
-        if c > 0.0 { tps.push(c); }
+        if a > 0.0 {
+            ttft.push(a);
+        }
+        if b > 0.0 {
+            total.push(b);
+        }
+        if c > 0.0 {
+            tps.push(c);
+        }
     }
     for v in [&mut ttft, &mut total, &mut tps] {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    let SummaryRow { requests, errors, .. } = row;
+    let SummaryRow {
+        requests, errors, ..
+    } = row;
     Ok(json!({
         "requests": requests,
         "users": row.users,
@@ -702,7 +716,13 @@ async fn stats_by(
                         .get("name")
                         .and_then(|v| v.as_str())
                         .and_then(|id| cfg.keys.iter().find(|k| k.id == id))
-                        .map(|k| if k.label.is_empty() { k.id.clone() } else { k.label.clone() });
+                        .map(|k| {
+                            if k.label.is_empty() {
+                                k.id.clone()
+                            } else {
+                                k.label.clone()
+                            }
+                        });
                     if let (Some(map), Some(label)) = (row.as_object_mut(), label) {
                         map.insert("label".into(), Value::String(label));
                     }
@@ -792,7 +812,10 @@ async fn list_requests(
 
             let mut stmt = conn.prepare(&sql)?;
             let rows: Vec<Value> = stmt
-                .query_map(rusqlite::params_from_iter(page_args.iter()), schema::row_to_json)?
+                .query_map(
+                    rusqlite::params_from_iter(page_args.iter()),
+                    schema::row_to_json,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
             Ok(json!({ "rows": rows, "total": total }))
@@ -814,9 +837,7 @@ async fn get_request(State(dash): State<Arc<Dashboard>>, Path(id): Path<String>)
                 "SELECT {} FROM requests WHERE id = ?1",
                 schema::select_columns()
             );
-            let row = conn
-                .query_row(&sql, [&id], schema::row_to_json)
-                .ok();
+            let row = conn.query_row(&sql, [&id], schema::row_to_json).ok();
             Ok(row)
         })
         .await;
@@ -837,10 +858,11 @@ async fn prune(State(dash): State<Arc<Dashboard>>) -> Response {
         .state
         .store
         .read(move |conn| {
-            let removed: i64 =
-                conn.query_row("SELECT COUNT(*) FROM requests WHERE ts < ?1", [cutoff], |r| {
-                    r.get(0)
-                })?;
+            let removed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM requests WHERE ts < ?1",
+                [cutoff],
+                |r| r.get(0),
+            )?;
             conn.execute("DELETE FROM requests WHERE ts < ?1", [cutoff])?;
             if removed > 0 {
                 conn.execute_batch("VACUUM;")?;
@@ -962,7 +984,10 @@ async fn tokenizer_count(State(dash): State<Arc<Dashboard>>, Json(body): Json<Va
 ///
 /// The Node version shelled out to a helper script; doing it natively is why
 /// the Rust build needs no Node on the phone at all.
-async fn tokenizer_install(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> Response {
+async fn tokenizer_install(
+    State(dash): State<Arc<Dashboard>>,
+    Json(body): Json<Value>,
+) -> Response {
     let state = &dash.state;
     let str_field = |key: &str| {
         body.get(key)
@@ -973,9 +998,8 @@ async fn tokenizer_install(State(dash): State<Arc<Dashboard>>, Json(body): Json<
     };
 
     let (url, name) = if let Some(repo) = str_field("hf") {
-        let name = str_field("as").unwrap_or_else(|| {
-            repo.rsplit('/').next().unwrap_or(&repo).to_lowercase()
-        });
+        let name = str_field("as")
+            .unwrap_or_else(|| repo.rsplit('/').next().unwrap_or(&repo).to_lowercase());
         (crate::tokenizer::registry::hf_url(&repo), name)
     } else if let Some(url) = str_field("url") {
         match str_field("as") {
@@ -1006,7 +1030,10 @@ async fn tokenizer_install(State(dash): State<Arc<Dashboard>>, Json(body): Json<
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return error(400, "the name may only contain letters, digits, dot, dash and underscore");
+        return error(
+            400,
+            "the name may only contain letters, digits, dot, dash and underscore",
+        );
     }
 
     let dir = state.counter.registry.dir().to_path_buf();
@@ -1123,7 +1150,10 @@ async fn playground(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>)
     let mut req = state
         .upstream
         .client()
-        .post(format!("http://127.0.0.1:{}/v1/chat/completions", cfg.server.port))
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            cfg.server.port
+        ))
         .timeout(std::time::Duration::from_secs(300))
         .json(&payload);
     if let Some(key) = key {

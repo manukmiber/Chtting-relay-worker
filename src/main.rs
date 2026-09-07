@@ -210,7 +210,9 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
         env!("CARGO_PKG_VERSION"),
         cfg.models.iter().filter(|m| m.enabled).count(),
         cfg.backends.iter().filter(|b| b.enabled).count(),
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
     ));
 
     if cfg.models.is_empty() {
@@ -219,9 +221,11 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
 
     // The public, tunnel-facing server.
     let relay_addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
-    let relay = tokio::net::TcpListener::bind(relay_addr).await.map_err(|err| {
-        anyhow::anyhow!("cannot bind {relay_addr}: {err} — is another copy already running?")
-    })?;
+    let relay = tokio::net::TcpListener::bind(relay_addr)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("cannot bind {relay_addr}: {err} — is another copy already running?")
+        })?;
     let relay_bound = relay.local_addr()?;
     logger.info(format!("relay listening on http://{relay_bound}"));
 
@@ -245,7 +249,9 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
                     listener.local_addr()?
                 ));
                 let app = server::dashboard::router(state.clone());
-                dashboard_task = Some(tokio::spawn(async move { axum::serve(listener, app).await }));
+                dashboard_task = Some(tokio::spawn(
+                    async move { axum::serve(listener, app).await },
+                ));
             }
             Err(err) => logger.error(format!("cannot bind the dashboard on {addr}: {err}")),
         }
@@ -281,6 +287,8 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
         _ = tokio::signal::ctrl_c() => {
             logger.info("shutting down");
             let _ = state.tunnel.stop().await;
+            // Commit whatever the metrics writer still had queued.
+            state.store.flush().await;
         }
     }
     Ok(())
@@ -290,7 +298,11 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
 
 async fn doctor(paths: Paths) -> Result<()> {
     println!("chtting-relay {}", env!("CARGO_PKG_VERSION"));
-    println!("  platform      {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "  platform      {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     println!(
         "  termux        {}",
         if std::env::var("PREFIX").is_ok_and(|p| p.contains("com.termux")) {
@@ -301,7 +313,9 @@ async fn doctor(paths: Paths) -> Result<()> {
     );
     println!(
         "  cores         {}",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     );
     println!("  config        {}", paths.config.display());
     println!("  data          {}", paths.data.display());
@@ -312,7 +326,10 @@ async fn doctor(paths: Paths) -> Result<()> {
     println!("  backends      {}", cfg.backends.len());
     println!("  client keys   {}", cfg.keys.len());
     println!("  relay port    {}", cfg.server.port);
-    println!("  dashboard     {}:{}", cfg.dashboard.host, cfg.dashboard.port);
+    println!(
+        "  dashboard     {}:{}",
+        cfg.dashboard.host, cfg.dashboard.port
+    );
     println!("  max in flight {}", cfg.server.max_concurrent_requests);
 
     println!("\ntokenizers");
@@ -341,7 +358,10 @@ async fn doctor(paths: Paths) -> Result<()> {
     println!(
         "\ncloudflared     {}",
         if version["installed"] == serde_json::Value::Bool(true) {
-            version["version"].as_str().unwrap_or("installed").to_string()
+            version["version"]
+                .as_str()
+                .unwrap_or("installed")
+                .to_string()
         } else {
             "not installed (pkg install cloudflared)".to_string()
         }
@@ -428,7 +448,9 @@ async fn backend_command(paths: Paths, action: BackendAction) -> Result<()> {
                 kind,
                 ..Default::default()
             };
-            let saved = store.upsert("backends", serde_json::to_value(backend)?).await?;
+            let saved = store
+                .upsert("backends", serde_json::to_value(backend)?)
+                .await?;
             println!(
                 "added backend \"{name}\" with id {}",
                 saved["id"].as_str().unwrap_or("?")
@@ -540,11 +562,18 @@ async fn tokenizer_command(paths: Paths, action: TokenizerAction) -> Result<()> 
 
             tokio::fs::create_dir_all(&paths.tokenizers).await?;
             println!("downloading {url}");
-            let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
+            let bytes = reqwest::get(&url)
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
             // Validate before saving, so a failed download cannot masquerade
             // as an installed vocabulary.
             if tokenizers::Tokenizer::from_bytes(&bytes).is_err() {
-                bail!("downloaded {} bytes, but it is not a valid tokenizer.json", bytes.len());
+                bail!(
+                    "downloaded {} bytes, but it is not a valid tokenizer.json",
+                    bytes.len()
+                );
             }
             let path = paths.tokenizers.join(format!("{save_as}.tokenizer.json"));
             tokio::fs::write(&path, &bytes).await?;

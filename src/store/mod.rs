@@ -32,7 +32,7 @@ const WRITE_BATCH: usize = 128;
 
 pub struct Store {
     file: PathBuf,
-    tx: mpsc::Sender<RequestRecord>,
+    tx: mpsc::Sender<WriteMsg>,
     /// A second connection used only for dashboard reads. SQLite in WAL mode
     /// lets it read while the writer commits.
     reader: Arc<Mutex<Connection>>,
@@ -63,7 +63,7 @@ impl Store {
             .await??
         };
 
-        let (tx, rx) = mpsc::channel::<RequestRecord>(8192);
+        let (tx, rx) = mpsc::channel::<WriteMsg>(8192);
         spawn_writer(path.clone(), rx, logger);
 
         Ok(Arc::new(Self {
@@ -87,7 +87,22 @@ impl Store {
     /// is dropped and said so out loud, because losing a metrics row is always
     /// better than making a user wait on the disk.
     pub fn insert(&self, record: RequestRecord) -> bool {
-        self.tx.try_send(record).is_ok()
+        // Boxed so the channel's slots stay small; the record is 35 fields wide.
+        self.tx.try_send(WriteMsg::Row(Box::new(record))).is_ok()
+    }
+
+    /// Wait until everything queued so far has been committed.
+    ///
+    /// The channel is FIFO, so by the time the writer reaches this marker every
+    /// row sent before it has already been written. Used on shutdown, so a
+    /// Ctrl-C does not discard the last un-committed batch, and by tests that
+    /// need to read back what they just recorded.
+    pub async fn flush(&self) -> bool {
+        let (ack, wait) = tokio::sync::oneshot::channel();
+        if self.tx.send(WriteMsg::Flush(ack)).await.is_err() {
+            return false;
+        }
+        wait.await.is_ok()
     }
 
     /// Run a blocking query against the read connection.
@@ -105,16 +120,26 @@ impl Store {
     }
 }
 
+/// What the writer task accepts.
+enum WriteMsg {
+    Row(Box<RequestRecord>),
+    /// Commit whatever is pending, then answer.
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 fn spawn_writer(
     path: PathBuf,
-    mut rx: mpsc::Receiver<RequestRecord>,
+    mut rx: mpsc::Receiver<WriteMsg>,
     logger: Arc<crate::logging::Logger>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut conn = match Connection::open(&path) {
             Ok(c) => c,
             Err(err) => {
-                logger.error(format!("metrics writer cannot open {}: {err}", path.display()));
+                logger.error(format!(
+                    "metrics writer cannot open {}: {err}",
+                    path.display()
+                ));
                 return;
             }
         };
@@ -129,20 +154,34 @@ fn spawn_writer(
         }
 
         let mut batch: Vec<RequestRecord> = Vec::with_capacity(WRITE_BATCH);
+        let mut acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
         // blocking_recv_many is not available, so drain by hand: take one
         // blocking read, then greedily pull whatever else is already queued.
         while let Some(first) = rx.blocking_recv() {
-            batch.push(first);
+            match first {
+                WriteMsg::Row(record) => batch.push(*record),
+                WriteMsg::Flush(ack) => acks.push(ack),
+            }
             while batch.len() < WRITE_BATCH {
                 match rx.try_recv() {
-                    Ok(next) => batch.push(next),
+                    Ok(WriteMsg::Row(record)) => batch.push(*record),
+                    Ok(WriteMsg::Flush(ack)) => acks.push(ack),
                     Err(_) => break,
                 }
             }
-            if let Err(err) = write_batch(&mut conn, &batch) {
-                logger.error(format!("failed to record {} request(s): {err}", batch.len()));
+            if !batch.is_empty() {
+                if let Err(err) = write_batch(&mut conn, &batch) {
+                    logger.error(format!(
+                        "failed to record {} request(s): {err}",
+                        batch.len()
+                    ));
+                }
+                batch.clear();
             }
-            batch.clear();
+            // Answer only after the commit, so a waiter can read the rows back.
+            for ack in acks.drain(..) {
+                let _ = ack.send(());
+            }
         }
     });
 }
@@ -192,7 +231,11 @@ impl QuotaTracker {
                 )?;
                 let rows = stmt
                     .query_map([&day_owned], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64))
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)? as u64,
+                            r.get::<_, i64>(2)? as u64,
+                        ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)

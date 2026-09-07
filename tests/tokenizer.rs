@@ -66,8 +66,14 @@ fn builtin_vocabularies_produce_the_same_token_ids_not_just_the_same_totals() {
         };
         let encoder = builtin_encoder(name).expect("built in");
         for (i, want) in expected.iter().enumerate() {
-            let Some(want) = want.as_array() else { continue };
-            let want: Vec<u32> = want.iter().filter_map(|v| v.as_u64()).map(|n| n as u32).collect();
+            let Some(want) = want.as_array() else {
+                continue;
+            };
+            let want: Vec<u32> = want
+                .iter()
+                .filter_map(|v| v.as_u64())
+                .map(|n| n as u32)
+                .collect();
             // `pieces` re-splits the text the way the model sees it; joining
             // them back must reproduce the input exactly.
             let pieces = encoder.pieces(&cases[i]);
@@ -100,7 +106,10 @@ async fn installed_huggingface_vocabularies_match_the_reference() {
         }
         let encoder = registry.get(name).await;
         if !encoder.exact() {
-            eprintln!("skipping {name}: no vocabulary installed in {}", dir.display());
+            eprintln!(
+                "skipping {name}: no vocabulary installed in {}",
+                dir.display()
+            );
             continue;
         }
         let expected = expected.as_array().expect("counts are a list");
@@ -128,7 +137,9 @@ fn the_estimator_is_marked_inexact_so_it_is_never_mistaken_for_a_real_count() {
     let n = estimate("halo dunia, ini teks percobaan");
     assert!(n > 0);
     // It should be in the right ballpark for latin text, not wildly off.
-    let real = builtin_encoder("o200k_base").unwrap().count("halo dunia, ini teks percobaan");
+    let real = builtin_encoder("o200k_base")
+        .unwrap()
+        .count("halo dunia, ini teks percobaan");
     let ratio = n as f64 / real as f64;
     assert!(
         (0.5..2.0).contains(&ratio),
@@ -143,13 +154,22 @@ async fn a_missing_vocabulary_degrades_to_the_estimator_rather_than_failing() {
         Logger::console(Level::Silent),
     );
     let encoder = registry.get("definitely-not-installed").await;
-    assert!(!encoder.exact(), "a missing vocabulary must not claim to be exact");
-    assert!(encoder.count("some text") > 0, "it must still produce a number");
+    assert!(
+        !encoder.exact(),
+        "a missing vocabulary must not claim to be exact"
+    );
+    assert!(
+        encoder.count("some text") > 0,
+        "it must still produce a number"
+    );
 }
 
 #[tokio::test]
 async fn counting_a_chat_request_charges_template_overhead_on_top_of_the_text() {
-    let registry = Arc::new(Registry::new(tokenizer_dir(), Logger::console(Level::Silent)));
+    let registry = Arc::new(Registry::new(
+        tokenizer_dir(),
+        Logger::console(Level::Silent),
+    ));
     let counter = TokenCounter::new(registry);
     let cfg = Config::default();
 
@@ -169,23 +189,36 @@ async fn counting_a_chat_request_charges_template_overhead_on_top_of_the_text() 
     assert!(counted.exact, "a built-in vocabulary is always exact");
     assert!(counted.breakdown.system > 0);
     assert!(counted.breakdown.user > 0);
-    assert!(counted.breakdown.overhead > 0, "chat template tokens are billed too");
+    assert!(
+        counted.breakdown.overhead > 0,
+        "chat template tokens are billed too"
+    );
     assert_eq!(counted.total, counted.breakdown.total());
 }
 
 #[test]
 fn a_long_cjk_run_stays_fast_enough_for_a_phone() {
     // The pathological input for a BPE merge loop: one unbroken run with no
-    // whitespace for the pre-tokenizer to split on.
+    // whitespace for the pre-tokenizer to split on. This guards against a
+    // quadratic blowup, so the budget only has to be the right order of
+    // magnitude — and an unoptimised test build is far slower than the release
+    // binary a phone actually runs, so the budget follows the profile.
     let text = "这是一个没有空格的很长的中文句子".repeat(500);
     let encoder = builtin_encoder("o200k_base").unwrap();
+
     let started = std::time::Instant::now();
     let n = encoder.count(&text);
     let elapsed = started.elapsed();
+
     assert!(n > 1000);
+    let budget_ms = if cfg!(debug_assertions) {
+        30_000
+    } else {
+        3_000
+    };
     assert!(
-        elapsed.as_millis() < 3000,
-        "counting {} characters took {elapsed:?}",
+        elapsed.as_millis() < budget_ms,
+        "counting {} characters took {elapsed:?}, over the {budget_ms}ms budget",
         text.chars().count()
     );
 }
@@ -202,5 +235,8 @@ fn the_chat_profiles_differ_in_the_way_their_templates_do() {
     let llama3 = count_chat_request(&body, &encoder, "llama3", &images).total;
 
     assert!(raw < openai, "raw must not add template tokens");
-    assert!(openai < llama3, "llama3 has the heaviest per-message header");
+    assert!(
+        openai < llama3,
+        "llama3 has the heaviest per-message header"
+    );
 }

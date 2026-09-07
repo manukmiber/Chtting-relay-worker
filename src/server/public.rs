@@ -169,10 +169,7 @@ async fn chat_inner(
 
     // Rate limit before doing any work, so a hammering key costs nothing.
     if let Err(retry_after) = state.limiter.check(&key.id, key.quota.requests_per_minute) {
-        let message = format!(
-            "rate limit reached ({}/min)",
-            key.quota.requests_per_minute
-        );
+        let message = format!("rate limit reached ({}/min)", key.quota.requests_per_minute);
         let response = (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", retry_after.to_string())],
@@ -188,11 +185,21 @@ async fn chat_inner(
         return with_cors(&state, &headers, response);
     }
 
-    if body.get("model").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+    if body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
         return with_cors(
             &state,
             &headers,
-            error_response(400, "the \"model\" field is required", "invalid_request_error", None),
+            error_response(
+                400,
+                "the \"model\" field is required",
+                "invalid_request_error",
+                None,
+            ),
         );
     }
 
@@ -257,10 +264,19 @@ async fn embeddings(
         return with_cors(
             &state,
             &headers,
-            error_response(403, &message, "invalid_request_error", Some("model_forbidden")),
+            error_response(
+                403,
+                &message,
+                "invalid_request_error",
+                Some("model_forbidden"),
+            ),
         );
     }
-    let Some(backend) = cfg.find_backend(&route.backend).filter(|b| b.enabled).cloned() else {
+    let Some(backend) = cfg
+        .find_backend(&route.backend)
+        .filter(|b| b.enabled)
+        .cloned()
+    else {
         return with_cors(
             &state,
             &headers,
@@ -275,15 +291,22 @@ async fn embeddings(
     let inputs: Vec<String> = match body.get("input") {
         Some(Value::Array(items)) => items
             .iter()
-            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
             .collect(),
         Some(Value::String(s)) => vec![s.clone()],
         _ => vec![String::new()],
     };
 
-    let resolved = state
-        .counter
-        .resolve(&cfg, &route.upstream_model, &route.tokenizer, &route.chat_profile);
+    let resolved = state.counter.resolve(
+        &cfg,
+        &route.upstream_model,
+        &route.tokenizer,
+        &route.chat_profile,
+    );
     let mut local_prompt = 0usize;
     let mut exact = true;
     let mut tokenizer_name = String::new();
@@ -340,10 +363,17 @@ async fn embeddings(
         day: day_key(started_wall, &tz),
         hour: hour_key(started_wall, &tz),
         key_id: key.id.clone(),
-        key_label: if key.label.is_empty() { key.id.clone() } else { key.label.clone() },
+        key_label: if key.label.is_empty() {
+            key.id.clone()
+        } else {
+            key.label.clone()
+        },
         ip,
         user_agent: truncate(
-            headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or(""),
+            headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
             200,
         ),
         endpoint: "v1/embeddings".into(),
@@ -357,7 +387,11 @@ async fn embeddings(
         total_tokens: prompt_tokens,
         local_prompt: local_prompt as i64,
         drift_prompt: local_prompt as i64 - prompt_tokens,
-        usage_source: if upstream_prompt > 0 { "upstream".into() } else { "local".into() },
+        usage_source: if upstream_prompt > 0 {
+            "upstream".into()
+        } else {
+            "local".into()
+        },
         tokenizer: tokenizer_name,
         exact: i64::from(exact),
         ..Default::default()

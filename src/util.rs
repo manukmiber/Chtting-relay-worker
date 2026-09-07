@@ -106,14 +106,20 @@ pub fn hour_key(ts_ms: i64, tz: &Tz) -> String {
 }
 
 fn local(ts_ms: i64, tz: &Tz) -> DateTime<Tz> {
-    let utc: DateTime<Utc> = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or_else(Utc::now);
+    let utc: DateTime<Utc> = Utc
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
     utc.with_timezone(tz)
 }
 
 /// Epoch millis of local midnight today, for "today" statistics.
 pub fn start_of_today(tz: &Tz) -> i64 {
     let now = Utc::now().with_timezone(tz);
-    let naive = now.date_naive().and_hms_opt(0, 0, 0).expect("midnight exists");
+    let naive = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight exists");
     tz.from_local_datetime(&naive)
         .earliest()
         .map(|d| d.timestamp_millis())

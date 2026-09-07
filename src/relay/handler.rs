@@ -22,14 +22,16 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::{ClientKey, Config, Model, RequestTransform, ResolvedResponseTransform, ResponseTransform};
+use crate::config::{
+    ClientKey, Config, Model, RequestTransform, ResolvedResponseTransform, ResponseTransform,
+};
+use crate::relay::error_response;
 use crate::relay::sse::{self, SseParser, StreamRewriter};
 use crate::relay::transform::{
     collect_tool_calls, compile_text_rules, rules_lookbehind, transform_chunk, transform_request,
     transform_response, ReasoningState,
 };
 use crate::relay::upstream::Sent;
-use crate::relay::error_response;
 use crate::state::AppState;
 use crate::store::RequestRecord;
 use crate::tokenizer::chat::flatten_content;
@@ -66,7 +68,11 @@ pub fn authenticate(cfg: &Config, secret: Option<&str>) -> Auth {
             status: 403,
             message: format!(
                 "key \"{}\" is disabled",
-                if key.label.is_empty() { &key.id } else { &key.label }
+                if key.label.is_empty() {
+                    &key.id
+                } else {
+                    &key.label
+                }
             ),
         },
         Some(key) => Auth::Ok(key.clone()),
@@ -79,7 +85,11 @@ pub fn check_access(key: &ClientKey, model_id: &str) -> Result<(), String> {
     }
     Err(format!(
         "key \"{}\" may not use model \"{model_id}\"",
-        if key.label.is_empty() { &key.id } else { &key.label }
+        if key.label.is_empty() {
+            &key.id
+        } else {
+            &key.label
+        }
     ))
 }
 
@@ -145,7 +155,11 @@ pub async fn handle_chat(
         day: day_key(started_wall, &tz),
         hour: hour_key(started_wall, &tz),
         key_id: key.id.clone(),
-        key_label: if key.label.is_empty() { key.id.clone() } else { key.label.clone() },
+        key_label: if key.label.is_empty() {
+            key.id.clone()
+        } else {
+            key.label.clone()
+        },
         ip,
         user_agent: truncate(
             headers
@@ -155,7 +169,11 @@ pub async fn handle_chat(
             200,
         ),
         endpoint: endpoint.to_string(),
-        public_model: body.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        public_model: body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         exact: 1,
         ..Default::default()
     };
@@ -163,13 +181,27 @@ pub async fn handle_chat(
     let asked_for = record.public_model.clone();
     let Some(route) = cfg.find_model(&asked_for).filter(|m| m.enabled).cloned() else {
         let message = format!("model \"{asked_for}\" is not available on this relay");
-        finish(&state, record, 404, &message, None, None, None, None, "", "");
-        return error_response(404, &message, "invalid_request_error", Some("model_not_found"));
+        finish(
+            &state, record, 404, &message, None, None, None, None, "", "",
+        );
+        return error_response(
+            404,
+            &message,
+            "invalid_request_error",
+            Some("model_not_found"),
+        );
     };
 
     if let Err(message) = check_access(&key, &route.id) {
-        finish(&state, record, 403, &message, None, None, None, None, "", "");
-        return error_response(403, &message, "invalid_request_error", Some("model_forbidden"));
+        finish(
+            &state, record, 403, &message, None, None, None, None, "", "",
+        );
+        return error_response(
+            403,
+            &message,
+            "invalid_request_error",
+            Some("model_forbidden"),
+        );
     }
 
     record.backend_id = route.backend.clone();
@@ -179,9 +211,12 @@ pub async fn handle_chat(
     // model, because that is the one that bills.
     let rt = RequestTransform::merged(&cfg.defaults.request_transform, &route.request_transform);
     let mut upstream_body = transform_request(&body, &route, &cfg, &rt);
-    let resolved = state
-        .counter
-        .resolve(&cfg, &route.upstream_model, &route.tokenizer, &route.chat_profile);
+    let resolved = state.counter.resolve(
+        &cfg,
+        &route.upstream_model,
+        &route.tokenizer,
+        &route.chat_profile,
+    );
     let input = state
         .counter
         .count_request(&upstream_body, &resolved, &cfg.tokenizer.image_defaults)
@@ -197,15 +232,25 @@ pub async fn handle_chat(
             "prompt is {} tokens, over this model's {max_in} token limit",
             input.total
         );
-        finish(&state, record, 413, &message, None, None, None, None, "", "");
-        return error_response(413, &message, "invalid_request_error", Some("context_length_exceeded"));
+        finish(
+            &state, record, 413, &message, None, None, None, None, "", "",
+        );
+        return error_response(
+            413,
+            &message,
+            "invalid_request_error",
+            Some("context_length_exceeded"),
+        );
     }
 
     if cfg.logging.store_bodies != "none" {
         record.req_preview = preview_request(&upstream_body, &cfg);
     }
 
-    let client_wants_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Streaming upstream is what makes TTFT and tokens/sec measurable; when the
     // caller asked for a whole response we buffer the stream back together.
     let stream_upstream = rt.force_stream.unwrap_or(client_wants_stream);
@@ -232,12 +277,17 @@ pub async fn handle_chat(
     // Backpressure: refuse rather than pile work onto a phone that is already
     // saturated. A queued request that times out helps nobody.
     let Ok(permit) = state.in_flight.clone().try_acquire_owned() else {
-        state.stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
+        state
+            .stats
+            .rejected_overload
+            .fetch_add(1, Ordering::Relaxed);
         let message = format!(
             "relay is at its concurrency limit ({}); retry shortly",
             cfg.server.max_concurrent_requests
         );
-        finish(&state, record, 503, &message, None, None, None, None, "", "");
+        finish(
+            &state, record, 503, &message, None, None, None, None, "", "",
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "1")],
@@ -258,7 +308,18 @@ pub async fn handle_chat(
         Ok(sent) => sent,
         Err(err) => {
             record.retries = i64::from(err.attempts.saturating_sub(1));
-            finish(&state, record, err.status as i64, &err.message, Some(started), None, None, None, "", "");
+            finish(
+                &state,
+                record,
+                err.status as i64,
+                &err.message,
+                Some(started),
+                None,
+                None,
+                None,
+                "",
+                "",
+            );
             state.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
             drop(permit);
             return error_response(err.status, &err.message, "upstream_error", None);
@@ -286,8 +347,10 @@ pub async fn handle_chat(
             error_response(status, &message, "upstream_error", None)
         }
         Sent::Ok { response, .. } => {
-            let transform =
-                ResponseTransform::merged(&cfg.defaults.response_transform, &route.response_transform);
+            let transform = ResponseTransform::merged(
+                &cfg.defaults.response_transform,
+                &route.response_transform,
+            );
             let is_sse = response
                 .headers()
                 .get("content-type")
@@ -399,7 +462,10 @@ async fn pump(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            if let Some(calls) = delta.and_then(|d| d.get("tool_calls")).and_then(|v| v.as_array()) {
+            if let Some(calls) = delta
+                .and_then(|d| d.get("tool_calls"))
+                .and_then(|v| v.as_array())
+            {
                 collect_tool_calls(&mut tool_calls, calls);
             }
 
@@ -412,12 +478,8 @@ async fn pump(
             out.text.push_str(content_delta);
             out.reasoning.push_str(reasoning_delta);
 
-            let mut shaped = transform_chunk(
-                &parsed,
-                &ctx.route.id,
-                &ctx.transform,
-                &mut reasoning_state,
-            );
+            let mut shaped =
+                transform_chunk(&parsed, &ctx.route.id, &ctx.transform, &mut reasoning_state);
 
             let Some(tx) = emit else { continue };
 
@@ -553,15 +615,26 @@ async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Respo
         Some(r) => r.apply(&pumped.text),
         None => pumped.text.clone(),
     };
-    let content = format!("{}{body_text}{}", ctx.transform.prefix, ctx.transform.suffix);
+    let content = format!(
+        "{}{body_text}{}",
+        ctx.transform.prefix, ctx.transform.suffix
+    );
 
     let assembled = assemble_completion(
         &ctx.record.id,
         &ctx.route.id,
         &content,
-        if ctx.transform.reasoning == "strip" { "" } else { &pumped.reasoning },
+        if ctx.transform.reasoning == "strip" {
+            ""
+        } else {
+            &pumped.reasoning
+        },
         &pumped.tool_calls,
-        if pumped.finish_reason.is_empty() { "stop" } else { &pumped.finish_reason },
+        if pumped.finish_reason.is_empty() {
+            "stop"
+        } else {
+            &pumped.finish_reason
+        },
         &usage,
     );
 
@@ -625,7 +698,11 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
         .count_output(
             &content,
             &ctx.resolved,
-            if ctx.transform.reasoning == "strip" { "" } else { &reasoning },
+            if ctx.transform.reasoning == "strip" {
+                ""
+            } else {
+                &reasoning
+            },
             tool_calls,
         )
         .await;
@@ -696,7 +773,11 @@ async fn finalise_usage(ctx: &Ctx, pumped: &Pumped, streaming_to_client: bool) -
         .count_output(
             &counted_text,
             &ctx.resolved,
-            if ctx.transform.reasoning == "strip" { "" } else { &pumped.reasoning },
+            if ctx.transform.reasoning == "strip" {
+                ""
+            } else {
+                &pumped.reasoning
+            },
             pumped.tool_calls.clone(),
         )
         .await;
@@ -793,7 +874,11 @@ fn finish(
     };
     record.res_preview = response_preview.to_string();
 
-    let tag = if status >= 400 || status == 0 { "error" } else { "ok" };
+    let tag = if status >= 400 || status == 0 {
+        "error"
+    } else {
+        "ok"
+    };
     state.logger.info(format!(
         "{tag} {} -> {} {}in/{}out ttft={}ms total={}ms tps={} key={}{}",
         record.public_model,
@@ -811,9 +896,11 @@ fn finish(
         },
     ));
 
-    state
-        .quotas
-        .record(&record.key_id, &record.day, record.total_tokens.max(0) as u64);
+    state.quotas.record(
+        &record.key_id,
+        &record.day,
+        record.total_tokens.max(0) as u64,
+    );
 
     if !state.store.insert(record) {
         state
@@ -1040,8 +1127,14 @@ mod tests {
         let listed = list_models(&cfg);
         let text = listed.to_string();
         assert!(text.contains("manukmiberai/creative-writer"));
-        assert!(!text.contains("Deepseek-v4-flash-0731"), "backend name leaked");
-        assert!(!text.contains("hidden"), "a disabled model must not be listed");
+        assert!(
+            !text.contains("Deepseek-v4-flash-0731"),
+            "backend name leaked"
+        );
+        assert!(
+            !text.contains("hidden"),
+            "a disabled model must not be listed"
+        );
     }
 
     #[test]

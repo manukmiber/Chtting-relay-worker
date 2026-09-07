@@ -26,19 +26,54 @@ pub const PROFILE_NAMES: [&str; 7] = [
 pub fn profile(name: &str) -> Profile {
     match name {
         // <|im_start|>role\n content <|im_end|>\n
-        "chatml" => Profile { per_message: 4, per_name: 1, primer: 3, bos: 0 },
+        "chatml" => Profile {
+            per_message: 4,
+            per_name: 1,
+            primer: 3,
+            bos: 0,
+        },
         // <|start_header_id|>role<|end_header_id|>\n\n content <|eot_id|>
-        "llama3" => Profile { per_message: 5, per_name: 1, primer: 4, bos: 1 },
+        "llama3" => Profile {
+            per_message: 5,
+            per_name: 1,
+            primer: 4,
+            bos: 1,
+        },
         // <|User|> / <|Assistant|> markers, bos once
-        "deepseek" => Profile { per_message: 2, per_name: 0, primer: 2, bos: 1 },
+        "deepseek" => Profile {
+            per_message: 2,
+            per_name: 0,
+            primer: 2,
+            bos: 1,
+        },
         // [INST] ... [/INST]
-        "mistral" => Profile { per_message: 3, per_name: 0, primer: 2, bos: 1 },
+        "mistral" => Profile {
+            per_message: 3,
+            per_name: 0,
+            primer: 2,
+            bos: 1,
+        },
         // <start_of_turn>role\n content <end_of_turn>\n
-        "gemma" => Profile { per_message: 4, per_name: 0, primer: 3, bos: 1 },
+        "gemma" => Profile {
+            per_message: 4,
+            per_name: 0,
+            primer: 3,
+            bos: 1,
+        },
         // plain concatenation, for completion-style backends
-        "raw" => Profile { per_message: 0, per_name: 0, primer: 0, bos: 0 },
+        "raw" => Profile {
+            per_message: 0,
+            per_name: 0,
+            primer: 0,
+            bos: 0,
+        },
         // gpt-3.5/gpt-4/gpt-4o: <|start|>role<|message|>content<|end|>
-        _ => Profile { per_message: 3, per_name: 1, primer: 3, bos: 0 },
+        _ => Profile {
+            per_message: 3,
+            per_name: 1,
+            primer: 3,
+            bos: 0,
+        },
     }
 }
 
@@ -55,7 +90,13 @@ pub struct Breakdown {
 
 impl Breakdown {
     pub fn total(&self) -> usize {
-        self.system + self.user + self.assistant + self.tool + self.images + self.tools + self.overhead
+        self.system
+            + self.user
+            + self.assistant
+            + self.tool
+            + self.images
+            + self.tools
+            + self.overhead
     }
 }
 
@@ -85,11 +126,12 @@ fn content_to_parts(content: &Value) -> Vec<Part<'_>> {
                 Value::String(s) => Part::Text(s.clone()),
                 Value::Object(map) => match map.get("type").and_then(|v| v.as_str()) {
                     Some("text") | Some("input_text") => Part::Text(
-                        map.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        map.get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                     ),
-                    Some("image_url") => {
-                        Part::Image(map.get("image_url").unwrap_or(&Value::Null))
-                    }
+                    Some("image_url") => Part::Image(map.get("image_url").unwrap_or(&Value::Null)),
                     Some("input_image") => Part::Image(p),
                     Some("input_audio") => {
                         Part::Audio(map.get("input_audio").unwrap_or(&Value::Null))
@@ -159,7 +201,10 @@ pub fn image_tokens(image: &Value, defaults: &ImageDefaults) -> usize {
 /// ~10 tokens per second of audio; base64 length is the only signal available
 /// without decoding, so approximate from the payload size.
 fn audio_tokens(audio: &Value) -> usize {
-    let len = audio.get("data").and_then(|v| v.as_str()).map_or(0, str::len);
+    let len = audio
+        .get("data")
+        .and_then(|v| v.as_str())
+        .map_or(0, str::len);
     let bytes = len * 3 / 4;
     bytes.div_ceil(3200)
 }
@@ -193,7 +238,11 @@ pub fn render_tools(tools: &[Value]) -> String {
                     if let Some(desc) = spec.get("description").and_then(|v| v.as_str()) {
                         lines.push(format!("// {desc}"));
                     }
-                    let opt = if required.contains(&key.as_str()) { "" } else { "?" };
+                    let opt = if required.contains(&key.as_str()) {
+                        ""
+                    } else {
+                        "?"
+                    };
                     lines.push(format!("{key}{opt}: {},", schema_type(spec)));
                 }
                 lines.push("}) => any;".into());
@@ -331,7 +380,11 @@ pub fn count_chat_request(
         Some(Value::String(s)) => b.user += count(s),
         Some(Value::Array(items)) => {
             for p in items {
-                b.user += count(&p.as_str().map(str::to_string).unwrap_or_else(|| p.to_string()));
+                b.user += count(
+                    &p.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| p.to_string()),
+                );
             }
         }
         _ => {}
@@ -391,7 +444,10 @@ mod tests {
         // `raw` contributes no template tokens, so the whole difference is the
         // openai profile's own: two messages at 3 each, plus a 3-token primer.
         let p = profile("openai");
-        assert_eq!(openai.total - raw.total, 2 * p.per_message + p.primer + p.bos);
+        assert_eq!(
+            openai.total - raw.total,
+            2 * p.per_message + p.primer + p.bos
+        );
         assert_eq!(openai.breakdown.system, raw.breakdown.system);
         assert_eq!(openai.breakdown.user, raw.breakdown.user);
     }

@@ -40,13 +40,19 @@ cd Chtting-relay-worker
 bash scripts/install-termux.sh
 ```
 
-Script itu memasang toolchain Rust dan `cloudflared`, membangun binary,
-menawarkan unduh vocabulary tokenizer, membuat config awal, dan mencetak client
-key pertama.
+Script itu **mengunduh binary siap pakai** untuk CPU HP-mu kalau rilisnya ada
+(checksum diverifikasi), memasang `cloudflared`, menawarkan unduh vocabulary
+tokenizer, membuat config awal, dan mencetak client key pertama.
 
-> **Build pertama lama** — 5 sampai 15 menit di HP, sekali saja. Yang dipasang
-> cuma `rust` dan `clang`; tidak ada cmake, tidak ada Go, tidak ada Node.
-> Kalau core-nya sedikit script otomatis pakai `-j1` supaya tidak kehabisan RAM.
+Kalau belum ada rilis yang cocok, script otomatis build dari source:
+
+> **Build dari source lama** — 5 sampai 15 menit di HP, sekali saja. Yang
+> dipasang cuma `rust` dan `clang`; tidak ada cmake, tidak ada Go, tidak ada
+> Node. Kalau core-nya sedikit script otomatis pakai `-j1` supaya tidak
+> kehabisan RAM. Mau memaksa build sendiri: `bash scripts/install-termux.sh --build`.
+
+Binary rilis dibuat untuk **arm64** (hampir semua HP sejak ~2016) dan **armv7**
+(HP 32-bit). Keduanya binary Android asli, bukan emulasi.
 
 Jalankan:
 
@@ -69,6 +75,32 @@ sv status chtting-relay
 
 ---
 
+## Build sendiri dan rilis
+
+Di PC (tidak perlu HP), silakan cross-compile untuk Android:
+
+```bash
+# sekali saja: unduh Android NDK
+curl -LO https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+unzip -q android-ndk-r27c-linux.zip
+export ANDROID_NDK_HOME="$PWD/android-ndk-r27c"
+
+bash scripts/build-android.sh              # arm64
+bash scripts/build-android.sh aarch64 armv7  # dua-duanya
+```
+
+Hasilnya di `target/<target>/release/chtting-relay` — tinggal salin ke HP,
+`chmod +x`, jalankan. Tidak perlu toolchain Rust di HP sama sekali.
+
+Untuk merilis: `git tag v2.1.0 && git push origin v2.1.0`. GitHub Actions
+membangun kedua arsitektur, membuat checksum, dan menempelkannya ke Release.
+
+CI (`cargo test`, clippy, rustfmt, plus cross-compile Android) jalan di tiap
+push dan PR. Semuanya cuma perintah cargo biasa — **kalau nanti isinya diganti
+framework lain, CI dan rilisnya tetap jalan tanpa diubah.**
+
+---
+
 ## Kenapa Rust
 
 Versi sebelumnya jalan di Node. Untuk ratusan pengguna konkuren di HP, ini yang
@@ -85,8 +117,8 @@ berubah:
 | Koneksi ke backend | handshake per request | connection pool reqwest, TLS tetap hangat |
 | Tokenizer | implementasi BPE sendiri | library rujukan aslinya |
 
-Yang dipasang di HP juga menyusut: satu binary statis, tanpa runtime Node,
-tanpa `node_modules`.
+Yang dipasang di HP juga menyusut: satu file binary (dashboard dan vocabulary
+OpenAI ikut di dalamnya), tanpa runtime Node, tanpa `node_modules`.
 
 ---
 

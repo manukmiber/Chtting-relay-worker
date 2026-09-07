@@ -28,7 +28,10 @@ impl Dash {
             addr,
             relay,
             // A cookie store, so signing in carries over between calls.
-            client: reqwest::Client::builder().cookie_store(true).build().unwrap(),
+            client: reqwest::Client::builder()
+                .cookie_store(true)
+                .build()
+                .unwrap(),
         }
     }
 
@@ -45,11 +48,21 @@ impl Dash {
     }
 
     async fn post(&self, path: &str, body: Value) -> reqwest::Response {
-        self.client.post(self.url(path)).json(&body).send().await.unwrap()
+        self.client
+            .post(self.url(path))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
     }
 
     async fn put(&self, path: &str, body: Value) -> reqwest::Response {
-        self.client.put(self.url(path)).json(&body).send().await.unwrap()
+        self.client
+            .put(self.url(path))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
     }
 }
 
@@ -86,7 +99,10 @@ async fn state_reports_everything_the_dashboard_needs_in_one_call() {
     assert_eq!(state["store"]["kind"], "sqlite");
     assert_eq!(state["runtime"]["runtime"], "rust");
     assert!(state["runtime"]["cores"].as_u64().unwrap() >= 1);
-    assert!(state["profiles"].as_array().unwrap().contains(&json!("deepseek")));
+    assert!(state["profiles"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("deepseek")));
     assert_eq!(state["relay"]["port"], 0);
 }
 
@@ -96,7 +112,10 @@ async fn secrets_are_masked_everywhere_the_dashboard_can_see_them() {
 
     let config = dash.get_json("/api/config").await;
     let api_key = config["backends"][0]["apiKey"].as_str().unwrap();
-    assert_ne!(api_key, "sk-backend-secret", "the backend key was sent in the clear");
+    assert_ne!(
+        api_key, "sk-backend-secret",
+        "the backend key was sent in the clear"
+    );
     assert!(api_key.contains('…') || api_key.contains('•'));
 
     let key = config["keys"][0]["key"].as_str().unwrap();
@@ -145,7 +164,10 @@ async fn a_model_alias_can_be_repointed_at_a_different_backend_model() {
                    "messages": [{"role": "user", "content": "hi"}]}),
         )
         .await;
-    assert_eq!(dash.relay.backend.last_request()["model"], "Qwen3-Coder-NEXT");
+    assert_eq!(
+        dash.relay.backend.last_request()["model"],
+        "Qwen3-Coder-NEXT"
+    );
 }
 
 #[tokio::test]
@@ -179,7 +201,10 @@ async fn a_generated_key_is_shown_once_and_masked_afterwards() {
         .await
         .unwrap();
     let secret = created["item"]["key"].as_str().unwrap().to_string();
-    assert!(secret.starts_with("sk-relay-"), "unexpected key shape: {secret}");
+    assert!(
+        secret.starts_with("sk-relay-"),
+        "unexpected key shape: {secret}"
+    );
 
     // Listing it afterwards only ever shows the mask.
     let keys = dash.get_json("/api/keys").await;
@@ -286,7 +311,9 @@ async fn the_request_log_can_be_listed_filtered_and_opened() {
     // Full-text search over the stored previews.
     let found = dash.get_json("/api/requests?q=distinctive").await;
     assert_eq!(found["total"], 1);
-    let missing = dash.get_json("/api/requests?q=nowhere-in-any-preview").await;
+    let missing = dash
+        .get_json("/api/requests?q=nowhere-in-any-preview")
+        .await;
     assert_eq!(missing["total"], 0);
 
     let id = row["id"].as_str().unwrap();
@@ -320,12 +347,12 @@ async fn the_tokenizer_playground_counts_text_and_messages() {
     for piece in pieces {
         assert!(piece["text"].is_string(), "piece has no text: {piece}");
         assert!(piece["id"].is_i64(), "piece has no id: {piece}");
-        assert!(piece["special"].is_boolean(), "piece has no special flag: {piece}");
+        assert!(
+            piece["special"].is_boolean(),
+            "piece has no special flag: {piece}"
+        );
     }
-    let joined: String = pieces
-        .iter()
-        .filter_map(|p| p["text"].as_str())
-        .collect();
+    let joined: String = pieces.iter().filter_map(|p| p["text"].as_str()).collect();
     assert_eq!(joined, "halo dunia", "pieces must reconstruct the input");
 
     let messages: Value = dash
@@ -393,14 +420,18 @@ async fn a_password_locks_the_dashboard_until_you_sign_in() {
 
     // A wrong password stays locked.
     assert_eq!(
-        dash.post("/api/login", json!({"password": "wrong"})).await.status(),
+        dash.post("/api/login", json!({"password": "wrong"}))
+            .await
+            .status(),
         401
     );
     assert_eq!(dash.get("/api/state").await.status(), 401);
 
     // The right one opens it, and the cookie carries over.
     assert_eq!(
-        dash.post("/api/login", json!({"password": "hunter2"})).await.status(),
+        dash.post("/api/login", json!({"password": "hunter2"}))
+            .await
+            .status(),
         200
     );
     assert_eq!(dash.get("/api/state").await.status(), 200);

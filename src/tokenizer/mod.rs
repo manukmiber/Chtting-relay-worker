@@ -36,7 +36,13 @@ impl TokenCounter {
     /// actually bills. An override names a vocabulary directly and bypasses the
     /// glob rules, which is how a route pins an exact vocabulary — passing the
     /// pinned name back through the rules would send it to the catch-all.
-    pub fn resolve(&self, cfg: &Config, model: &str, override_tokenizer: &str, override_profile: &str) -> Resolved {
+    pub fn resolve(
+        &self,
+        cfg: &Config,
+        model: &str,
+        override_tokenizer: &str,
+        override_profile: &str,
+    ) -> Resolved {
         let (matched_tok, matched_prof) = Registry::match_rules(&cfg.tokenizer, model);
         Resolved {
             tokenizer: if override_tokenizer.is_empty() {
@@ -216,8 +222,16 @@ pub fn reconcile_usage(
 
     let (prompt, completion) = match (&up, use_up) {
         (Some(u), true) => (
-            if u.prompt_tokens > 0 { u.prompt_tokens } else { local.prompt },
-            if u.completion_tokens > 0 { u.completion_tokens } else { local.completion },
+            if u.prompt_tokens > 0 {
+                u.prompt_tokens
+            } else {
+                local.prompt
+            },
+            if u.completion_tokens > 0 {
+                u.completion_tokens
+            } else {
+                local.completion
+            },
         ),
         _ => (local.prompt, local.completion),
     };
@@ -261,23 +275,25 @@ pub fn normalize_usage(usage: &Value) -> Option<NormalizedUsage> {
         .get("completion_tokens")
         .or_else(|| map.get("output_tokens"))
         .or_else(|| map.get("completionTokens")));
-    let cached = num(
-        map.get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .or_else(|| map.get("prompt_cache_hit_tokens"))
-            .or_else(|| map.get("cache_read_input_tokens")),
-    );
-    let reasoning = num(
-        map.get("completion_tokens_details")
-            .and_then(|d| d.get("reasoning_tokens"))
-            .or_else(|| map.get("reasoning_tokens")),
-    );
+    let cached = num(map
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .or_else(|| map.get("prompt_cache_hit_tokens"))
+        .or_else(|| map.get("cache_read_input_tokens")));
+    let reasoning = num(map
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .or_else(|| map.get("reasoning_tokens")));
 
     let total = num(map.get("total_tokens"));
     Some(NormalizedUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
-        total_tokens: if total > 0 { total } else { prompt + completion },
+        total_tokens: if total > 0 {
+            total
+        } else {
+            prompt + completion
+        },
         cached_tokens: cached,
         reasoning_tokens: reasoning,
     })
@@ -289,7 +305,11 @@ mod tests {
 
     #[test]
     fn the_backend_number_wins_and_the_difference_is_kept_as_drift() {
-        let local = LocalCount { prompt: 100, completion: 50, exact: true };
+        let local = LocalCount {
+            prompt: 100,
+            completion: 50,
+            exact: true,
+        };
         let upstream = serde_json::json!({"prompt_tokens": 98, "completion_tokens": 52});
         let usage = reconcile_usage(local, Some(&upstream), true);
         assert_eq!(usage.prompt_tokens, 98);
@@ -302,7 +322,11 @@ mod tests {
 
     #[test]
     fn a_silent_backend_leaves_the_local_count_in_charge() {
-        let local = LocalCount { prompt: 100, completion: 50, exact: false };
+        let local = LocalCount {
+            prompt: 100,
+            completion: 50,
+            exact: false,
+        };
         let usage = reconcile_usage(local, None, true);
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.source, "local");
@@ -313,7 +337,11 @@ mod tests {
 
     #[test]
     fn preferring_local_ignores_the_backend_but_still_records_drift() {
-        let local = LocalCount { prompt: 100, completion: 50, exact: true };
+        let local = LocalCount {
+            prompt: 100,
+            completion: 50,
+            exact: true,
+        };
         let upstream = serde_json::json!({"prompt_tokens": 98, "completion_tokens": 52});
         let usage = reconcile_usage(local, Some(&upstream), false);
         assert_eq!(usage.prompt_tokens, 100);
@@ -327,7 +355,10 @@ mod tests {
             "input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 5
         });
         let u = normalize_usage(&anthropic).unwrap();
-        assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), (10, 20, 5));
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.cached_tokens),
+            (10, 20, 5)
+        );
 
         let openai = serde_json::json!({
             "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30,
@@ -335,7 +366,10 @@ mod tests {
             "completion_tokens_details": {"reasoning_tokens": 7}
         });
         let u = normalize_usage(&openai).unwrap();
-        assert_eq!((u.total_tokens, u.cached_tokens, u.reasoning_tokens), (30, 4, 7));
+        assert_eq!(
+            (u.total_tokens, u.cached_tokens, u.reasoning_tokens),
+            (30, 4, 7)
+        );
     }
 
     #[test]
@@ -347,14 +381,18 @@ mod tests {
         )));
         // Without a pin, the backend name drives the rules.
         assert_eq!(
-            counter.resolve(&cfg, "Deepseek-v4-flash-0731", "", "").tokenizer,
+            counter
+                .resolve(&cfg, "Deepseek-v4-flash-0731", "", "")
+                .tokenizer,
             "deepseek"
         );
         // With a pin, the pinned name is used verbatim — the bug this guards
         // against was feeding "cl100k_base" back in as if it were a model name,
         // which fell through to the catch-all rule and silently used o200k.
         assert_eq!(
-            counter.resolve(&cfg, "Deepseek-v4-flash-0731", "cl100k_base", "").tokenizer,
+            counter
+                .resolve(&cfg, "Deepseek-v4-flash-0731", "cl100k_base", "")
+                .tokenizer,
             "cl100k_base"
         );
     }

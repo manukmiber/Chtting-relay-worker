@@ -132,12 +132,22 @@ impl TunnelManager {
         let mut args = vec!["--no-autoupdate".to_string()];
 
         if t.mode == "named" && !t.token.is_empty() {
-            args.extend(["tunnel".into(), "run".into(), "--token".into(), t.token.clone()]);
+            args.extend([
+                "tunnel".into(),
+                "run".into(),
+                "--token".into(),
+                t.token.clone(),
+            ]);
             args.extend(t.extra_args.iter().cloned());
             return args;
         }
         if t.mode == "named" && !t.config_file.is_empty() {
-            args.extend(["--config".into(), t.config_file.clone(), "tunnel".into(), "run".into()]);
+            args.extend([
+                "--config".into(),
+                t.config_file.clone(),
+                "tunnel".into(),
+                "run".into(),
+            ]);
             args.extend(t.extra_args.iter().cloned());
             return args;
         }
@@ -166,7 +176,9 @@ impl TunnelManager {
 
         let cfg = self.config.current();
         if cfg.tunnel.mode == "off" {
-            return Err(anyhow!("tunnel mode is \"off\"; set it to quick or named first"));
+            return Err(anyhow!(
+                "tunnel mode is \"off\"; set it to quick or named first"
+            ));
         }
 
         let check = self.version().await;
@@ -189,7 +201,10 @@ impl TunnelManager {
         self.log(&format!(
             "starting: {} {}",
             self.binary(),
-            args.iter().map(|a| redact_arg(a)).collect::<Vec<_>>().join(" ")
+            args.iter()
+                .map(|a| redact_arg(a))
+                .collect::<Vec<_>>()
+                .join(" ")
         ));
 
         let mut child = Command::new(self.binary())
@@ -247,7 +262,9 @@ impl TunnelManager {
                 return;
             }
 
-            let code = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+            let code = status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|e| e.to_string());
             {
                 let mut inner = manager.inner.lock();
                 inner.state_label = Some(State::Failed);
@@ -264,9 +281,7 @@ impl TunnelManager {
                 inner.restarts += 1;
                 inner.restarts
             };
-            let wait = std::time::Duration::from_millis(
-                (1_000u64 << restarts.min(5)).min(60_000),
-            );
+            let wait = std::time::Duration::from_millis((1_000u64 << restarts.min(5)).min(60_000));
             manager.log(&format!("restarting in {}s", wait.as_secs()));
             tokio::time::sleep(wait).await;
             if let Err(err) = manager.start().await {

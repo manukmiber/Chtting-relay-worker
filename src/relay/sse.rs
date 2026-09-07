@@ -63,7 +63,12 @@ fn parse_event(raw: &str) -> Option<SseEvent> {
             continue;
         }
         let (field, value) = match line.find(':') {
-            Some(idx) => (&line[..idx], line[idx + 1..].strip_prefix(' ').unwrap_or(&line[idx + 1..])),
+            Some(idx) => (
+                &line[..idx],
+                line[idx + 1..]
+                    .strip_prefix(' ')
+                    .unwrap_or(&line[idx + 1..]),
+            ),
             None => (line, ""),
         };
         match field {

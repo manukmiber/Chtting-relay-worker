@@ -86,7 +86,10 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn estimator() -> Self {
-        Self { name: "estimate".into(), inner: Inner::Estimate }
+        Self {
+            name: "estimate".into(),
+            inner: Inner::Estimate,
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -161,7 +164,11 @@ impl Encoder {
                         Ok(s) => {
                             out.push(Piece {
                                 text: s.to_string(),
-                                id: if pending_ids.len() == 1 { i64::from(pending_ids[0]) } else { -1 },
+                                id: if pending_ids.len() == 1 {
+                                    i64::from(pending_ids[0])
+                                } else {
+                                    -1
+                                },
                                 special: false,
                             });
                             pending.clear();
@@ -205,7 +212,11 @@ impl Encoder {
             },
             _ => text
                 .split_inclusive(' ')
-                .map(|s| Piece { text: s.to_string(), id: -1, special: false })
+                .map(|s| Piece {
+                    text: s.to_string(),
+                    id: -1,
+                    special: false,
+                })
                 .collect(),
         }
     }
@@ -485,8 +496,7 @@ fn builtin(name: &str) -> Option<&'static CoreBPE> {
 fn load_tiktoken_file(name: &str, path: &Path) -> Result<Encoder> {
     use base64::Engine;
     let raw = std::fs::read_to_string(path)?;
-    let mut ranks: rustc_hash::FxHashMap<Vec<u8>, u32> =
-        rustc_hash::FxHashMap::default();
+    let mut ranks: rustc_hash::FxHashMap<Vec<u8>, u32> = rustc_hash::FxHashMap::default();
     for (lineno, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -494,7 +504,13 @@ fn load_tiktoken_file(name: &str, path: &Path) -> Result<Encoder> {
         let mut parts = line.split(' ');
         let (token, rank) = match (parts.next(), parts.next()) {
             (Some(t), Some(r)) => (t, r),
-            _ => return Err(anyhow!("{}: malformed rank on line {}", path.display(), lineno + 1)),
+            _ => {
+                return Err(anyhow!(
+                    "{}: malformed rank on line {}",
+                    path.display(),
+                    lineno + 1
+                ))
+            }
         };
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(token)

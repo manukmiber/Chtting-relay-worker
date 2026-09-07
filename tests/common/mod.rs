@@ -148,9 +148,16 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
     let model = config
         .model_echo
         .clone()
-        .or_else(|| body.get("model").and_then(|v| v.as_str()).map(str::to_string))
+        .or_else(|| {
+            body.get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_default();
-    let wants_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if wants_stream && !config.never_streams {
         return stream_response(&config, &model);
@@ -175,13 +182,18 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
 
 fn stream_response(config: &MockConfig, model: &str) -> Response {
     let mut raw = String::new();
-    let frame = |delta: Value| format!("data: {}\n\n", json!({
-        "id": "chatcmpl-mock",
-        "object": "chat.completion.chunk",
-        "created": 1_700_000_000,
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
-    }));
+    let frame = |delta: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+            })
+        )
+    };
 
     raw.push_str(&frame(json!({"role": "assistant", "content": ""})));
     if let Some(reasoning) = &config.reasoning {
@@ -270,30 +282,24 @@ impl Harness {
 
     /// Every metrics row recorded so far, newest first.
     pub async fn rows(&self) -> Vec<Value> {
-        // The writer batches, so give it a moment to commit.
-        for _ in 0..40 {
-            let rows = self
-                .state
-                .store
-                .read(|conn| {
-                    let sql = format!(
-                        "SELECT {} FROM requests ORDER BY ts DESC, rowid DESC",
-                        chtting_relay::store::schema::select_columns()
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let rows: Vec<Value> = stmt
-                        .query_map([], chtting_relay::store::schema::row_to_json)?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok(rows)
-                })
-                .await
-                .unwrap_or_default();
-            if !rows.is_empty() {
-                return rows;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        Vec::new()
+        // The writer batches, so ask it to commit and wait rather than polling
+        // until something shows up — polling returns a partial set under load.
+        self.state.store.flush().await;
+        self.state
+            .store
+            .read(|conn| {
+                let sql = format!(
+                    "SELECT {} FROM requests ORDER BY ts DESC, rowid DESC",
+                    chtting_relay::store::schema::select_columns()
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows: Vec<Value> = stmt
+                    .query_map([], chtting_relay::store::schema::row_to_json)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn last_row(&self) -> Value {

@@ -68,7 +68,11 @@ async fn an_unknown_model_is_a_404_not_a_relayed_call() {
         )
         .await;
     assert_eq!(response.status(), 404);
-    assert_eq!(h.backend.request_count(), 0, "the backend must not be called");
+    assert_eq!(
+        h.backend.request_count(),
+        0,
+        "the backend must not be called"
+    );
 }
 
 /* ------------------------------------------------- 4/6. prompt + shape -- */
@@ -147,7 +151,10 @@ async fn a_rewrite_split_across_streamed_chunks_is_still_caught() {
 
     let (events, raw) = read_sse(response).await;
     assert_eq!(stream_text(&events), "ask Writer about writing");
-    assert!(!raw.contains("DeepSeek"), "the provider name leaked mid-stream");
+    assert!(
+        !raw.contains("DeepSeek"),
+        "the provider name leaked mid-stream"
+    );
 }
 
 #[tokio::test]
@@ -209,7 +216,10 @@ async fn forcing_a_stream_upstream_still_returns_json_to_the_caller() {
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["object"], "chat.completion");
-    assert_eq!(body["choices"][0]["message"]["content"], "hello from the backend");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from the backend"
+    );
 
     // ...but we streamed upstream, so TTFT is measurable.
     assert_eq!(h.backend.last_request()["stream"], true);
@@ -249,8 +259,14 @@ async fn an_uninstalled_vocabulary_still_counts_but_says_it_is_an_estimate() {
     assert_eq!(response.status(), 200);
 
     let row = h.last_row().await;
-    assert!(row["prompt_tokens"].as_i64().unwrap() > 0, "no count at all");
-    assert_eq!(row["exact"], 0, "an estimate must never be reported as exact");
+    assert!(
+        row["prompt_tokens"].as_i64().unwrap() > 0,
+        "no count at all"
+    );
+    assert_eq!(
+        row["exact"], 0,
+        "an estimate must never be reported as exact"
+    );
     assert_eq!(row["tokenizer"], "estimate");
 }
 
@@ -394,7 +410,9 @@ async fn a_daily_token_quota_is_enforced_from_memory() {
 
     // The first call goes through and spends the budget.
     assert_eq!(
-        h.post("/v1/chat/completions", chat("hello there")).await.status(),
+        h.post("/v1/chat/completions", chat("hello there"))
+            .await
+            .status(),
         200
     );
     // Wait for the row, which is also when the quota counter is updated.
@@ -417,12 +435,19 @@ async fn a_daily_request_quota_is_enforced_too() {
     })
     .await;
 
-    assert_eq!(h.post("/v1/chat/completions", chat("one")).await.status(), 200);
+    assert_eq!(
+        h.post("/v1/chat/completions", chat("one")).await.status(),
+        200
+    );
     let _ = h.last_row().await;
 
     let refused = h.post("/v1/chat/completions", chat("two")).await;
     assert_eq!(refused.status(), 429);
-    assert_eq!(h.backend.request_count(), 1, "the refused call never reached the backend");
+    assert_eq!(
+        h.backend.request_count(),
+        1,
+        "the refused call never reached the backend"
+    );
 }
 
 /* --------------------------------------------------- failure handling -- */
@@ -437,7 +462,11 @@ async fn a_backend_error_status_reaches_the_caller_rather_than_a_generic_502() {
     let h = harness(mock, |_| {}).await;
 
     let response = h.post("/v1/chat/completions", chat("hi")).await;
-    assert_eq!(response.status(), 503, "the backend's own status must survive");
+    assert_eq!(
+        response.status(),
+        503,
+        "the backend's own status must survive"
+    );
     let body: serde_json::Value = response.json().await.unwrap();
     assert!(body["error"]["message"]
         .as_str()
@@ -465,12 +494,7 @@ async fn a_disabled_model_is_not_reachable() {
 #[tokio::test]
 async fn health_reports_what_is_configured_without_needing_a_key() {
     let h = harness(MockConfig::default(), |_| {}).await;
-    let response = h
-        .client()
-        .get(h.url("/health"))
-        .send()
-        .await
-        .unwrap();
+    let response = h.client().get(h.url("/health")).send().await.unwrap();
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["status"], "ok");

@@ -148,7 +148,10 @@ pub fn transform_request(
     if let Some(messages) = map.get("messages").and_then(|v| v.as_array()).cloned() {
         let injected = inject_system_prompt(&messages, &route.system_prompt, cfg);
         let rewritten = match compile_text_rules(&rt.replace) {
-            Some(rules) => injected.iter().map(|m| rewrite_message(m, &rules)).collect(),
+            Some(rules) => injected
+                .iter()
+                .map(|m| rewrite_message(m, &rules))
+                .collect(),
             None => injected,
         };
         map.insert("messages".into(), Value::Array(rewritten));
@@ -215,7 +218,11 @@ pub fn resolve_system_prompt(spec: &SystemPromptSpec, cfg: &Config) -> (String, 
 /// * `append`  — the caller's first, ours after
 /// * `replace` — ours only; the caller's is dropped
 /// * `merge`   — one system message, ours on top
-pub fn inject_system_prompt(messages: &[Value], spec: &SystemPromptSpec, cfg: &Config) -> Vec<Value> {
+pub fn inject_system_prompt(
+    messages: &[Value],
+    spec: &SystemPromptSpec,
+    cfg: &Config,
+) -> Vec<Value> {
     let (mode, text) = resolve_system_prompt(spec, cfg);
     if mode == "none" || text.trim().is_empty() {
         return messages.to_vec();
@@ -324,10 +331,16 @@ pub fn transform_response(
             .map(|mut choice| {
                 if let Some(c) = choice.as_object_mut() {
                     if let Some(message) = c.get("message").cloned() {
-                        c.insert("message".into(), transform_message(&message, transform, &rules));
+                        c.insert(
+                            "message".into(),
+                            transform_message(&message, transform, &rules),
+                        );
                     }
                     if let Some(Value::String(text)) = c.get("text").cloned() {
-                        c.insert("text".into(), Value::String(apply_text(&text, transform, &rules)));
+                        c.insert(
+                            "text".into(),
+                            Value::String(apply_text(&text, transform, &rules)),
+                        );
                     }
                 }
                 choice
@@ -387,7 +400,10 @@ fn transform_message(
     }
 
     if let Some(Value::String(content)) = m.get("content").cloned() {
-        m.insert("content".into(), Value::String(apply_text(&content, transform, rules)));
+        m.insert(
+            "content".into(),
+            Value::String(apply_text(&content, transform, rules)),
+        );
     }
     out
 }
@@ -515,7 +531,11 @@ pub fn transform_chunk(
 /// Merge streamed `tool_calls` deltas into whole calls, keyed by index.
 pub fn collect_tool_calls(map: &mut Map<String, Value>, deltas: &[Value]) {
     for tc in deltas {
-        let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0).to_string();
+        let idx = tc
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .to_string();
         let entry = map.entry(idx).or_insert_with(|| {
             serde_json::json!({
                 "id": tc.get("id").cloned().unwrap_or(Value::Null),
@@ -532,7 +552,11 @@ pub fn collect_tool_calls(map: &mut Map<String, Value>, deltas: &[Value]) {
         let Some(func) = existing.get_mut("function").and_then(|f| f.as_object_mut()) else {
             continue;
         };
-        if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+        if let Some(name) = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+        {
             let current = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
             func.insert("name".into(), Value::String(format!("{current}{name}")));
         }
@@ -542,7 +566,10 @@ pub fn collect_tool_calls(map: &mut Map<String, Value>, deltas: &[Value]) {
             .and_then(|v| v.as_str())
         {
             let current = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
-            func.insert("arguments".into(), Value::String(format!("{current}{args}")));
+            func.insert(
+                "arguments".into(),
+                Value::String(format!("{current}{args}")),
+            );
         }
     }
 }
@@ -584,12 +611,19 @@ mod tests {
     #[test]
     fn forced_params_beat_the_caller_but_defaults_do_not() {
         let (cfg, mut route) = cfg_with_route();
-        route.params.insert("temperature".into(), serde_json::json!(0.7));
-        route.force_params.insert("top_p".into(), serde_json::json!(0.9));
+        route
+            .params
+            .insert("temperature".into(), serde_json::json!(0.7));
+        route
+            .force_params
+            .insert("top_p".into(), serde_json::json!(0.9));
 
         let body = serde_json::json!({"temperature": 0.1, "top_p": 0.1, "messages": []});
         let out = transform_request(&body, &route, &cfg, &ResolvedRequestTransform::default());
-        assert_eq!(out["temperature"], 0.1, "a default must not override the caller");
+        assert_eq!(
+            out["temperature"], 0.1,
+            "a default must not override the caller"
+        );
         assert_eq!(out["top_p"], 0.9, "a forced param must override the caller");
     }
 
@@ -600,13 +634,22 @@ mod tests {
         let rt = ResolvedRequestTransform::default();
 
         let asked_more = serde_json::json!({"max_tokens": 4000, "messages": []});
-        assert_eq!(transform_request(&asked_more, &route, &cfg, &rt)["max_tokens"], 100);
+        assert_eq!(
+            transform_request(&asked_more, &route, &cfg, &rt)["max_tokens"],
+            100
+        );
 
         let asked_less = serde_json::json!({"max_tokens": 50, "messages": []});
-        assert_eq!(transform_request(&asked_less, &route, &cfg, &rt)["max_tokens"], 50);
+        assert_eq!(
+            transform_request(&asked_less, &route, &cfg, &rt)["max_tokens"],
+            50
+        );
 
         let asked_nothing = serde_json::json!({"messages": []});
-        assert_eq!(transform_request(&asked_nothing, &route, &cfg, &rt)["max_tokens"], 100);
+        assert_eq!(
+            transform_request(&asked_nothing, &route, &cfg, &rt)["max_tokens"],
+            100
+        );
     }
 
     #[test]
@@ -642,7 +685,11 @@ mod tests {
                 .map(|m| m["content"].as_str().unwrap_or(""))
                 .collect();
             assert_eq!(systems, expected, "mode {mode}");
-            assert_eq!(out.last().unwrap()["role"], "user", "mode {mode} kept the user turn");
+            assert_eq!(
+                out.last().unwrap()["role"],
+                "user",
+                "mode {mode} kept the user turn"
+            );
         }
 
         // A library entry wins over inline text.
@@ -659,7 +706,10 @@ mod tests {
     fn none_leaves_the_conversation_untouched() {
         let (cfg, route) = cfg_with_route();
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        assert_eq!(inject_system_prompt(&messages, &route.system_prompt, &cfg), messages);
+        assert_eq!(
+            inject_system_prompt(&messages, &route.system_prompt, &cfg),
+            messages
+        );
     }
 
     #[test]
@@ -684,16 +734,17 @@ mod tests {
         });
         let out = transform_request(&body, &route, &cfg, &rt);
         let messages = out["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["content"], "You are DeepSeek", "our prompt is left alone");
+        assert_eq!(
+            messages[0]["content"], "You are DeepSeek",
+            "our prompt is left alone"
+        );
         assert_eq!(messages[1]["content"], "tell me about Writer");
     }
 
     #[test]
     fn the_backend_name_is_scrubbed_out_of_the_reply() {
-        let transform = ResponseTransform::merged(
-            &ResponseTransform::default(),
-            &ResponseTransform::default(),
-        );
+        let transform =
+            ResponseTransform::merged(&ResponseTransform::default(), &ResponseTransform::default());
         let body = serde_json::json!({
             "model": "Deepseek-v4-flash-0731",
             "choices": [{"message": {"role": "assistant", "content": "hello"}}],
@@ -721,10 +772,21 @@ mod tests {
             transform_response(&body, "alias", &t)
         };
 
-        assert_eq!(with("keep")["choices"][0]["message"]["reasoning_content"], "thinking");
-        assert!(with("strip")["choices"][0]["message"].get("reasoning_content").is_none());
-        assert_eq!(with("inline")["choices"][0]["message"]["content"], "<think>thinking</think>answer");
-        assert_eq!(with("field")["choices"][0]["message"]["reasoning"], "thinking");
+        assert_eq!(
+            with("keep")["choices"][0]["message"]["reasoning_content"],
+            "thinking"
+        );
+        assert!(with("strip")["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
+        assert_eq!(
+            with("inline")["choices"][0]["message"]["content"],
+            "<think>thinking</think>answer"
+        );
+        assert_eq!(
+            with("field")["choices"][0]["message"]["reasoning"],
+            "thinking"
+        );
     }
 
     #[test]
@@ -762,7 +824,10 @@ mod tests {
     #[test]
     fn an_invalid_rule_is_skipped_instead_of_taking_the_relay_down() {
         let rules = compile_text_rules(&[
-            TextRule { pattern: "([unclosed".into(), ..Default::default() },
+            TextRule {
+                pattern: "([unclosed".into(),
+                ..Default::default()
+            },
             TextRule {
                 pattern: "ok".into(),
                 replacement: "fine".into(),
@@ -790,7 +855,9 @@ mod tests {
         let mut acc = Map::new();
         collect_tool_calls(
             &mut acc,
-            &[serde_json::json!({"index": 0, "id": "call_1", "function": {"name": "get_", "arguments": "{\"a\""}})],
+            &[
+                serde_json::json!({"index": 0, "id": "call_1", "function": {"name": "get_", "arguments": "{\"a\""}}),
+            ],
         );
         collect_tool_calls(
             &mut acc,

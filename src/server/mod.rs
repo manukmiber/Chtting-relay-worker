@@ -46,7 +46,10 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Apply the configured CORS policy to a response.
-pub fn cors_headers(origins: &[String], request_origin: Option<&str>) -> Vec<(&'static str, HeaderValue)> {
+pub fn cors_headers(
+    origins: &[String],
+    request_origin: Option<&str>,
+) -> Vec<(&'static str, HeaderValue)> {
     let allow = if origins.iter().any(|o| o == "*") {
         Some("*".to_string())
     } else {
@@ -85,7 +88,10 @@ mod tests {
     fn proxy_headers_are_honoured_only_when_trusted() {
         let mut headers = HeaderMap::new();
         headers.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.9"));
-        headers.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7, 10.1.1.1"));
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.7, 10.1.1.1"),
+        );
 
         assert_eq!(client_ip(&headers, peer(), true), "203.0.113.9");
         assert_eq!(client_ip(&headers, peer(), false), "10.0.0.1");
@@ -111,9 +117,13 @@ mod tests {
     fn a_specific_origin_list_does_not_echo_arbitrary_origins() {
         let origins = vec!["https://app.example.com".to_string()];
         let allowed = cors_headers(&origins, Some("https://app.example.com"));
-        assert!(allowed.iter().any(|(k, v)| *k == "access-control-allow-origin" && v == "https://app.example.com"));
+        assert!(allowed
+            .iter()
+            .any(|(k, v)| *k == "access-control-allow-origin" && v == "https://app.example.com"));
 
         let denied = cors_headers(&origins, Some("https://evil.example.com"));
-        assert!(!denied.iter().any(|(k, _)| *k == "access-control-allow-origin"));
+        assert!(!denied
+            .iter()
+            .any(|(k, _)| *k == "access-control-allow-origin"));
     }
 }
