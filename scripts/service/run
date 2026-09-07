@@ -2,11 +2,11 @@
 # runit service for termux-services:
 #
 #   pkg install termux-services
-#   ln -s ~/chtting-relay/scripts/service $PREFIX/var/service/chtting-relay
+#   ln -s ~/Chtting-relay-worker/scripts/service $PREFIX/var/service/chtting-relay
 #   sv up chtting-relay
 #
 # Logs go to the Termux service log; the relay also writes data/logs/relay.log.
 exec 2>&1
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 termux-wake-lock 2>/dev/null || true
-exec node src/cli.js start
+exec ./target/release/chtting-relay start

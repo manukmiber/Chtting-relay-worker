@@ -1,0 +1,143 @@
+name: Release
+
+# Publishes prebuilt Termux binaries so installing on a phone is a download
+# rather than a 5-15 minute compile.
+#
+#   git tag v2.0.0 && git push origin v2.0.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and publish
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-linux-android
+          - arch: armv7
+            target: armv7-linux-androideabi
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # Only first-party actions plus the runner's own rustup: a repository
+      # that restricts which actions may run would refuse this workflow at
+      # startup if it depended on third-party ones.
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.arch }}-
+
+      # The runner exports ANDROID_NDK_LATEST_HOME, which the script finds.
+      - name: Cross-compile
+        run: bash scripts/build-android.sh ${{ matrix.arch }}
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          name="chtting-relay-${version}-${TARGET}"
+
+          mkdir -p "dist/$name"
+          cp "target/${TARGET}/release/chtting-relay" "dist/$name/"
+          cp README.md docs/CONFIG.md config/config.example.json "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          ls -lh dist/
+          cat dist/*.tar.gz.sha256 > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      # The notes go through a file: a multi-line string inlined here would
+      # carry this file's own YAML indentation into the release body.
+      - name: Write release notes
+        run: |
+          cat > dist/NOTES.md <<'EOF'
+          Prebuilt binaries for Termux — no Rust toolchain and no Node needed on the phone.
+
+          ```bash
+          bash scripts/install-termux.sh
+          ```
+
+          That downloads the right binary for your device. To grab one by hand:
+
+          | Device | Asset |
+          |---|---|
+          | 64-bit (almost every phone since ~2016) | `*-aarch64-linux-android.tar.gz` |
+          | 32-bit | `*-armv7-linux-androideabi.tar.gz` |
+
+          Verify with `sha256sum -c SHA256SUMS`.
+          EOF
+          cat dist/NOTES.md
+
+      # `gh` is preinstalled on the runner, so this needs no third-party action.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; uploading assets to it"
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --notes-file dist/NOTES.md \
+              dist/*.tar.gz dist/SHA256SUMS
+          fi
