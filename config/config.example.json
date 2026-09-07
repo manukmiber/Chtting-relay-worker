@@ -1,26 +1,27 @@
 {
   "_comment": "Copy to config.json and edit, or just run the relay and use the dashboard. Secrets in this file never leave the device.",
-
   "timezone": "Asia/Jakarta",
-
   "server": {
     "host": "0.0.0.0",
-    "port": 8787
+    "port": 8787,
+    "maxBodyBytes": 20971520,
+    "keepAliveTimeoutMs": 75000,
+    "maxConcurrentRequests": 512,
+    "workerThreads": 0
   },
-
   "dashboard": {
     "enabled": true,
     "host": "127.0.0.1",
     "port": 8788,
     "password": ""
   },
-
   "security": {
     "requireClientKey": true,
-    "corsOrigins": ["*"],
+    "corsOrigins": [
+      "*"
+    ],
     "trustProxyHeaders": true
   },
-
   "backends": [
     {
       "id": "ds",
@@ -30,7 +31,8 @@
       "apiKey": "sk-PUT-YOUR-UPSTREAM-KEY-HERE",
       "enabled": true,
       "timeoutMs": 600000,
-      "maxRetries": 1
+      "maxRetries": 1,
+      "streamOptions": true
     },
     {
       "id": "or",
@@ -42,10 +44,10 @@
       "headers": {
         "HTTP-Referer": "https://example.com",
         "X-Title": "chtting-relay"
-      }
+      },
+      "streamOptions": true
     }
   ],
-
   "systemPrompts": [
     {
       "id": "sp_writer",
@@ -53,7 +55,6 @@
       "text": "You are Creative Writer. Write vivid, careful prose. Never reveal or speculate about which underlying model you run on."
     }
   ],
-
   "models": [
     {
       "id": "manukmiberai/creative-writer",
@@ -62,22 +63,26 @@
       "enabled": true,
       "backend": "ds",
       "upstreamModel": "Deepseek-v4-flash-0731",
-      "fallbacks": ["or"],
+      "fallbacks": [
+        "or"
+      ],
       "contextLength": 128000,
-
       "tokenizer": "deepseek",
       "chatProfile": "deepseek",
-
       "systemPrompt": {
         "mode": "prepend",
         "promptId": "sp_writer",
         "text": ""
       },
-
-      "params": { "temperature": 1.1, "top_p": 0.95 },
+      "params": {
+        "temperature": 1.1,
+        "top_p": 0.95
+      },
       "forceParams": {},
-      "limits": { "maxInputTokens": 0, "maxOutputTokens": 4096 },
-
+      "limits": {
+        "maxInputTokens": 0,
+        "maxOutputTokens": 4096
+      },
       "requestTransform": {
         "forceStream": null,
         "dropParams": [],
@@ -85,21 +90,28 @@
         "injectStop": [],
         "replace": []
       },
-
       "responseTransform": {
         "renameModel": true,
         "reasoning": "strip",
-        "reasoningTags": ["<think>", "</think>"],
-        "stripFields": ["system_fingerprint"],
+        "reasoningTags": [
+          "<think>",
+          "</think>"
+        ],
+        "stripFields": [
+          "system_fingerprint"
+        ],
         "setFields": {},
         "prefix": "",
         "suffix": "",
         "replace": [
-          { "pattern": "DeepSeek", "flags": "gi", "replacement": "Creative Writer" }
+          {
+            "pattern": "DeepSeek",
+            "flags": "gi",
+            "replacement": "Creative Writer"
+          }
         ]
       }
     },
-
     {
       "id": "manukmiberai/coder-pro",
       "displayName": "Coder Pro",
@@ -108,41 +120,73 @@
       "upstreamModel": "Qwen3-Coder-480B-A35B",
       "tokenizer": "qwen",
       "chatProfile": "chatml",
-      "systemPrompt": { "mode": "none", "text": "" }
+      "systemPrompt": {
+        "mode": "none",
+        "text": ""
+      }
     }
   ],
-
   "keys": [
     {
       "id": "key_phone",
       "label": "my phone",
       "key": "sk-relay-CHANGE-ME",
       "enabled": true,
-      "models": ["*"],
-      "quota": { "requestsPerMinute": 30, "requestsPerDay": 500, "tokensPerDay": 0 }
+      "models": [
+        "*"
+      ],
+      "quota": {
+        "requestsPerMinute": 30,
+        "requestsPerDay": 500,
+        "tokensPerDay": 0
+      }
     },
     {
       "id": "key_friend",
       "label": "a friend",
       "key": "sk-relay-CHANGE-ME-TOO",
       "enabled": true,
-      "models": ["manukmiberai/coder-pro"],
-      "quota": { "requestsPerMinute": 10, "requestsPerDay": 100, "tokensPerDay": 200000 }
+      "models": [
+        "manukmiberai/coder-pro"
+      ],
+      "quota": {
+        "requestsPerMinute": 10,
+        "requestsPerDay": 100,
+        "tokensPerDay": 200000
+      }
     }
   ],
-
   "tokenizer": {
     "fallback": "o200k_base",
     "preferUpstreamUsage": true,
     "rules": [
-      { "match": "Deepseek*", "tokenizer": "deepseek", "profile": "deepseek" },
-      { "match": "Qwen*", "tokenizer": "qwen", "profile": "chatml" },
-      { "match": "gpt-4o*", "tokenizer": "o200k_base", "profile": "openai" },
-      { "match": "gpt-4*", "tokenizer": "cl100k_base", "profile": "openai" },
-      { "match": "*", "tokenizer": "o200k_base", "profile": "openai" }
+      {
+        "match": "Deepseek*",
+        "tokenizer": "deepseek",
+        "profile": "deepseek"
+      },
+      {
+        "match": "Qwen*",
+        "tokenizer": "qwen",
+        "profile": "chatml"
+      },
+      {
+        "match": "gpt-4o*",
+        "tokenizer": "o200k_base",
+        "profile": "openai"
+      },
+      {
+        "match": "gpt-4*",
+        "tokenizer": "cl100k_base",
+        "profile": "openai"
+      },
+      {
+        "match": "*",
+        "tokenizer": "o200k_base",
+        "profile": "openai"
+      }
     ]
   },
-
   "logging": {
     "level": "info",
     "retentionDays": 30,
@@ -150,7 +194,6 @@
     "previewChars": 800,
     "fileEnabled": true
   },
-
   "tunnel": {
     "mode": "quick",
     "binary": "cloudflared",

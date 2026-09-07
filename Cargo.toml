@@ -1,0 +1,83 @@
+[package]
+name = "chtting-relay"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Termux-native, stateful LLM relay: exact tokenizing, model-name translation, response reshaping, localhost dashboard, Cloudflare Tunnel"
+license = "MIT"
+
+[lib]
+name = "chtting_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chtting-relay"
+path = "src/main.rs"
+
+[dependencies]
+# --- async runtime + HTTP -------------------------------------------------
+# A multi-thread runtime is the whole point of the Rust port: hundreds of
+# concurrent callers are spread over every core instead of one event loop.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util", "sync", "fs"] }
+tokio-stream = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
+tower = { version = "0.5", default-features = false }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# TLS through `ring`, never `aws-lc-rs`: aws-lc needs cmake and (sometimes) Go,
+# neither of which is reasonable to require inside Termux. `ring` builds with
+# the clang that `pkg install rust` already pulls in.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2", "charset"] }
+
+# --- data -----------------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# `bundled` compiles SQLite from source, so the relay does not depend on
+# whatever libsqlite version a given Termux install happens to carry.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# --- tokenizing -----------------------------------------------------------
+# The reference implementations themselves rather than a reimplementation:
+# tiktoken-rs embeds OpenAI's rank files, and `tokenizers` is HuggingFace's own
+# Rust crate that the Python package is a binding for.
+tiktoken-rs = "0.9"
+# default features pull in `onig` (C) and `esaxx_fast` (C++); the fancy-regex
+# path is pure Rust and cross-compiles to Android without extra toolchains.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+# --- misc -----------------------------------------------------------------
+# fancy-regex, not `regex`: user-written rewrite rules are JS-flavoured and do
+# use lookaround, which the `regex` crate deliberately cannot express.
+fancy-regex = "0.16"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+include_dir = "0.7"
+rand = "0.9"
+arc-swap = "1"
+parking_lot = "0.12"
+anyhow = "1"
+thiserror = "2"
+subtle = "2"
+percent-encoding = "2"
+base64 = "0.22"
+# Matches the hasher `tiktoken_rs::CoreBPE::new` expects for its rank tables.
+rustc-hash = "1.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+# The dashboard tests need a cookie jar to hold a signed-in session.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2", "charset", "cookies"] }
+
+[profile.release]
+# Termux builds on a phone: `thin` LTO gets most of the win for a fraction of
+# the peak memory `fat` needs, and 4 codegen units keeps the build parallel.
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "unwind"

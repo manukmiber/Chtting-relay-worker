@@ -4,6 +4,11 @@ Everything lives in one file, `config/config.json`, written atomically on every
 save so a phone that loses power mid-write cannot corrupt it. The dashboard
 edits the same file; there is no second source of truth.
 
+Reads happen on every request and take no lock: the live config is published
+through an atomic pointer swap, so a save never blocks traffic and traffic never
+blocks a save. A saved change is live on the very next request — no restart,
+except for `server.workerThreads` and the two listen ports.
+
 Move it with `CHTTING_CONFIG=/path/to/config.json`, or move the whole state
 directory with `CHTTING_HOME`. The shipped assets (`public/`) always stay next
 to the code.
@@ -39,9 +44,19 @@ to the code.
 | `port` | `8787` | relay port — the only one published |
 | `maxBodyBytes` | `20971520` | request body ceiling |
 | `keepAliveTimeoutMs` | `75000` | idle keep-alive |
+| `maxConcurrentRequests` | `512` | calls allowed in flight upstream at once |
+| `workerThreads` | `0` | Tokio worker threads; `0` means one per core |
 
 There is no relay-side request timeout: a long generation must not be cut off.
 Upstream timeouts are per backend.
+
+`maxConcurrentRequests` is a shed-load ceiling, not a queue. Once it is reached
+the relay answers `503` with `Retry-After: 1` immediately, because a request
+queued behind a phone that cannot keep up helps nobody. Raise it if your backend
+is fast and your phone has headroom; lower it if the device gets hot.
+
+`workerThreads` is read before the async runtime starts, so it only takes effect
+on restart. Lower it to leave cores for other Termux processes.
 
 ## `dashboard`
 
@@ -79,6 +94,7 @@ The real providers. Their API keys never leave the device.
 | `timeoutMs` | `600000` | per attempt |
 | `maxRetries` | `1` | retries on 429, 5xx and dropped connections, with backoff |
 | `streamOptions` | `true` | ask for `stream_options.include_usage` while streaming |
+| `note` | `""` | free text for your own reference |
 | `headers` | `{}` | extra headers, e.g. OpenRouter's `HTTP-Referer` |
 
 ---
@@ -187,9 +203,25 @@ A rule:
 { "match": "Deepseek*", "tokenizer": "deepseek", "profile": "deepseek" }
 ```
 
-`match` is a case-insensitive glob against the **backend** model name.
-`tokenizer` names a file in `data/tokenizers/` (`<name>.tiktoken` or
-`<name>.tokenizer.json`). A model's own `tokenizer` field bypasses these rules.
+`match` is a case-insensitive glob against the **backend** model name — the one
+that actually bills, not the public alias. A model's own `tokenizer` field
+bypasses these rules entirely and is used verbatim.
+
+`tokenizer` names either:
+
+* a **built-in** OpenAI vocabulary — `o200k_base`, `cl100k_base`, `p50k_base`,
+  `p50k_edit`, `r50k_base`, `o200k_harmony`. These are compiled into the binary
+  and need no download.
+* a file in `data/tokenizers/`: `<name>.tokenizer.json` (a HuggingFace
+  `tokenizer.json`, loaded through HuggingFace's own `tokenizers` crate) or
+  `<name>.tiktoken` (an OpenAI rank file).
+
+A `.tiktoken` file carries no pre-tokenizer pattern of its own, so the split is
+chosen by name: anything containing `o200k` uses the o200k split, everything
+else the cl100k one.
+
+An unknown or missing vocabulary is never fatal — the relay falls back to a
+script-aware estimator and marks every count `exact: false`.
 
 ### Chat profiles
 
@@ -204,7 +236,7 @@ template — the tokens billed on top of your message text.
 | Key | Default | Meaning |
 |---|---|---|
 | `level` | `info` | `debug`, `info`, `warn`, `error`, `silent` |
-| `retentionDays` | `30` | request rows older than this are pruned; 0 = keep forever |
+| `retentionDays` | `30` | request rows older than this are pruned by the dashboard's Prune button; 0 = keep forever |
 | `storeBodies` | `preview` | `none`, `preview`, or `full` |
 | `previewChars` | `800` | preview length |
 | `fileEnabled` | `true` | also write `data/logs/relay.log` |

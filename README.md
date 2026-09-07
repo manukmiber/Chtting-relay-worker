@@ -1,17 +1,18 @@
 # chtting-relay
 
 Relay LLM yang jalan **native di Termux** — bukan Cloudflare Worker, bukan stateless.
-Satu proses Node yang menerima panggilan OpenAI-compatible, menerjemahkan nama model,
-menyuntik system prompt, mengubah bentuk respons, menghitung token dengan tokenizer
-asli, lalu mencatat semuanya ke dashboard lokal.
+Satu proses **Rust** yang menerima panggilan OpenAI-compatible, menerjemahkan nama
+model, menyuntik system prompt, mengubah bentuk respons, menghitung token dengan
+tokenizer asli, lalu mencatat semuanya ke dashboard lokal.
 
-> *English: a Termux-native, stateful OpenAI-compatible LLM relay with exact token
-> counting, model-name translation, prompt injection, response reshaping, a
-> localhost dashboard and Cloudflare Tunnel. Everything below applies; the code and
-> the dashboard are in English.*
+> *English: a Termux-native, stateful OpenAI-compatible LLM relay in Rust, with
+> exact token counting, model-name translation, prompt injection, response
+> reshaping, a localhost dashboard and Cloudflare Tunnel. Everything below
+> applies; the code and the dashboard are in English.*
 
-**Nol dependensi npm.** Semuanya pakai Node standard library, jadi tidak ada
-`node-gyp`, tidak ada kompilasi native — yang selalu jadi masalah di Termux.
+**Dibangun untuk ratusan pengguna konkuren.** Runtime Tokio multi-thread memakai
+semua core HP, config dibaca lock-free, metrik ditulis satu writer di belakang
+channel, dan kuota harian dijawab dari memori — bukan query SQLite per request.
 
 ```
      HP kamu (Termux)                                   internet
@@ -34,13 +35,18 @@ asli, lalu mencatat semuanya ke dashboard lokal.
 
 ```bash
 pkg install git
-git clone https://github.com/manukmiber/chtting-relay-worker.git
-cd chtting-relay-worker
+git clone https://github.com/manukmiber/Chtting-relay-worker
+cd Chtting-relay-worker
 bash scripts/install-termux.sh
 ```
 
-Script itu memasang Node dan `cloudflared`, mengunduh vocabulary tokenizer yang
-kamu pilih, membuat config awal, dan mencetak client key pertama.
+Script itu memasang toolchain Rust dan `cloudflared`, membangun binary,
+menawarkan unduh vocabulary tokenizer, membuat config awal, dan mencetak client
+key pertama.
+
+> **Build pertama lama** — 5 sampai 15 menit di HP, sekali saja. Yang dipasang
+> cuma `rust` dan `clang`; tidak ada cmake, tidak ada Go, tidak ada Node.
+> Kalau core-nya sedikit script otomatis pakai `-j1` supaya tidak kehabisan RAM.
 
 Jalankan:
 
@@ -51,16 +57,11 @@ bash scripts/start-termux.sh        # pakai termux-wake-lock, aman layar mati
 Buka `http://127.0.0.1:8788` di browser HP. Itu dashboard-nya.
 
 <details>
-<summary>Jalan otomatis saat HP nyala / sebagai service</summary>
-
-**Termux:Boot** — pasang app Termux:Boot dari F-Droid, lalu jalankan
-`install-termux.sh` sekali lagi; script menaruh launcher di `~/.termux/boot/`.
-
-**termux-services (runit)**
+<summary>Jalan otomatis sebagai service</summary>
 
 ```bash
 pkg install termux-services
-ln -s ~/chtting-relay-worker/scripts/service $PREFIX/var/service/chtting-relay
+ln -s ~/Chtting-relay-worker/scripts/service $PREFIX/var/service/chtting-relay
 sv up chtting-relay
 sv status chtting-relay
 ```
@@ -68,47 +69,68 @@ sv status chtting-relay
 
 ---
 
+## Kenapa Rust
+
+Versi sebelumnya jalan di Node. Untuk ratusan pengguna konkuren di HP, ini yang
+berubah:
+
+| | Node (v1) | Rust (v2) |
+|---|---|---|
+| Paralelisme | satu event loop, satu core | Tokio multi-thread, semua core |
+| Baca config per request | clone objek | `ArcSwap` — baca atomik, tanpa lock |
+| Cek kuota harian | satu `SELECT` SQLite per request | counter di memori, di-seed saat start |
+| Tulis metrik | sinkron di jalur request | channel → satu writer, batch per transaksi |
+| Tokenisasi | JS, blocking event loop | pool blocking, tidak menahan stream orang lain |
+| Kelebihan beban | antre sampai HP megap | semaphore + **503 langsung** |
+| Koneksi ke backend | handshake per request | connection pool reqwest, TLS tetap hangat |
+| Tokenizer | implementasi BPE sendiri | library rujukan aslinya |
+
+Yang dipasang di HP juga menyusut: satu binary statis, tanpa runtime Node,
+tanpa `node_modules`.
+
+---
+
 ## 1. Tokenizer yang akurat
 
 Ini bagian yang paling menentukan angka biaya kamu benar atau tidak.
 
-Relay ini punya implementasi BPE sendiri, murni JavaScript, dan sudah
-**diverifikasi byte-exact** terhadap library rujukan:
+Versi Rust tidak memakai implementasi BPE sendiri — ia memakai **implementasi
+rujukannya langsung**:
 
-| Vocabulary | Rujukan | Hasil |
+| Vocabulary | Dipakai | Hasil |
 |---|---|---|
-| `cl100k_base`, `o200k_base` | OpenAI `tiktoken` | **token id identik**, bukan cuma jumlahnya |
-| DeepSeek, Qwen, Llama-2/3 | HuggingFace `tokenizers` | **jumlah token identik** |
-| BERT (WordPiece) | HuggingFace `tokenizers` | persis untuk teks normal |
-| T5 (Unigram) | HuggingFace `tokenizers` | persis untuk teks normal¹ |
+| `cl100k_base`, `o200k_base`, `p50k`, `r50k` | `tiktoken-rs` (rank file OpenAI, ikut ter-compile ke binary) | token id identik dengan `tiktoken` Python |
+| DeepSeek, Qwen, Llama, Mistral, Gemma, GLM | crate `tokenizers` milik HuggingFace | identik — ini kode yang sama yang dipakai package Python-nya |
+| BERT (WordPiece), T5 (Unigram) | crate `tokenizers` | identik, termasuk *precompiled charsmap* |
 
-¹ T5 memakai *precompiled charsmap* sentencepiece yang tidak bisa direplikasi
-persis tanpa blob-nya; dianggap NFKC. Untuk teks biasa hasilnya sama, untuk
-karakter kontrol langka bisa beda satu-dua token. Model yang benar-benar dipakai
-sebagai backend relay (GPT, DeepSeek, Qwen, Llama) semuanya exact.
+Bedanya dengan versi Node: dulu BPE, byte-fallback, dan pre-tokenizer ditulis
+ulang dengan tangan, dan T5/BERT hanya mendekati. Sekarang semuanya exact karena
+yang jalan memang library aslinya.
 
-Yang didukung: tiktoken rank files, dan HuggingFace `tokenizer.json` dalam bentuk
-BPE (byte-level maupun metaspace/sentencepiece, termasuk `byte_fallback` dan
-penggabungan `<unk>`), Unigram (Viterbi), dan WordPiece.
+Diverifikasi lewat test terhadap fixture yang dibuat pakai `tiktoken` dan
+`tokenizers` Python asli — jalankan `cargo test`.
 
-### Pasang vocabulary
+**Vocabulary OpenAI tidak perlu diunduh sama sekali**; ikut di dalam binary.
+
+### Pasang vocabulary model terbuka
 
 Dari dashboard tab **Tokenizer**, atau:
 
 ```bash
-npm run tokenizer:fetch cl100k_base o200k_base deepseek qwen
-node scripts/fetch-tokenizer.mjs --hf Qwen/Qwen3-8B --as qwen3
-HF_TOKEN=hf_xxx node scripts/fetch-tokenizer.mjs llama3     # repo gated
+chtting-relay tokenizer list
+chtting-relay tokenizer install deepseek
+chtting-relay tokenizer install Qwen/Qwen3-8B --as qwen3
 ```
 
-Sekali unduh, seterusnya jalan offline. Kalau belum ada vocabulary, relay tetap
-jalan memakai estimator sadar-skrip, dan setiap angka diberi tanda
-`exact: false` supaya tidak diam-diam dianggap fakta.
+Sekali unduh, seterusnya jalan offline. File diperiksa dulu sebelum disimpan,
+jadi unduhan gagal tidak akan menyamar jadi vocabulary terpasang.
+
+Kalau vocabulary belum ada, relay tetap jalan memakai estimator sadar-skrip, dan
+setiap angka diberi tanda `exact: false` supaya tidak diam-diam dianggap fakta.
 
 ### Yang dihitung, bukan cuma teks
 
-Yang dibilling backend bukan cuma isi pesan, tapi juga overhead chat template.
-Jadi yang dihitung:
+Yang dibilling backend bukan cuma isi pesan, tapi juga overhead chat template:
 
 - teks tiap pesan, per-role (system / user / assistant / tool)
 - overhead template per pesan — profil `openai`, `chatml`, `llama3`, `deepseek`,
@@ -164,6 +186,8 @@ Tiap alias punya mode:
 Teksnya bisa ditulis inline di alias, atau diambil dari **library prompt** (tab
 Prompts) supaya satu persona dipakai beberapa alias sekaligus.
 
+Aturan rewrite request tidak pernah menyentuh system prompt kamu sendiri.
+
 ---
 
 ## 4. Mengubah bentuk respons
@@ -198,8 +222,9 @@ Sisi request juga bisa dibentuk: `dropParams` untuk backend yang rewel,
 
 ## 5. Logging dan metrik
 
-Satu baris per panggilan, masuk SQLite (`node:sqlite`, bawaan Node 22 — tanpa
-kompilasi). Node lama otomatis jatuh ke JSONL append-only.
+Satu baris per panggilan, masuk SQLite (WAL, di-*bundle* jadi tidak bergantung
+versi sqlite Termux). Handler tidak pernah menunggu disk: baris dikirim lewat
+channel ke satu writer yang menulisnya per-batch dalam satu transaksi.
 
 Yang dicatat: token input dan output, token cached dan reasoning, **TTFT**,
 jendela generasi, **tokens/detik**, total latensi, status, alasan berhenti,
@@ -228,8 +253,8 @@ punya TTFT, dan rata-ratanya tidak dikotori angka palsu.
 ## 6. Dashboard
 
 Di `http://127.0.0.1:8788`, terikat ke localhost dan **tidak pernah dilewatkan
-tunnel**. Vanilla JS, tanpa build step, tanpa CDN — jadi tetap terbuka meski HP
-sedang offline.
+tunnel**. Vanilla JS, tanpa build step, tanpa CDN — dan sekarang **ikut
+ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pun.
 
 | Tab | Isinya |
 |---|---|
@@ -252,14 +277,32 @@ tampil termask, dan menyimpan form tidak akan menimpa key asli dengan masknya.
 
 ## 7. Cloudflare Tunnel
 
-Tab **Tunnel**, atau `node src/cli.js tunnel`.
+Tab **Tunnel**, atau setel `tunnel.autoStart` di config.
 
 - **quick** — URL `*.trycloudflare.com` gratis, tanpa akun Cloudflare
 - **named** — hostname sendiri, pakai tunnel token dari Zero Trust
-- autoStart menyalakan tunnel bersama relay dan menyambungkannya lagi kalau putus
-  (jaringan seluler memang sering putus)
+- autoStart menyalakan tunnel bersama relay dan menyambungkannya lagi kalau putus,
+  dengan backoff (jaringan seluler memang sering putus)
 
-Yang dipublikasikan hanya port relay. Dashboard tetap di localhost.
+Yang dipublikasikan hanya port relay. Dashboard tetap di localhost. Tunnel token
+tidak pernah ikut tertulis ke buffer log yang ditampilkan dashboard.
+
+---
+
+## Setelan untuk banyak pengguna
+
+Di `config.json` bagian `server`:
+
+| Kunci | Default | Artinya |
+|---|---|---|
+| `maxConcurrentRequests` | `512` | batas panggilan yang sedang berjalan ke backend. Lewat itu relay menjawab **503 + `Retry-After`** langsung, bukan mengantre sampai HP tidak sanggup |
+| `workerThreads` | `0` | jumlah thread Tokio; `0` berarti satu per core. Turunkan kalau mau menyisakan tenaga buat aplikasi lain |
+| `keepAliveTimeoutMs` | `75000` | keep-alive koneksi masuk |
+
+Kuota per key (`keys[].quota`) dihitung di memori: `requestsPerMinute` pakai
+sliding window ter-*shard*, `requestsPerDay` dan `tokensPerDay` pakai counter
+harian yang di-seed dari database saat start dan berputar sendiri di tengah malam
+zona waktumu.
 
 ---
 
@@ -279,26 +322,30 @@ curl https://xxx.trycloudflare.com/v1/chat/completions \
 ```
 
 Endpoint: `GET /health`, `GET /v1/models`, `GET /v1/models/:id`,
-`POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`.
+`POST /v1/chat/completions`, `POST /chat/completions`, `POST /v1/completions`,
+`POST /v1/embeddings`.
 
 ---
 
 ## CLI
 
 ```
-chtting start                 jalankan relay + dashboard
-chtting doctor                periksa lingkungan dan konfigurasi
-chtting config path|show
-chtting key new [label]       buat client key, ditampilkan sekali
-chtting key list
-chtting backend add --id ds --url https://api.deepseek.com/v1 --key sk-...
-chtting model add --id manukmiberai/creative-writer --backend ds \
-                  --upstream deepseek-chat --tokenizer deepseek
-chtting tokenizer list
-chtting tunnel                jalankan tunnel saja
+chtting-relay start [--port N] [--no-dashboard]
+chtting-relay doctor                    periksa lingkungan dan konfigurasi
+chtting-relay config path|show
+chtting-relay key new --label "hp saya" client key baru, ditampilkan sekali
+chtting-relay key list
+chtting-relay backend add --name deepseek \
+      --base-url https://api.deepseek.com/v1 --api-key sk-...
+chtting-relay backend list
+chtting-relay model add --id manukmiberai/creative-writer \
+      --backend <id> --upstream Deepseek-v4-flash-0731
+chtting-relay model list
+chtting-relay tokenizer list
+chtting-relay tokenizer install deepseek
 ```
 
-Opsi: `--port`, `--dashboard-port`, `--no-dashboard`, `--config <file>`.
+`--home <dir>` memindahkan seluruh state.
 
 ---
 
@@ -306,15 +353,17 @@ Opsi: `--port`, `--dashboard-port`, `--no-dashboard`, `--config <file>`.
 
 ```
 src/
-  tokenizer/    BPE core, loader tiktoken & HuggingFace, pre-tokenizer,
-                penghitungan chat, estimator, registry
-  relay/        routing, upstream + fallback, transform, SSE, handler + metrik
-  server/       API publik, dashboard + admin API
-  store/        SQLite dan JSONL
-  tunnel/       supervisor cloudflared
-public/         dashboard (vanilla JS, tanpa build)
-scripts/        setup Termux, service runit, pengunduh tokenizer
-tests/          52 test: tokenizer, transform, relay end-to-end
+  config.rs      skema config, simpan atomik, validasi, masking
+  state.rs       yang dibagi semua handler
+  logging.rs     log berlevel, file writer di background
+  tokenizer/     registry vocabulary, penghitungan chat, estimator
+  relay/         upstream + fallback, transform, SSE, handler + metrik
+  server/        API publik, dashboard + admin API
+  store/         SQLite, quota tracker, rate limiter
+  tunnel.rs      supervisor cloudflared
+public/          dashboard (vanilla JS, ikut ter-compile ke binary)
+scripts/         setup Termux, service runit
+tests/           test end-to-end lewat HTTP asli
 ```
 
 Data ada di `data/` (database, log, vocabulary), config di `config/config.json`.
@@ -324,17 +373,21 @@ Keduanya di-gitignore. `CHTTING_HOME`, `CHTTING_CONFIG`, `CHTTING_DATA` dan
 ## Test
 
 ```bash
-npm test
+cargo test
 ```
 
-Test tokenizer memakai fixture hasil `tiktoken` dan `tokenizers` asli. Test yang
-butuh vocabulary akan di-skip, bukan gagal, kalau vocabulary-nya belum dipasang.
+Test tokenizer membandingkan dengan fixture hasil `tiktoken` dan `tokenizers`
+Python asli. Test yang butuh vocabulary HuggingFace akan di-skip, bukan gagal,
+kalau vocabulary-nya belum dipasang. Test relay dan dashboard menjalankan server
+sungguhan lewat HTTP di depan backend tiruan — termasuk 300 pemanggil serentak
+dan pengujian bahwa kelebihan beban dijawab 503, bukan diantre.
 
 ## Catatan keamanan
 
 - API key backend tidak pernah keluar dari HP; pemanggil hanya memegang client key relay.
 - Dashboard default terikat `127.0.0.1` dan tidak masuk tunnel. Kalau kamu ubah
   bindingnya, pasang password.
+- Perbandingan client key memakai constant-time compare.
 - Prompt hanya disimpan lokal. Kalau tidak mau disimpan sama sekali, set
   `logging.storeBodies` ke `none`.
 - Client key ditampilkan penuh sekali saat dibuat, sesudah itu selalu termask.

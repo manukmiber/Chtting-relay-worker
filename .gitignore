@@ -1,5 +1,5 @@
-node_modules/
-npm-debug.log*
+# Rust build output
+/target/
 
 # runtime state (never commit)
 config/config.json
@@ -8,7 +8,6 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
-data/*.jsonl
 data/logs/
 data/tokenizers/*
 !data/tokenizers/.gitkeep
