@@ -225,16 +225,34 @@ export function createDashboardServer(ctx) {
   router.post('/api/tokenizer/count', async (req, res) => {
     const body = await readJson(req, 4 * 1024 * 1024);
     const route = config.findModel(body.model);
-    const tokenizerName = body.tokenizer || route?.tokenizer || route?.upstreamModel || body.model;
+    // Resolve exactly as the relay does: the model name drives the rules, and
+    // an explicitly pinned vocabulary wins over them.
+    const model = route?.upstreamModel || body.model || '';
+    const override = {
+      tokenizer: body.tokenizer || route?.tokenizer || '',
+      profile: body.profile || route?.chatProfile || '',
+    };
 
     if (Array.isArray(body.messages)) {
       const cfg = config.get();
       const upstreamShape = { messages: body.messages, tools: body.tools };
-      const counted = await counter.countRequest(upstreamShape, tokenizerName, cfg.tokenizer.imageDefaults);
-      return sendJson(res, 200, { mode: 'messages', ...counted, resolved: counter.registry.match(tokenizerName) });
+      const counted = await counter.countRequest(upstreamShape, model, cfg.tokenizer.imageDefaults, override);
+      const resolved = await counter.resolve(model, override);
+      return sendJson(res, 200, {
+        mode: 'messages',
+        ...counted,
+        profile: resolved.profile,
+        resolved: { tokenizer: resolved.tokenizer, profile: resolved.profile },
+      });
     }
-    const detail = await counter.pieces(body.text ?? '', tokenizerName, Number(body.limit ?? 2000));
-    return sendJson(res, 200, { mode: 'text', ...detail, resolved: counter.registry.match(tokenizerName) });
+
+    const detail = await counter.pieces(body.text ?? '', model, Number(body.limit ?? 2000), override);
+    const resolved = await counter.resolve(model, override);
+    return sendJson(res, 200, {
+      mode: 'text',
+      ...detail,
+      resolved: { tokenizer: resolved.tokenizer, profile: resolved.profile },
+    });
   });
 
   router.post('/api/tokenizer/install', async (req, res) => {
