@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Config } from './config.js';
 import { Logger } from './logger.js';
@@ -13,15 +14,22 @@ import { TunnelManager } from './tunnel/cloudflared.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+/**
+ * CHTTING_HOME moves the *state* (config, database, vocabularies); the shipped
+ * assets stay next to the code, so pointing HOME at a data directory does not
+ * leave the dashboard serving 404s.
+ */
 export function resolvePaths(overrides = {}) {
-  const root = overrides.root ?? process.env.CHTTING_HOME ?? ROOT;
+  const home = overrides.root ?? process.env.CHTTING_HOME ?? ROOT;
+  const data = overrides.data ?? process.env.CHTTING_DATA ?? path.join(home, 'data');
   return {
-    root,
-    config: overrides.config ?? process.env.CHTTING_CONFIG ?? path.join(root, 'config', 'config.json'),
-    data: overrides.data ?? process.env.CHTTING_DATA ?? path.join(root, 'data'),
-    logs: overrides.logs ?? path.join(overrides.data ?? path.join(root, 'data'), 'logs'),
-    tokenizers: overrides.tokenizers ?? process.env.CHTTING_TOKENIZER_DIR ?? path.join(root, 'data', 'tokenizers'),
-    public: overrides.public ?? path.join(root, 'public'),
+    root: ROOT,
+    home,
+    config: overrides.config ?? process.env.CHTTING_CONFIG ?? path.join(home, 'config', 'config.json'),
+    data,
+    logs: overrides.logs ?? path.join(data, 'logs'),
+    tokenizers: overrides.tokenizers ?? process.env.CHTTING_TOKENIZER_DIR ?? path.join(data, 'tokenizers'),
+    public: overrides.public ?? path.join(ROOT, 'public'),
   };
 }
 
@@ -73,6 +81,9 @@ export async function createApp(overrides = {}) {
       logger.info(`relay API listening on http://${c.server.host}:${c.server.port}`);
 
       if (c.dashboard.enabled) {
+        if (!existsSync(path.join(paths.public, 'index.html'))) {
+          logger.warn(`dashboard assets not found at ${paths.public} - the UI will not load`);
+        }
         await listen(dashboardServer, c.dashboard.port, c.dashboard.host);
         logger.info(`dashboard on http://${c.dashboard.host}:${c.dashboard.port}`);
         if (!c.dashboard.password && c.dashboard.host !== '127.0.0.1') {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './util/quiet-warnings.js';
 import { randomBytes } from 'node:crypto';
 import { createApp, resolvePaths } from './index.js';
 import { Config } from './config.js';
@@ -14,6 +15,7 @@ usage: chtting <command> [options]
   config show           print the config with secrets masked
   key new [label]       create a client API key and print it once
   key list              list client keys
+  backend add           add an upstream backend via flags
   model add             add a model alias interactively via flags
   tokenizer list        show installed tokenizer vocabularies
   tunnel                start only the cloudflared tunnel
@@ -24,12 +26,23 @@ options:
   --no-dashboard        do not start the dashboard
   --config <file>       use a specific config file
 
+backend add flags:
+  --id <id>                 short id you reference from a model
+  --name <label>
+  --url <base url>          e.g. https://api.deepseek.com/v1
+  --key <api key>
+
 model add flags:
   --id <public name>        e.g. manukmiberai/creative-writer
   --backend <backend id>
   --upstream <real name>    e.g. Deepseek-v4-flash-0731
   --system <text>           system prompt to inject
   --tokenizer <name>        vocabulary to count with
+
+examples:
+  chtting backend add --id ds --name DeepSeek --url https://api.deepseek.com/v1 --key sk-...
+  chtting model add --id manukmiberai/creative-writer --backend ds \
+      --upstream deepseek-chat --tokenizer deepseek --system "You are Creative Writer."
 `;
 
 async function main() {
@@ -50,6 +63,8 @@ async function main() {
       return configCommand(sub, paths);
     case 'key':
       return keyCommand(sub, rest, paths);
+    case 'backend':
+      return backendCommand(sub, flags, paths);
     case 'model':
       return modelCommand(sub, flags, paths);
     case 'tokenizer':
@@ -178,6 +193,35 @@ async function keyCommand(sub, rest, paths) {
   }
   console.error('usage: chtting key <new|list> [label]');
   process.exitCode = 1;
+  return undefined;
+}
+
+async function backendCommand(sub, flags, paths) {
+  const config = await Config.load(paths.config);
+  if (sub === 'list') {
+    for (const b of config.get().backends) {
+      console.log(`${b.enabled ? '●' : '○'} ${b.id.padEnd(12)} ${b.baseUrl}  ${maskSecret(b.apiKey)}`);
+    }
+    return undefined;
+  }
+  if (sub !== 'add') {
+    console.error('usage: chtting backend <add|list> --id <id> --url <base url> [--key <api key>]');
+    process.exitCode = 1;
+    return undefined;
+  }
+  if (!flags.url) {
+    console.error('backend add needs --url');
+    process.exitCode = 1;
+    return undefined;
+  }
+  const saved = await config.upsert('backends', {
+    id: flags.id || newId('be'),
+    name: flags.name ?? flags.id ?? 'backend',
+    baseUrl: flags.url,
+    apiKey: flags.key ?? '',
+    enabled: true,
+  });
+  console.log(`added backend ${saved.id} -> ${saved.baseUrl}`);
   return undefined;
 }
 
