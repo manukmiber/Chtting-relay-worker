@@ -434,6 +434,31 @@ pub fn count_system_messages(
         .saturating_sub(p.primer + p.bos)
 }
 
+/// Whether two bodies agree everywhere the count looks, apart from system turns.
+///
+/// When they do, counting one gives the other away for free: the whole
+/// difference between them is the difference between their system turns.
+/// Injecting a system prompt always lands here, which is the common case and
+/// the one worth saving a second pass over. A rewrite rule that edits the
+/// caller's own text does not, and then there is nothing for it but to count.
+pub fn same_but_system(a: &Value, b: &Value) -> bool {
+    fn others(v: &Value) -> Vec<&Value> {
+        v.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    others(a) == others(b)
+        && ["tools", "functions", "prompt"]
+            .into_iter()
+            .all(|k| a.get(k) == b.get(k))
+}
+
 /// Count a completion: text, reasoning trace and tool calls.
 pub fn count_completion(
     text: &str,
@@ -462,6 +487,60 @@ mod tests {
     fn enc() -> Encoder {
         // Any exact vocabulary works; the assertions are about the accounting.
         builtin_encoder("cl100k_base").expect("cl100k is built in")
+    }
+
+    #[test]
+    fn the_whole_difference_between_two_bodies_is_their_system_turns() {
+        let original = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Halo, apa kabar hari ini?"},
+                {"role": "assistant", "content": "Baik, terima kasih."},
+            ]
+        });
+        let upstream = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You answer briefly and in the caller's language."},
+                {"role": "user", "content": "Halo, apa kabar hari ini?"},
+                {"role": "assistant", "content": "Baik, terima kasih."},
+            ]
+        });
+        let (e, img) = (enc(), ImageDefaults::default());
+        let theirs = count_chat_request(&original, &e, "openai", &img).total;
+        let sent = count_chat_request(&upstream, &e, "openai", &img).total;
+        let injected = count_system_messages(&upstream, &e, "openai", &img)
+            - count_system_messages(&original, &e, "openai", &img);
+
+        assert!(injected > 0, "the injected prompt should cost real tokens");
+        assert!(same_but_system(&original, &upstream));
+        // The saving behind `count_prompt`: the caller's body is counted in
+        // full and the body on the wire falls out of it, exactly, without a
+        // second walk over the whole conversation.
+        assert_eq!(theirs + injected, sent);
+    }
+
+    #[test]
+    fn a_rewritten_turn_is_not_the_same_body_and_has_to_be_counted() {
+        let original = serde_json::json!({"messages": [{"role": "user", "content": "halo"}]});
+        let injected = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "halo"},
+            ]
+        });
+        let rewritten = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "halo halo halo"},
+            ]
+        });
+        let tooled = serde_json::json!({
+            "messages": [{"role": "user", "content": "halo"}],
+            "tools": [{"type": "function", "function": {"name": "now"}}],
+        });
+
+        assert!(same_but_system(&original, &injected));
+        assert!(!same_but_system(&original, &rewritten));
+        assert!(!same_but_system(&original, &tooled));
     }
 
     #[test]

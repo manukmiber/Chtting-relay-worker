@@ -317,12 +317,11 @@ pub async fn handle_chat(
     };
     record.queued_ms = round(ticket.queued_ms, 1);
 
-    // Requirements 2 and 3. The caller's own prompt and the relay's injected
-    // one are accounted separately, so nobody is billed for a system prompt
-    // they never wrote. Physically the injection happens first and both
-    // figures come out of a single counting pass — tokenizing the same
-    // conversation twice would double the cost of the heaviest step for a
-    // number that subtraction already gives exactly. The tokenizer is the
+    // Requirements 2 and 3. The caller is counted on the body they sent, and
+    // the relay's system prompt goes in after — so nobody is billed for text
+    // they never wrote, whatever the transform does to the request on its way
+    // out. Both bodies go to the counter together because the figures come out
+    // of one pass over the thread pool, not two. The tokenizer is the
     // *backend* model's, because that is the one that bills.
     let rt = RequestTransform::merged(&cfg.defaults.request_transform, &route.request_transform);
     let mut upstream_body = transform_request(&body, &route, &cfg, &rt);

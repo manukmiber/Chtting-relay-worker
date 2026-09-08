@@ -274,10 +274,15 @@ tidak menulisnya dan tidak bisa melihatnya. Jadi tiap baris menyimpan dua angka:
 | `billed_prompt_tokens` | yang ditagih backend, sudah termasuk system prompt |
 | `system_prompt_tokens` | ukuran suntikan itu sendiri, menurut tokenizer relay |
 
-Pemanggil dibebani **hitungan pesannya sendiri**, diukur tokenizer relay sebelum
-suntikan terjadi. Kirim 6K token, yang balik ya 6K — bukan 10K. Dari sisi
-pemanggil, suntikan system prompt dan markup itu tidak bisa dibedakan, jadi
-angkanya memang harus sama persis dengan yang dia kirim.
+Pemanggil dibebani **hitungan pesannya sendiri**: relay menghitung body yang
+masuk dulu, baru menyuntik, baru mengirim. Kirim 6K token, yang balik ya 6K —
+bukan 10K. Dari sisi pemanggil, suntikan system prompt dan markup itu tidak bisa
+dibedakan, jadi angkanya memang harus sama persis dengan yang dia kirim.
+
+Karena yang diukur adalah body **sebelum relay menyentuhnya**, ini tidak berhenti
+di system prompt. Aturan rewrite request (`requestTransform.replace`) yang
+memanjangkan teks pemanggil juga jadi biaya relay: yang dikirim ke backend
+memang jadi lebih panjang, tapi angka pemanggil tidak ikut naik.
 
 Angka itu dibatasi di **porsi dia atas tagihan backend yang sebenarnya**, supaya
 relay tidak pernah menagih lebih dari yang ditagihkan ke dia. Batasnya berupa

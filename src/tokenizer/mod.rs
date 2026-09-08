@@ -11,7 +11,10 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::config::{Config, ImageDefaults};
-use chat::{count_chat_request, count_completion, count_system_messages, Breakdown, RequestCount};
+use chat::{
+    count_chat_request, count_completion, count_system_messages, same_but_system, Breakdown,
+    RequestCount,
+};
 use registry::{Encoder, Registry};
 
 /// What vocabulary and chat profile a given call should be counted with.
@@ -80,21 +83,22 @@ impl TokenCounter {
 
     /// Count a prompt and split it between the caller and the relay.
     ///
-    /// The caller pays for what they wrote; the system prompt the relay injects
-    /// on their behalf is the relay's own cost, and lumping the two together
-    /// would bill a user for text they never sent and cannot see.
+    /// The caller's figure is a plain count of the body that arrived, taken
+    /// from the untouched request. Nothing the relay does afterwards can move
+    /// it — not the injected system prompt, not a rewrite rule. Send 6k tokens
+    /// and the answer says 6k, because 6k is what was sent.
     ///
-    /// Both figures come out of one pass: the body as sent upstream is counted
-    /// in full, and the system turns of each version are counted on their own —
-    /// they are short, and they are the only part injection touches. Text
-    /// rewrite rules never apply to system turns, so the subtraction here is
-    /// exact. What a rewrite rule does change is counted as sent, because that
-    /// is what the backend charges for.
+    /// The body the backend receives is counted too, because
+    /// [`Usage::charged_to_caller`] needs it: it is the denominator the
+    /// backend's own bill is divided by. Injection only ever touches system
+    /// turns, so that figure is usually the caller's count plus the difference
+    /// between the two bodies' system turns, which are short. Only a rewrite
+    /// rule editing the caller's own text forces a second full pass, and a rule
+    /// that rewrites every message has earned one.
     ///
-    /// This is one tokenizer measuring one body, so subtracting is safe. Taking
-    /// the caller's share out of a figure the *backend* reported is a different
-    /// problem, and [`Usage::charged_to_caller`] scales rather than subtracts
-    /// for exactly that reason.
+    /// One tokenizer over one conversation, so adding and subtracting here is
+    /// exact. Splitting a figure the *backend* reported is a different problem,
+    /// and `charged_to_caller` scales rather than subtracts for that reason.
     pub async fn count_prompt(
         &self,
         original: &Value,
@@ -109,17 +113,21 @@ impl TokenCounter {
         let images = images.clone();
 
         run_maybe_blocking(move || {
-            let billed = count_chat_request(&upstream, &encoder, &profile, &images);
-            let theirs = count_system_messages(&original, &encoder, &profile, &images);
-            let ours = count_system_messages(&upstream, &encoder, &profile, &images);
-            let injected = ours as i64 - theirs as i64;
+            let theirs = count_chat_request(&original, &encoder, &profile, &images);
+            let injected = count_system_messages(&upstream, &encoder, &profile, &images) as i64
+                - count_system_messages(&original, &encoder, &profile, &images) as i64;
+            let billed = if same_but_system(&original, &upstream) {
+                (theirs.total as i64 + injected).max(0) as usize
+            } else {
+                count_chat_request(&upstream, &encoder, &profile, &images).total
+            };
             PromptSplit {
-                user: (billed.total as i64 - injected).max(0) as usize,
-                billed: billed.total,
+                user: theirs.total,
+                billed,
                 injected,
-                breakdown: billed.breakdown,
-                exact: billed.exact,
-                tokenizer: billed.tokenizer,
+                breakdown: theirs.breakdown,
+                exact: theirs.exact,
+                tokenizer: theirs.tokenizer,
             }
         })
         .await
@@ -210,12 +218,12 @@ pub struct NormalizedUsage {
 pub struct PromptSplit {
     /// The body as actually sent upstream: what the backend charges for.
     pub billed: usize,
-    /// What the caller is accountable for, with the relay's own system prompt
-    /// taken back out.
+    /// The request as it arrived, counted before the relay touched it.
     pub user: usize,
     /// The relay's contribution. Negative when the route replaces a longer
     /// system prompt of the caller's with a shorter one of its own.
     pub injected: i64,
+    /// Where the *caller's* budget goes, matching `user` rather than `billed`.
     pub breakdown: Breakdown,
     pub exact: bool,
     pub tokenizer: String,

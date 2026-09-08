@@ -769,6 +769,56 @@ async fn the_injected_system_prompt_is_not_charged_to_the_caller() {
 }
 
 #[tokio::test]
+async fn a_rewrite_rule_that_inflates_the_prompt_is_not_the_caller_s_bill() {
+    // A request rewrite rule is the relay's doing, exactly like the injected
+    // system prompt. Whatever it adds to the body on the wire, the caller is
+    // still accounted for the message they actually sent.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].request_transform.replace = Some(vec![chtting_relay::config::TextRule {
+            pattern: "hi".into(),
+            flags: Some("g".into()),
+            replacement: "hi, and please be extremely thorough about it, \
+                          sparing no detail whatsoever"
+                .into(),
+            literal: true,
+        }]);
+    })
+    .await;
+
+    let res = h.post("/v1/chat/completions", chat("hi")).await;
+    assert_eq!(res.status(), 200);
+    let charged = res.json::<serde_json::Value>().await.unwrap()["usage"]["prompt_tokens"]
+        .as_i64()
+        .unwrap();
+
+    // The backend really was handed the longer text...
+    assert!(
+        h.backend
+            .last_request()
+            .to_string()
+            .contains("sparing no detail"),
+        "the rewrite rule did not run"
+    );
+
+    // ...and it shows up in what the relay says the backend was given.
+    let row = h.last_row().await;
+    let billed = row["billed_prompt_tokens"].as_i64().unwrap();
+    let user = row["user_prompt_tokens"].as_i64().unwrap();
+    assert!(
+        billed > user,
+        "the rewrite should cost the relay: billed {billed}, caller {user}"
+    );
+    assert_eq!(
+        charged, user,
+        "the caller was billed for the relay's rewrite"
+    );
+
+    // "hi" on its own, with nothing bolted on: template overhead and a token or
+    // two. The point is that it is nowhere near the rewritten body.
+    assert!(user < 12, "the caller's own message counted {user} tokens");
+}
+
+#[tokio::test]
 async fn a_caller_with_no_system_prompt_injected_is_charged_the_whole_prompt() {
     let h = harness(MockConfig::default(), |_| {}).await;
     h.post("/v1/chat/completions", chat("hi")).await;
