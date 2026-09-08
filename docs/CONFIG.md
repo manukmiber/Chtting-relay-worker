@@ -33,6 +33,7 @@ to the code.
 | `tokenizer` | see below | counting rules |
 | `logging` | see below | what is recorded and for how long |
 | `tunnel` | see below | cloudflared |
+| `openrouter` | see below | what OpenRouter is told about this relay |
 
 ---
 
@@ -44,19 +45,39 @@ to the code.
 | `port` | `8787` | relay port — the only one published |
 | `maxBodyBytes` | `20971520` | request body ceiling |
 | `keepAliveTimeoutMs` | `75000` | idle keep-alive |
-| `maxConcurrentRequests` | `512` | calls allowed in flight upstream at once |
+| `maxConcurrentRequests` | `512` | how many requests are worked on at once |
+| `queueCapacity` | `2048` | how many may wait for a slot; `0` refuses instead of queueing |
+| `queueTimeoutMs` | `30000` | how long a queued request waits before giving up |
 | `workerThreads` | `0` | Tokio worker threads; `0` means one per core |
 
 There is no relay-side request timeout: a long generation must not be cut off.
 Upstream timeouts are per backend.
 
-`maxConcurrentRequests` is a shed-load ceiling, not a queue. Once it is reached
-the relay answers `503` with `Retry-After: 1` immediately, because a request
-queued behind a phone that cannot keep up helps nobody. Raise it if your backend
-is fast and your phone has headroom; lower it if the device gets hot.
-
 `workerThreads` is read before the async runtime starts, so it only takes effect
 on restart. Lower it to leave cores for other Termux processes.
+
+### The queue
+
+Past `maxConcurrentRequests`, requests wait in line rather than being turned
+away: a caller who waits 300 ms and then gets an answer is better served than
+one who gets a 503 and retries into the same wall. The line is FIFO — the caller
+who has waited longest gets the next slot, so nobody starves behind a burst of
+newcomers.
+
+A 503 with `Retry-After` is sent only when the line is already `queueCapacity`
+long, or when a request has waited `queueTimeoutMs` without reaching the front.
+Keep `queueTimeoutMs` below your client's own timeout, or the client gives up
+first and the slot is spent producing an answer nobody is listening for.
+
+The line lives in memory. Every request in it is already an open HTTP connection
+with a caller on the other end; writing it to disk first would add latency to
+exactly the path that is under pressure, and buy nothing — the connection dies
+with the process either way.
+
+All three take effect immediately, from the dashboard, with no restart. Lowering
+the concurrency never takes a slot from a request already running: the shrink
+completes as those finish. The Settings tab shows the live picture — running,
+waiting, peak depth, average wait, and how many were turned away.
 
 ## `dashboard`
 
@@ -123,6 +144,7 @@ reshaping are configured.
 | `limits.maxOutputTokens` | `0` | caps `max_tokens`; 0 = no limit |
 | `requestTransform` | | see below |
 | `responseTransform` | | see below |
+| `openrouter` | | what OpenRouter is told about this model; see below |
 
 ### `systemPrompt.mode`
 
@@ -194,6 +216,7 @@ Each key is one "daily user" in the stats.
 |---|---|---|
 | `fallback` | `o200k_base` | used when no rule matches |
 | `preferUpstreamUsage` | `true` | trust the backend's `usage`, keep the local count as drift |
+| `billSystemPromptToUser` | `false` | charge callers for the system prompt the relay injects |
 | `rules` | built-in list | first match wins |
 | `imageDefaults` | | assumed detail/size when a caller sends no dimensions |
 
@@ -244,6 +267,27 @@ template — the tokens billed on top of your message text.
 Prompts are stored on the device only. Set `storeBodies` to `none` to keep none
 of them.
 
+### What pruning does not touch
+
+`retentionDays` and the Prune button apply to the browsable `requests` table
+only. The `usage_ledger` table — request counts, input and output tokens, TTFT,
+tokens per second and cache hits — is never pruned, and cannot be:
+
+- `UPDATE` and `DELETE` on it are refused by SQLite triggers, from this process
+  or any other holding the file open.
+- Every row carries the hash of the row before it, so an edit made around
+  SQLite — dropping the triggers, or touching the file directly — leaves a break
+  in the chain. The dashboard's Usage tab recomputes it and names the first row
+  that does not match.
+
+Each request appends two rows: `input` once the backend has the request, so
+tokens already spent survive a crash or a caller hanging up, and `final` when it
+ends. Neither restates the other's figures, so a plain `SUM` over the table is
+the right answer.
+
+The rows are small and carry no prompt text, so the table grows by roughly a
+couple of hundred bytes per request — a million requests is a few hundred MB.
+
 ---
 
 ## `tunnel`
@@ -258,6 +302,92 @@ of them.
 | `extraArgs` | `[]` | passed through to cloudflared |
 
 Only `server.port` is published. The dashboard is never routed through it.
+
+---
+
+## `openrouter`
+
+What OpenRouter is told about this relay. Everything here is a commercial
+decision rather than a technical fact, so nothing has a useful default and
+nothing is guessed.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | publish the model document at all |
+| `path` | `/provider/models` | where OpenRouter polls; a custom path needs a restart, and the default stays mounted either way |
+| `token` | `""` | optional bearer OpenRouter must present; empty means the listing is public |
+| `providerSlug` | `chtting` | prefixes each model's slug |
+| `deploymentRegion` | `""` | ISO country code the traffic is actually served from |
+| `datacenters` | `[]` | `[{ "countryCode": "ID", "region": "jakarta" }]` |
+| `compliance.zdr` | `false` | zero data retention |
+| `compliance.hipaa` | `false` | |
+| `isReady` | `true` | clear it to be listed without being routed to |
+| `maxConcurrentRequests` | `0` | root-scope concurrency; `0` publishes `server.maxConcurrentRequests` |
+| `requestsPerMinute` | `0` | root-scope rate; `0` publishes none |
+
+Turning on `compliance.zdr` while `logging.storeBodies` is anything but `none`
+is refused: the relay would be keeping prompt text while telling OpenRouter's
+users it keeps nothing.
+
+The document follows `schema_version` 2.4 — input and output modalities,
+`supported_parameters`, `pricing` and `capacity` arrays, quantization, tokenizer
+family, datacenters and compliance. It never contains `upstreamModel`.
+
+### `models[].openrouter`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `listed` | `false` | offer this model to OpenRouter |
+| `slug` | `""` | `openrouter.slug`; empty derives one from `providerSlug` and the model name |
+| `huggingFaceId` | `""` | required by OpenRouter when the model exists on HuggingFace |
+| `quantization` | `""` | one of int4, int8, fp4, mxfp4, nvfp4, fp6, fp8, mxfp8, fp16, bf16, fp32; empty publishes `null` |
+| `tokenizerFamily` | `""` | e.g. `GPT`; empty reports the vocabulary the relay actually counts with |
+| `inputModalities` | `["text"]` | text, image, audio, video, file |
+| `maxPromptTokens` | `0` | `0` falls back to `limits.maxInputTokens`, then `contextLength` |
+| `maxOutputTokens` | `0` | `0` falls back to `limits.maxOutputTokens` |
+| `temperatureMax` | `2` | upper bound published for `temperature` |
+| `streaming` | `true` | |
+| `supportsTools` | `true` | |
+| `supportsStructuredOutputs` | `false` | |
+| `supportsReasoning` | `false` | |
+| `isFree` | `false` | |
+| `discountToUser` | `0` | at least 0 and below 1 |
+| `deprecationDate` | `""` | `YYYY-MM-DD` |
+
+Prices are USD for a **single token**, kept as strings:
+
+| Key | Scope |
+|---|---|
+| `pricing.promptUsd` | input |
+| `pricing.cachedPromptUsd` | input, served from the backend's cache |
+| `pricing.cacheWriteUsd` | input, writing to that cache |
+| `pricing.completionUsd` | output |
+| `pricing.internalReasoningUsd` | output, reasoning tokens |
+| `pricing.requestUsd` | a flat fee per request |
+| `pricing.cacheTtlSeconds` | how long a cache entry lives |
+| `pricing.cacheImplicit` | caching happens without the caller asking |
+
+They are strings and not numbers because `0.0000006` loses its last digits
+through an `f64`, and OpenRouter compares them as decimals. A price left empty
+is **not published at all** rather than published as zero — a wrong price is
+worse than a missing one, so a listed model with no price and no `isFree` is
+rejected by validation.
+
+Capacity is what the model can actually sustain:
+
+| Key | Meaning |
+|---|---|
+| `capacity.promptTokensPerMinute` | |
+| `capacity.completionTokensPerMinute` | |
+| `capacity.requestsPerMinute` | |
+| `capacity.concurrency` | `0` publishes `server.maxConcurrentRequests` |
+
+Publishing an honest number here is what stops OpenRouter sending more traffic
+than the phone can take.
+
+A parameter the relay is configured to drop or rename is left out of
+`supported_parameters`: advertising a parameter that gets discarded on the way
+through would be a lie OpenRouter acts on.
 
 ---
 

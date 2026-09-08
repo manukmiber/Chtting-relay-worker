@@ -5,6 +5,7 @@
 //! carries the settings, keys and logs. Nothing routes between them.
 
 pub mod dashboard;
+pub mod openrouter;
 pub mod public;
 
 use axum::http::{HeaderMap, HeaderValue};

@@ -5,10 +5,10 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 use crate::config::ConfigStore;
 use crate::logging::Logger;
+use crate::relay::gate::Gate;
 use crate::store::{QuotaTracker, RateLimiter, Store};
 use crate::tokenizer::registry::Registry;
 use crate::tokenizer::TokenCounter;
@@ -51,13 +51,11 @@ impl Paths {
     }
 }
 
-/// Counters the dashboard shows and the load test asserts on.
+/// Counters the dashboard shows and the load test asserts on. Everything about
+/// the queue itself lives on the [`Gate`] instead, which owns those numbers.
 #[derive(Debug, Default)]
 pub struct Stats {
     pub started_at_ms: AtomicU64,
-    /// Requests refused because the in-flight ceiling was already reached.
-    pub rejected_overload: AtomicU64,
-    pub in_flight: AtomicU64,
 }
 
 impl Stats {
@@ -81,10 +79,9 @@ pub struct AppState {
     pub tunnel: Arc<TunnelManager>,
     pub paths: Paths,
     pub stats: Arc<Stats>,
-    /// Bounds how many calls may be in flight upstream at once. Past the
-    /// ceiling the relay answers 503 immediately rather than queueing work the
-    /// phone cannot finish.
-    pub in_flight: Arc<Semaphore>,
+    /// How many calls may be in flight upstream at once, and the line waiting
+    /// for a slot. Resized live from the dashboard.
+    pub gate: Arc<Gate>,
 }
 
 impl AppState {
@@ -109,7 +106,7 @@ impl AppState {
             .started_at_ms
             .store(crate::util::now_ms() as u64, Ordering::Relaxed);
 
-        let permits = cfg.server.max_concurrent_requests.max(1);
+        let gate = Arc::new(Gate::new(cfg.server.max_concurrent_requests));
         Ok(Arc::new(Self {
             config,
             store,
@@ -121,7 +118,7 @@ impl AppState {
             tunnel,
             paths,
             stats,
-            in_flight: Arc::new(Semaphore::new(permits)),
+            gate,
         }))
     }
 

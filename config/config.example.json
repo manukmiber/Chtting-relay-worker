@@ -7,7 +7,9 @@
     "maxBodyBytes": 20971520,
     "keepAliveTimeoutMs": 75000,
     "maxConcurrentRequests": 512,
-    "workerThreads": 0
+    "workerThreads": 0,
+    "queueCapacity": 2048,
+    "queueTimeoutMs": 30000
   },
   "dashboard": {
     "enabled": true,
@@ -110,6 +112,31 @@
             "replacement": "Creative Writer"
           }
         ]
+      },
+      "openrouter": {
+        "listed": false,
+        "huggingFaceId": "deepseek-ai/DeepSeek-V3",
+        "quantization": "fp8",
+        "inputModalities": [
+          "text"
+        ],
+        "maxOutputTokens": 8192,
+        "streaming": true,
+        "supportsTools": true,
+        "supportsReasoning": false,
+        "pricing": {
+          "promptUsd": "0.00000027",
+          "completionUsd": "0.0000011",
+          "cachedPromptUsd": "0.00000007",
+          "cacheTtlSeconds": 3600,
+          "cacheImplicit": true
+        },
+        "capacity": {
+          "promptTokensPerMinute": 0,
+          "completionTokensPerMinute": 0,
+          "requestsPerMinute": 0,
+          "concurrency": 0
+        }
       }
     },
     {
@@ -185,7 +212,8 @@
         "tokenizer": "o200k_base",
         "profile": "openai"
       }
-    ]
+    ],
+    "billSystemPromptToUser": false
   },
   "logging": {
     "level": "info",
@@ -201,5 +229,25 @@
     "token": "",
     "hostname": "",
     "extraArgs": []
+  },
+  "openrouter": {
+    "enabled": false,
+    "path": "/provider/models",
+    "token": "",
+    "providerSlug": "chtting",
+    "deploymentRegion": "ID",
+    "datacenters": [
+      {
+        "countryCode": "ID",
+        "region": "jakarta"
+      }
+    ],
+    "compliance": {
+      "zdr": false,
+      "hipaa": false
+    },
+    "isReady": true,
+    "maxConcurrentRequests": 0,
+    "requestsPerMinute": 0
   }
 }

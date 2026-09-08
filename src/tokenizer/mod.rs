@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::config::{Config, ImageDefaults};
-use chat::{count_chat_request, count_completion, RequestCount};
+use chat::{count_chat_request, count_completion, count_system_messages, Breakdown, RequestCount};
 use registry::{Encoder, Registry};
 
 /// What vocabulary and chat profile a given call should be counted with.
@@ -76,6 +76,53 @@ impl TokenCounter {
         let profile = resolved.profile.clone();
         let images = images.clone();
         run_maybe_blocking(move || count_chat_request(&body, &encoder, &profile, &images)).await
+    }
+
+    /// Count a prompt and split it between the caller and the relay.
+    ///
+    /// The caller pays for what they wrote; the system prompt the relay injects
+    /// on their behalf is the relay's own cost, and lumping the two together
+    /// would bill a user for text they never sent and cannot see.
+    ///
+    /// Both figures come out of one pass: the body as sent upstream is counted
+    /// in full, and the system turns of each version are counted on their own —
+    /// they are short, and they are the only part injection touches. Text
+    /// rewrite rules never apply to system turns, so the subtraction here is
+    /// exact. What a rewrite rule does change is counted as sent, because that
+    /// is what the backend charges for.
+    ///
+    /// This is one tokenizer measuring one body, so subtracting is safe. Taking
+    /// the caller's share out of a figure the *backend* reported is a different
+    /// problem, and [`Usage::charged_to_caller`] scales rather than subtracts
+    /// for exactly that reason.
+    pub async fn count_prompt(
+        &self,
+        original: &Value,
+        upstream: &Value,
+        resolved: &Resolved,
+        images: &ImageDefaults,
+    ) -> PromptSplit {
+        let encoder = self.encoder_for(resolved).await;
+        let original = original.clone();
+        let upstream = upstream.clone();
+        let profile = resolved.profile.clone();
+        let images = images.clone();
+
+        run_maybe_blocking(move || {
+            let billed = count_chat_request(&upstream, &encoder, &profile, &images);
+            let theirs = count_system_messages(&original, &encoder, &profile, &images);
+            let ours = count_system_messages(&upstream, &encoder, &profile, &images);
+            let injected = ours as i64 - theirs as i64;
+            PromptSplit {
+                user: (billed.total as i64 - injected).max(0) as usize,
+                billed: billed.total,
+                injected,
+                breakdown: billed.breakdown,
+                exact: billed.exact,
+                tokenizer: billed.tokenizer,
+            }
+        })
+        .await
     }
 
     pub async fn count_text(&self, text: &str, resolved: &Resolved) -> (usize, bool, String) {
@@ -158,6 +205,22 @@ pub struct NormalizedUsage {
     pub reasoning_tokens: u64,
 }
 
+/// How a prompt's cost divides between the caller and the relay.
+#[derive(Debug, Clone, Default)]
+pub struct PromptSplit {
+    /// The body as actually sent upstream: what the backend charges for.
+    pub billed: usize,
+    /// What the caller is accountable for, with the relay's own system prompt
+    /// taken back out.
+    pub user: usize,
+    /// The relay's contribution. Negative when the route replaces a longer
+    /// system prompt of the caller's with a shorter one of its own.
+    pub injected: i64,
+    pub breakdown: Breakdown,
+    pub exact: bool,
+    pub tokenizer: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LocalCount {
     pub prompt: u64,
@@ -184,6 +247,40 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// The same numbers with the relay's own system prompt taken back out.
+    ///
+    /// The backend charges for everything it received, injected prompt
+    /// included. The caller neither wrote that prompt nor can see it, so
+    /// billing them for it would be indefensible — this is the figure they are
+    /// shown and accounted for.
+    ///
+    /// The caller's share is applied as a proportion of the prompt rather than
+    /// subtracted from it, because the two numbers can come from two different
+    /// tokenizers: `prompt_tokens` may be the backend's own count, while the
+    /// split was measured locally. Subtracting one from the other can go
+    /// negative when the backend counts a prompt more cheaply than the relay
+    /// does — a real case, not a hypothetical. Scaling cannot: it agrees
+    /// exactly with subtraction when the two counts agree, and stays sensible
+    /// when they do not.
+    ///
+    /// `user_local >= billed_local` means nothing was injected — or the route
+    /// replaced a longer system prompt of the caller's with a shorter one — so
+    /// the numbers pass through untouched.
+    pub fn charged_to_caller(&self, user_local: u64, billed_local: u64) -> Usage {
+        if billed_local == 0 || user_local >= billed_local {
+            return self.clone();
+        }
+        // Widened, because prompt × tokens overflows u64 only in theory but
+        // costs nothing to rule out. Rounded down, in the caller's favour.
+        let prompt = (u128::from(self.prompt_tokens) * u128::from(user_local)
+            / u128::from(billed_local)) as u64;
+        Usage {
+            prompt_tokens: prompt,
+            total_tokens: prompt + self.completion_tokens,
+            ..self.clone()
+        }
+    }
+
     /// The `usage` object handed back to the caller.
     pub fn public(&self) -> Value {
         let mut out = serde_json::json!({
@@ -395,5 +492,65 @@ mod tests {
                 .tokenizer,
             "cl100k_base"
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    fn usage(prompt: u64, completion: u64) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_caller_pays_for_their_share_of_the_prompt() {
+        // 100 tokens went upstream, 40 of them the caller's.
+        let charged = usage(100, 20).charged_to_caller(40, 100);
+        assert_eq!(charged.prompt_tokens, 40);
+        assert_eq!(charged.completion_tokens, 20, "output is theirs entirely");
+        assert_eq!(charged.total_tokens, 60);
+    }
+
+    #[test]
+    fn a_backend_that_counts_differently_still_gives_a_sane_number() {
+        // The backend charged 120 for what the relay measured as 100, of which
+        // 40 was the caller's: they get the same 40% of the backend's figure.
+        let charged = usage(120, 10).charged_to_caller(40, 100);
+        assert_eq!(charged.prompt_tokens, 48);
+
+        // And the case that made scaling necessary: a backend that counts the
+        // prompt more cheaply than the relay's own tokenizer does. Subtracting
+        // would have gone negative and clamped the caller to zero.
+        let charged = usage(41, 27).charged_to_caller(40, 100);
+        assert_eq!(charged.prompt_tokens, 16);
+        assert!(charged.prompt_tokens > 0);
+    }
+
+    #[test]
+    fn nothing_injected_means_nothing_taken_off() {
+        let charged = usage(100, 20).charged_to_caller(100, 100);
+        assert_eq!(charged.prompt_tokens, 100);
+        assert_eq!(charged.total_tokens, 120);
+    }
+
+    #[test]
+    fn a_shorter_replacement_prompt_never_charges_the_caller_more() {
+        // The route replaced the caller's long system prompt with a short one,
+        // so their own count is the larger of the two. They pay the smaller.
+        let charged = usage(80, 5).charged_to_caller(200, 80);
+        assert_eq!(charged.prompt_tokens, 80);
+    }
+
+    #[test]
+    fn an_empty_prompt_does_not_divide_by_zero() {
+        let charged = usage(0, 0).charged_to_caller(0, 0);
+        assert_eq!(charged.prompt_tokens, 0);
+        assert_eq!(charged.total_tokens, 0);
     }
 }

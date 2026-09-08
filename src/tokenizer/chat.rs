@@ -400,6 +400,40 @@ pub fn count_chat_request(
     }
 }
 
+/// What the `system` turns in this body cost on their own.
+///
+/// Used to separate the prompt the caller wrote from the one the relay injects
+/// on their behalf. It runs the same accounting as [`count_chat_request`] over
+/// a body holding only the system turns — the same function, so the two can
+/// never drift apart — and then removes the per-request primer, which belongs
+/// to the request as a whole rather than to any one message.
+pub fn count_system_messages(
+    body: &Value,
+    encoder: &Encoder,
+    profile_name: &str,
+    images: &ImageDefaults,
+) -> usize {
+    let system: Vec<Value> = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if system.is_empty() {
+        return 0;
+    }
+    let p = profile(profile_name);
+    let only = serde_json::json!({ "messages": system });
+    count_chat_request(&only, encoder, profile_name, images)
+        .total
+        .saturating_sub(p.primer + p.bos)
+}
+
 /// Count a completion: text, reasoning trace and tool calls.
 pub fn count_completion(
     text: &str,

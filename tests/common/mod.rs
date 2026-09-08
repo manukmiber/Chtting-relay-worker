@@ -305,6 +305,62 @@ impl Harness {
     pub async fn last_row(&self) -> Value {
         self.rows().await.first().cloned().unwrap_or(Value::Null)
     }
+
+    /// Every ledger row recorded so far, in the order they were appended.
+    pub async fn ledger(&self) -> Vec<Value> {
+        self.state.store.flush().await;
+        self.state
+            .store
+            .read(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT seq, request_id, phase, status, requests, input_tokens,
+                            billed_input_tokens, output_tokens, cached_tokens, cache_hit,
+                            ttft_ms, gen_ms, total_ms, queued_ms, tokens_per_sec,
+                            prev_hash, row_hash
+                     FROM usage_ledger ORDER BY seq ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok(json!({
+                            "seq": r.get::<_, i64>(0)?,
+                            "request_id": r.get::<_, String>(1)?,
+                            "phase": r.get::<_, String>(2)?,
+                            "status": r.get::<_, i64>(3)?,
+                            "requests": r.get::<_, i64>(4)?,
+                            "input_tokens": r.get::<_, i64>(5)?,
+                            "billed_input_tokens": r.get::<_, i64>(6)?,
+                            "output_tokens": r.get::<_, i64>(7)?,
+                            "cached_tokens": r.get::<_, i64>(8)?,
+                            "cache_hit": r.get::<_, i64>(9)?,
+                            "ttft_ms": r.get::<_, f64>(10)?,
+                            "gen_ms": r.get::<_, f64>(11)?,
+                            "total_ms": r.get::<_, f64>(12)?,
+                            "queued_ms": r.get::<_, f64>(13)?,
+                            "tokens_per_sec": r.get::<_, f64>(14)?,
+                            "prev_hash": r.get::<_, String>(15)?,
+                            "row_hash": r.get::<_, String>(16)?,
+                        }))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Run whatever SQL a test likes against the ledger, so it can try to
+    /// tamper with rows the way an operator with a sqlite3 prompt would.
+    pub async fn sqlite(&self, sql: &'static str) -> Result<(), String> {
+        self.state.store.flush().await;
+        self.state
+            .store
+            .read(move |conn| {
+                conn.execute_batch(sql)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Start a relay in front of a mock backend, with one alias configured.

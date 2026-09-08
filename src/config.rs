@@ -53,6 +53,7 @@ pub struct Config {
     pub tokenizer: TokenizerConfig,
     pub logging: LoggingConfig,
     pub tunnel: TunnelConfig,
+    pub openrouter: OpenRouterConfig,
 }
 
 impl Default for Config {
@@ -71,6 +72,7 @@ impl Default for Config {
             tokenizer: TokenizerConfig::default(),
             logging: LoggingConfig::default(),
             tunnel: TunnelConfig::default(),
+            openrouter: OpenRouterConfig::default(),
         }
     }
 }
@@ -88,6 +90,14 @@ pub struct ServerConfig {
     /// Tokio worker threads. 0 means "one per core", which is what a phone
     /// wants; pin it lower to leave headroom for other Termux processes.
     pub worker_threads: usize,
+    /// How many requests may wait for a slot. Past this the relay answers 503
+    /// straight away: a queue nobody will reach the front of is worse than an
+    /// honest refusal, because the caller has already committed a retry budget
+    /// to waiting.
+    pub queue_capacity: usize,
+    /// How long a queued request waits before giving up. Should stay well
+    /// under the client's own timeout.
+    pub queue_timeout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -99,6 +109,8 @@ impl Default for ServerConfig {
             keep_alive_timeout_ms: 75_000,
             max_concurrent_requests: 512,
             worker_threads: 0,
+            queue_capacity: 2048,
+            queue_timeout_ms: 30_000,
         }
     }
 }
@@ -204,6 +216,7 @@ pub struct Model {
     pub response_transform: ResponseTransform,
     pub context_length: u32,
     pub created_at: i64,
+    pub openrouter: OpenRouterModel,
 }
 
 impl Default for Model {
@@ -227,6 +240,7 @@ impl Default for Model {
             response_transform: ResponseTransform::default(),
             context_length: 0,
             created_at: 0,
+            openrouter: OpenRouterModel::default(),
         }
     }
 }
@@ -468,6 +482,11 @@ pub struct TokenizerConfig {
     pub prefer_upstream_usage: bool,
     pub rules: Vec<TokenizerRule>,
     pub image_defaults: ImageDefaults,
+    /// Charge the caller for the system prompt the relay injects on their
+    /// behalf. Off by default: they did not write it and cannot see it, so
+    /// billing them for it would be indefensible. The relay still records what
+    /// the backend charged, so the margin stays visible.
+    pub bill_system_prompt_to_user: bool,
 }
 
 impl Default for TokenizerConfig {
@@ -477,6 +496,7 @@ impl Default for TokenizerConfig {
             prefer_upstream_usage: true,
             rules: default_tokenizer_rules(),
             image_defaults: ImageDefaults::default(),
+            bill_system_prompt_to_user: false,
         }
     }
 }
@@ -616,6 +636,165 @@ impl Config {
     pub fn tz(&self) -> chrono_tz::Tz {
         crate::util::parse_tz(&self.timezone)
     }
+}
+
+/* -------------------------------------------------------- openrouter -- */
+
+/// What OpenRouter asks a provider to publish about itself.
+///
+/// OpenRouter routes on this document: it decides pricing, which parameters it
+/// may forward, and — through the uptime, TTFT and throughput it measures — how
+/// much traffic a provider gets. It is deliberately editable from the
+/// dashboard rather than hard-coded, because every number here is a commercial
+/// decision, not a technical one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OpenRouterConfig {
+    /// Serve the model document at all.
+    pub enabled: bool,
+    /// Where the document is served from. OpenRouter polls this URL.
+    pub path: String,
+    /// Optional bearer token OpenRouter must present. Empty means public,
+    /// which is fine — the document contains no secrets.
+    pub token: String,
+    /// Prefixes `openrouter.slug` for models that do not set their own.
+    pub provider_slug: String,
+    /// ISO country code the traffic is actually served from.
+    pub deployment_region: String,
+    pub datacenters: Vec<Datacenter>,
+    pub compliance: Compliance,
+    /// Clear this while a model list is still being set up: OpenRouter will
+    /// list the models but send no traffic.
+    pub is_ready: bool,
+    /// Root-scope capacity, across every model.
+    pub max_concurrent_requests: u32,
+    pub requests_per_minute: u64,
+}
+
+impl Default for OpenRouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "/provider/models".into(),
+            token: String::new(),
+            provider_slug: "chtting".into(),
+            deployment_region: String::new(),
+            datacenters: Vec::new(),
+            compliance: Compliance::default(),
+            is_ready: true,
+            max_concurrent_requests: 0,
+            requests_per_minute: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Datacenter {
+    pub country_code: String,
+    pub region: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Compliance {
+    /// Zero data retention: true only if nothing of the prompt is kept. Turning
+    /// on request body storage in the logging section makes this a lie, so the
+    /// relay refuses that combination rather than publishing a false claim.
+    pub zdr: bool,
+    pub hipaa: bool,
+}
+
+/// Per-model OpenRouter metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OpenRouterModel {
+    /// Offer this model to OpenRouter. Off by default: a model is only listed
+    /// once someone has decided what it costs.
+    pub listed: bool,
+    /// `openrouter.slug`. Empty derives one from the provider slug and model id.
+    pub slug: String,
+    /// Required by OpenRouter when the model exists on HuggingFace.
+    pub hugging_face_id: String,
+    /// One of int4, int8, fp4, mxfp4, nvfp4, fp6, fp8, mxfp8, fp16, bf16, fp32.
+    /// Empty is published as null, which OpenRouter reads as "unspecified".
+    pub quantization: String,
+    /// Tokenizer family, e.g. "GPT" or "Claude". Empty falls back to the
+    /// tokenizer the relay actually counts with.
+    pub tokenizer_family: String,
+    pub input_modalities: Vec<String>,
+    pub max_prompt_tokens: u32,
+    pub max_output_tokens: u32,
+    pub streaming: bool,
+    pub supports_tools: bool,
+    pub supports_structured_outputs: bool,
+    pub supports_reasoning: bool,
+    pub temperature_max: f64,
+    pub pricing: OpenRouterPricing,
+    pub capacity: OpenRouterCapacity,
+    pub is_free: bool,
+    /// 0 to just under 1. OpenRouter applies it as a discount to the end user.
+    pub discount_to_user: f64,
+    /// `YYYY-MM-DD`, or empty for none.
+    pub deprecation_date: String,
+    pub created: i64,
+}
+
+impl Default for OpenRouterModel {
+    fn default() -> Self {
+        Self {
+            listed: false,
+            slug: String::new(),
+            hugging_face_id: String::new(),
+            quantization: String::new(),
+            tokenizer_family: String::new(),
+            input_modalities: vec!["text".into()],
+            max_prompt_tokens: 0,
+            max_output_tokens: 0,
+            streaming: true,
+            supports_tools: true,
+            supports_structured_outputs: false,
+            supports_reasoning: false,
+            temperature_max: 2.0,
+            pricing: OpenRouterPricing::default(),
+            capacity: OpenRouterCapacity::default(),
+            is_free: false,
+            discount_to_user: 0.0,
+            deprecation_date: String::new(),
+            created: 0,
+        }
+    }
+}
+
+/// Prices in USD, per single token — the unit OpenRouter's `cost_usd` uses.
+///
+/// Kept as strings all the way through: a price like 0.0000006 loses its last
+/// digit in an f64 round trip, and OpenRouter compares these as decimals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OpenRouterPricing {
+    pub prompt_usd: String,
+    pub cached_prompt_usd: String,
+    pub cache_write_usd: String,
+    pub completion_usd: String,
+    pub internal_reasoning_usd: String,
+    /// A flat per-request fee, on top of the token prices.
+    pub request_usd: String,
+    /// How long a prompt cache entry lives, for the cached-prompt price.
+    pub cache_ttl_seconds: u32,
+    /// True when caching happens without the caller asking for it.
+    pub cache_implicit: bool,
+}
+
+/// Throughput this model can actually sustain. Publishing an honest number is
+/// what keeps OpenRouter from routing more traffic at a phone than it can take.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OpenRouterCapacity {
+    pub prompt_tokens_per_minute: u64,
+    pub completion_tokens_per_minute: u64,
+    pub requests_per_minute: u64,
+    pub concurrency: u32,
 }
 
 /* --------------------------------------------------------------- store -- */
@@ -915,6 +1094,117 @@ pub fn validate(cfg: &Config) -> Vec<String> {
     // Port 0 means "pick any free port", so two zeroes are not a conflict.
     if cfg.server.port != 0 && cfg.server.port == cfg.dashboard.port {
         errors.push("server.port and dashboard.port must differ".into());
+    }
+
+    if cfg.server.max_concurrent_requests == 0 {
+        errors.push("server.maxConcurrentRequests must be at least 1".into());
+    }
+
+    errors.extend(validate_openrouter(cfg));
+    errors
+}
+
+/// Quantization values OpenRouter accepts. Anything else is rejected rather
+/// than published, because an unknown value invalidates the whole document.
+pub const QUANTIZATIONS: [&str; 11] = [
+    "int4", "int8", "fp4", "mxfp4", "nvfp4", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32",
+];
+
+pub const INPUT_MODALITIES: [&str; 5] = ["text", "image", "video", "audio", "file"];
+
+fn validate_openrouter(cfg: &Config) -> Vec<String> {
+    let or = &cfg.openrouter;
+    let mut errors = Vec::new();
+    if !or.enabled {
+        return errors;
+    }
+
+    if !or.path.starts_with('/') {
+        errors.push("openrouter.path must start with \"/\"".into());
+    }
+    // Publishing zero data retention while the relay is keeping prompt text
+    // would be a false claim to OpenRouter's users, so it is refused outright
+    // rather than quietly published.
+    if or.compliance.zdr && cfg.logging.store_bodies != "none" {
+        errors.push(
+            "openrouter.compliance.zdr claims nothing is retained, but logging.storeBodies is \
+             keeping request text — set storeBodies to \"none\" or drop the ZDR claim"
+                .into(),
+        );
+    }
+    for dc in &or.datacenters {
+        if dc.country_code.len() != 2 {
+            errors.push(format!(
+                "openrouter datacenter country code \"{}\" must be two letters",
+                dc.country_code
+            ));
+        }
+    }
+
+    for m in cfg.models.iter().filter(|m| m.openrouter.listed) {
+        let o = &m.openrouter;
+        if !o.quantization.is_empty() && !QUANTIZATIONS.contains(&o.quantization.as_str()) {
+            errors.push(format!(
+                "model \"{}\" has quantization \"{}\"; OpenRouter accepts only: {}",
+                m.id,
+                o.quantization,
+                QUANTIZATIONS.join(", ")
+            ));
+        }
+        for modality in &o.input_modalities {
+            if !INPUT_MODALITIES.contains(&modality.as_str()) {
+                errors.push(format!(
+                    "model \"{}\" lists input modality \"{modality}\"; OpenRouter accepts only: {}",
+                    m.id,
+                    INPUT_MODALITIES.join(", ")
+                ));
+            }
+        }
+        if o.input_modalities.is_empty() {
+            errors.push(format!(
+                "model \"{}\" must declare at least one input modality",
+                m.id
+            ));
+        }
+        if !(0.0..1.0).contains(&o.discount_to_user) {
+            errors.push(format!(
+                "model \"{}\" discountToUser must be at least 0 and below 1",
+                m.id
+            ));
+        }
+        for (label, price) in [
+            ("prompt", &o.pricing.prompt_usd),
+            ("cachedPrompt", &o.pricing.cached_prompt_usd),
+            ("cacheWrite", &o.pricing.cache_write_usd),
+            ("completion", &o.pricing.completion_usd),
+            ("internalReasoning", &o.pricing.internal_reasoning_usd),
+            ("request", &o.pricing.request_usd),
+        ] {
+            if price.is_empty() {
+                continue;
+            }
+            match price.parse::<f64>() {
+                Ok(n) if n >= 0.0 && n.is_finite() => {}
+                _ => errors.push(format!(
+                    "model \"{}\" {label} price \"{price}\" is not a USD amount",
+                    m.id
+                )),
+            }
+        }
+        if !o.is_free && o.pricing.prompt_usd.is_empty() && o.pricing.completion_usd.is_empty() {
+            errors.push(format!(
+                "model \"{}\" is offered to OpenRouter with no price and is not marked free",
+                m.id
+            ));
+        }
+        if !o.deprecation_date.is_empty()
+            && chrono::NaiveDate::parse_from_str(&o.deprecation_date, "%Y-%m-%d").is_err()
+        {
+            errors.push(format!(
+                "model \"{}\" deprecationDate \"{}\" must be YYYY-MM-DD",
+                m.id, o.deprecation_date
+            ));
+        }
     }
     errors
 }

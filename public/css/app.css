@@ -198,7 +198,12 @@ button.sm { padding: 5px 9px; font-size: 12.5px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .row.end { justify-content: flex-end; }
 
-.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+/* A switch takes its own line: two settings that happen to follow each other
+   are not one sentence, and inline-flex ran their labels together. Inside a
+   .row they are a deliberate pairing, and the row's own gap spaces them. */
+.switch { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+.row > .switch { display: inline-flex; }
+.switch input { flex: none; }
 .switch input { appearance: none; width: 36px; height: 20px; border-radius: 999px; background: var(--border); position: relative; transition: background .15s; cursor: pointer; margin: 0; }
 .switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; }
 .switch input:checked { background: var(--accent); }

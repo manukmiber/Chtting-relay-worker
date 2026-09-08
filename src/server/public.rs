@@ -21,8 +21,9 @@ use crate::util::{day_key, hour_key, new_id, now_ms, round, truncate};
 use super::{bearer_token, client_ip, cors_headers};
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let limit = state.config.current().server.max_body_bytes;
-    Router::new()
+    let cfg = state.config.current();
+    let limit = cfg.server.max_body_bytes;
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/models/{id}", get(model_by_id))
@@ -30,9 +31,54 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route(DEFAULT_PROVIDER_PATH, get(provider_models));
+
+    // The listing is always mounted, whether or not it is switched on, so
+    // toggling it in the dashboard takes effect at once; the handler is what
+    // checks. Only moving it to a different path needs a restart, which the
+    // dashboard says.
+    let custom = cfg.openrouter.path.trim();
+    if custom.starts_with('/') && custom != DEFAULT_PROVIDER_PATH {
+        router = router.route(custom, get(provider_models));
+    }
+
+    router
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(limit))
         .with_state(state)
+}
+
+/// Where the OpenRouter listing lives unless the config moves it.
+const DEFAULT_PROVIDER_PATH: &str = "/provider/models";
+
+/// The model document OpenRouter polls.
+///
+/// Not part of the OpenAI surface and not gated on a client key: it describes
+/// what this relay offers and what it costs, which is public by nature. A
+/// token can still be required, for operators who would rather not have their
+/// price list crawled.
+async fn provider_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let cfg = state.config.current();
+    if !cfg.openrouter.enabled {
+        return error_response(
+            404,
+            "the OpenRouter provider listing is switched off",
+            "not_found",
+            None,
+        );
+    }
+    if !cfg.openrouter.token.is_empty() {
+        let presented = bearer_token(&headers).unwrap_or("");
+        if !crate::util::safe_equal(&cfg.openrouter.token, presented) {
+            return error_response(
+                401,
+                "this provider listing needs its token",
+                "invalid_request_error",
+                Some("invalid_api_key"),
+            );
+        }
+    }
+    Json(super::openrouter::document(&cfg)).into_response()
 }
 
 /// Wrap a response in the configured CORS headers.
@@ -56,7 +102,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
         "models": cfg.models.iter().filter(|m| m.enabled).count(),
         "backends": cfg.backends.iter().filter(|b| b.enabled).count(),
         "uptime_s": state.stats.uptime_s(),
-        "in_flight": state.stats.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+        "in_flight": state.gate.snapshot().in_flight,
     }))
     .into_response()
 }

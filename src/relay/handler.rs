@@ -4,11 +4,19 @@
 //! Timing vocabulary used throughout:
 //!
 //! ```text
-//!    sent                 first token                  last token
-//!      │◄──── ttft_ms ────►│◄──────── gen_ms ──────────►│
-//!      │◄───────────────── total_ms ───────────────────►│
+//!  arrives      admitted            first token         last token
+//!     │◄─queued─►│◄──── ttft_ms ────►│◄──── gen_ms ──────►│
+//!                │◄───────────── total_ms ───────────────►│
 //!    tokens_per_sec = completion_tokens / gen_ms
 //! ```
+//!
+//! And two prompt figures that must not be confused:
+//!
+//! * **billed** — the body as sent upstream, system prompt included. What the
+//!   backend charges the relay.
+//! * **charged** — the caller's own share of that, with the system prompt the
+//!   relay injected taken back out. What they are shown and accounted for,
+//!   because they did not write that prompt and cannot see it.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -16,7 +24,6 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -26,6 +33,7 @@ use crate::config::{
     ClientKey, Config, Model, RequestTransform, ResolvedResponseTransform, ResponseTransform,
 };
 use crate::relay::error_response;
+use crate::relay::gate::{Admission, Ticket};
 use crate::relay::sse::{self, SseParser, StreamRewriter};
 use crate::relay::transform::{
     collect_tool_calls, compile_text_rules, rules_lookbehind, transform_chunk, transform_request,
@@ -33,7 +41,7 @@ use crate::relay::transform::{
 };
 use crate::relay::upstream::Sent;
 use crate::state::AppState;
-use crate::store::RequestRecord;
+use crate::store::{LedgerEntry, Phase, RequestRecord};
 use crate::tokenizer::chat::flatten_content;
 use crate::tokenizer::{reconcile_usage, LocalCount, Resolved, Usage};
 use crate::util::{day_key, hour_key, new_id, now_ms, round, truncate};
@@ -131,6 +139,35 @@ struct Ctx {
     record: RequestRecord,
     started: Instant,
     client_wants_stream: bool,
+    /// The locally measured prompt split: what the caller wrote, and the whole
+    /// body as sent. Their ratio is what the caller is charged.
+    user_local: u64,
+    billed_local: u64,
+    /// Whether the ledger already has this request's input row.
+    input_ledgered: bool,
+}
+
+/// Everything [`finish`] needs that is not already on the record.
+///
+/// A struct rather than ten positional arguments: at the call sites it is the
+/// difference between reading `status: 502` and counting commas to work out
+/// which `None` is which.
+#[derive(Default)]
+struct Outcome<'a> {
+    status: i64,
+    error: &'a str,
+    started: Option<Instant>,
+    first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
+    /// What the backend charged for.
+    billed: Option<&'a Usage>,
+    /// What the caller is charged for.
+    charged: Option<&'a Usage>,
+    finish_reason: &'a str,
+    response_preview: &'a str,
+    /// True when the ledger already carries this request's input row, so the
+    /// closing row must not count the same tokens a second time.
+    input_ledgered: bool,
 }
 
 /* ------------------------------------------------------------ dispatch -- */
@@ -182,7 +219,13 @@ pub async fn handle_chat(
     let Some(route) = cfg.find_model(&asked_for).filter(|m| m.enabled).cloned() else {
         let message = format!("model \"{asked_for}\" is not available on this relay");
         finish(
-            &state, record, 404, &message, None, None, None, None, "", "",
+            &state,
+            record,
+            Outcome {
+                status: 404,
+                error: &message,
+                ..Default::default()
+            },
         );
         return error_response(
             404,
@@ -194,7 +237,13 @@ pub async fn handle_chat(
 
     if let Err(message) = check_access(&key, &route.id) {
         finish(
-            &state, record, 403, &message, None, None, None, None, "", "",
+            &state,
+            record,
+            Outcome {
+                status: 403,
+                error: &message,
+                ..Default::default()
+            },
         );
         return error_response(
             403,
@@ -207,8 +256,64 @@ pub async fn handle_chat(
     record.backend_id = route.backend.clone();
     record.upstream_model = route.upstream_model.clone();
 
-    // Requirement 2: count what goes in, with the tokenizer of the *backend*
-    // model, because that is the one that bills.
+    // Take a slot before doing any real work. Tokenizing a long conversation
+    // is the most expensive thing this relay does, so letting an unbounded
+    // number of callers do it at once is exactly the pile-up the limit exists
+    // to prevent.
+    state.gate.resize(cfg.server.max_concurrent_requests);
+    let ticket = match state
+        .gate
+        .admit(
+            cfg.server.queue_capacity,
+            std::time::Duration::from_millis(cfg.server.queue_timeout_ms),
+        )
+        .await
+    {
+        Admission::Admitted(ticket) => ticket,
+        Admission::QueueFull { waiting, capacity } => {
+            let message = format!(
+                "relay is saturated: {waiting} request(s) already waiting for one of \
+                 {} slots, and the queue holds {capacity}",
+                cfg.server.max_concurrent_requests
+            );
+            finish(
+                &state,
+                record,
+                Outcome {
+                    status: 503,
+                    error: &message,
+                    ..Default::default()
+                },
+            );
+            return overloaded(&message, 1);
+        }
+        Admission::TimedOut { waited_ms } => {
+            let message = format!(
+                "waited {:.0}ms for a free slot and gave up; the relay is running {} at a time",
+                waited_ms, cfg.server.max_concurrent_requests
+            );
+            record.queued_ms = round(waited_ms, 1);
+            finish(
+                &state,
+                record,
+                Outcome {
+                    status: 503,
+                    error: &message,
+                    ..Default::default()
+                },
+            );
+            return overloaded(&message, 2);
+        }
+    };
+    record.queued_ms = round(ticket.queued_ms, 1);
+
+    // Requirements 2 and 3. The caller's own prompt and the relay's injected
+    // one are accounted separately, so nobody is billed for a system prompt
+    // they never wrote. Physically the injection happens first and both
+    // figures come out of a single counting pass — tokenizing the same
+    // conversation twice would double the cost of the heaviest step for a
+    // number that subtraction already gives exactly. The tokenizer is the
+    // *backend* model's, because that is the one that bills.
     let rt = RequestTransform::merged(&cfg.defaults.request_transform, &route.request_transform);
     let mut upstream_body = transform_request(&body, &route, &cfg, &rt);
     let resolved = state.counter.resolve(
@@ -219,21 +324,45 @@ pub async fn handle_chat(
     );
     let input = state
         .counter
-        .count_request(&upstream_body, &resolved, &cfg.tokenizer.image_defaults)
+        .count_prompt(
+            &body,
+            &upstream_body,
+            &resolved,
+            &cfg.tokenizer.image_defaults,
+        )
         .await;
 
-    record.local_prompt = input.total as i64;
+    // Charging for the injected prompt means treating the whole body as the
+    // caller's: same number on both sides of the ratio.
+    let user_local = if cfg.tokenizer.bill_system_prompt_to_user {
+        input.billed as u64
+    } else {
+        input.user as u64
+    };
+    let billed_local = input.billed as u64;
+    record.local_prompt = input.billed as i64;
+    record.billed_prompt_tokens = input.billed as i64;
+    record.user_prompt_tokens = user_local as i64;
+    record.system_prompt_tokens = input.injected;
     record.tokenizer = input.tokenizer.clone();
     record.exact = i64::from(input.exact);
 
+    // The model's own context window is a fact about the backend, so it is
+    // checked against what the backend will actually receive.
     let max_in = route.limits.max_input_tokens;
-    if max_in > 0 && input.total > max_in as usize {
+    if max_in > 0 && input.billed > max_in as usize {
         let message = format!(
             "prompt is {} tokens, over this model's {max_in} token limit",
-            input.total
+            input.billed
         );
         finish(
-            &state, record, 413, &message, None, None, None, None, "", "",
+            &state,
+            record,
+            Outcome {
+                status: 413,
+                error: &message,
+                ..Default::default()
+            },
         );
         return error_response(
             413,
@@ -274,31 +403,7 @@ pub async fn handle_chat(
         }
     }
 
-    // Backpressure: refuse rather than pile work onto a phone that is already
-    // saturated. A queued request that times out helps nobody.
-    let Ok(permit) = state.in_flight.clone().try_acquire_owned() else {
-        state
-            .stats
-            .rejected_overload
-            .fetch_add(1, Ordering::Relaxed);
-        let message = format!(
-            "relay is at its concurrency limit ({}); retry shortly",
-            cfg.server.max_concurrent_requests
-        );
-        finish(
-            &state, record, 503, &message, None, None, None, None, "", "",
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [("retry-after", "1")],
-            axum::Json(serde_json::json!({
-                "error": {"message": message, "type": "server_error", "code": "overloaded"}
-            })),
-        )
-            .into_response();
-    };
-    state.stats.in_flight.fetch_add(1, Ordering::Relaxed);
-
+    // Requirement 4: the request goes to the backend.
     let sent = state
         .upstream
         .send_with_fallback(&cfg, &route, endpoint, &upstream_body, stream_upstream)
@@ -307,21 +412,20 @@ pub async fn handle_chat(
     let sent = match sent {
         Ok(sent) => sent,
         Err(err) => {
+            // Never reached the backend, so nothing was consumed there; the
+            // closing ledger row accounts for the whole request on its own.
             record.retries = i64::from(err.attempts.saturating_sub(1));
             finish(
                 &state,
                 record,
-                err.status as i64,
-                &err.message,
-                Some(started),
-                None,
-                None,
-                None,
-                "",
-                "",
+                Outcome {
+                    status: err.status as i64,
+                    error: &err.message,
+                    started: Some(started),
+                    ..Default::default()
+                },
             );
-            state.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-            drop(permit);
+            drop(ticket);
             return error_response(err.status, &err.message, "upstream_error", None);
         }
     };
@@ -329,20 +433,25 @@ pub async fn handle_chat(
     record.backend_id = sent.backend().id.clone();
     record.retries = i64::from(sent.attempts().saturating_sub(1));
 
+    // Requirement 5: the input is on the books the moment the backend has it,
+    // not when the answer comes back. A stream that dies halfway, a caller who
+    // hangs up, a phone that loses power — the tokens were still spent, and
+    // this row is what remembers that.
+    ledger_input(&state, &record);
+
     let response = match sent {
         Sent::Failed { status, body, .. } => {
             let message = format!("backend rejected the request: {}", truncate(&body, 400));
             finish(
                 &state,
                 record,
-                i64::from(status),
-                &truncate(&body, 500),
-                Some(started),
-                None,
-                None,
-                None,
-                "",
-                "",
+                Outcome {
+                    status: i64::from(status),
+                    error: &truncate(&body, 500),
+                    started: Some(started),
+                    input_ledgered: true,
+                    ..Default::default()
+                },
             );
             error_response(status, &message, "upstream_error", None)
         }
@@ -366,21 +475,34 @@ pub async fn handle_chat(
                 record,
                 started,
                 client_wants_stream,
+                user_local,
+                billed_local,
+                input_ledgered: true,
             };
 
             if stream_upstream && is_sse {
-                return pipe_stream(response, ctx, permit).await;
+                return pipe_stream(response, ctx, ticket).await;
             }
             let out = pipe_buffered(response, ctx).await;
-            state.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-            drop(permit);
+            drop(ticket);
             return out;
         }
     };
 
-    state.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-    drop(permit);
+    drop(ticket);
     response
+}
+
+/// A 503 the caller can act on: it says how long to wait before trying again.
+fn overloaded(message: &str, retry_after_s: u32) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", retry_after_s.to_string())],
+        axum::Json(serde_json::json!({
+            "error": {"message": message, "type": "server_error", "code": "overloaded"}
+        })),
+    )
+        .into_response()
 }
 
 /* ----------------------------------------------------------- streaming -- */
@@ -545,15 +667,11 @@ async fn pump(
 
 /// Stream to the caller. The pump runs in its own task so the HTTP response can
 /// be returned immediately and the body produced as it arrives.
-async fn pipe_stream(
-    response: reqwest::Response,
-    ctx: Ctx,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> Response {
+async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> Response {
     if !ctx.client_wants_stream {
         // We streamed upstream only to measure TTFT; the caller wants JSON.
         let out = pipe_streamed_into_json(response, ctx).await;
-        drop(permit);
+        drop(ticket);
         return out;
     }
 
@@ -561,13 +679,13 @@ async fn pipe_stream(
     let request_id = ctx.record.id.clone();
 
     tokio::spawn(async move {
-        let state = ctx.state.clone();
         let pumped = pump(response, &ctx, Some(&tx)).await;
-        let usage = finalise_usage(&ctx, &pumped, true).await;
+        let billed = finalise_usage(&ctx, &pumped, true).await;
+        let charged = billed.charged_to_caller(ctx.user_local, ctx.billed_local);
 
         if !pumped.disconnected {
-            if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
-                let chunk = usage_chunk(&ctx.record.id, &ctx.route.id, &usage);
+            if charged.prompt_tokens > 0 || charged.completion_tokens > 0 {
+                let chunk = usage_chunk(&ctx.record.id, &ctx.route.id, &charged);
                 let _ = tx.send(Ok(sse::format_sse(&chunk))).await;
             }
             if let Some(err) = &pumped.error {
@@ -579,9 +697,8 @@ async fn pipe_stream(
             let _ = tx.send(Ok(Bytes::from_static(sse::DONE.as_bytes()))).await;
         }
 
-        record_stream_outcome(&ctx, &pumped, usage);
-        state.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-        drop(permit);
+        record_stream_outcome(&ctx, &pumped, &billed, &charged);
+        drop(ticket);
     });
 
     let mut headers = HeaderMap::new();
@@ -608,7 +725,8 @@ async fn pipe_stream(
 /// Rebuild a normal chat completion from a stream we consumed ourselves.
 async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Response {
     let pumped = pump(response, &ctx, None).await;
-    let usage = finalise_usage(&ctx, &pumped, false).await;
+    let billed = finalise_usage(&ctx, &pumped, false).await;
+    let charged = billed.charged_to_caller(ctx.user_local, ctx.billed_local);
 
     let rules = compile_text_rules(&ctx.transform.replace);
     let body_text = match &rules {
@@ -635,10 +753,10 @@ async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Respo
         } else {
             &pumped.finish_reason
         },
-        &usage,
+        &charged,
     );
 
-    record_stream_outcome(&ctx, &pumped, usage);
+    record_stream_outcome(&ctx, &pumped, &billed, &charged);
     json_with_id(&ctx.record.id, assembled)
 }
 
@@ -651,14 +769,13 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
             finish(
                 &ctx.state,
                 ctx.record.clone(),
-                502,
-                &message,
-                Some(ctx.started),
-                None,
-                None,
-                None,
-                "",
-                "",
+                Outcome {
+                    status: 502,
+                    error: &message,
+                    started: Some(ctx.started),
+                    input_ledgered: ctx.input_ledgered,
+                    ..Default::default()
+                },
             );
             return error_response(502, &message, "upstream_error", None);
         }
@@ -707,7 +824,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
         )
         .await;
 
-    let usage = reconcile_usage(
+    let billed = reconcile_usage(
         LocalCount {
             prompt: ctx.record.local_prompt as u64,
             completion: completion as u64,
@@ -716,9 +833,10 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
         payload.get("usage"),
         ctx.cfg.tokenizer.prefer_upstream_usage,
     );
+    let charged = billed.charged_to_caller(ctx.user_local, ctx.billed_local);
 
     if let Some(map) = shaped.as_object_mut() {
-        map.insert("usage".into(), usage.public());
+        map.insert("usage".into(), charged.public());
     }
 
     let finish_reason = choice
@@ -736,19 +854,22 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
     finish(
         &ctx.state,
         ctx.record.clone(),
-        200,
-        "",
-        Some(ctx.started),
-        None,
-        Some(finished),
-        Some(&usage),
-        &finish_reason,
-        &preview,
+        Outcome {
+            status: 200,
+            started: Some(ctx.started),
+            last_token_at: Some(finished),
+            billed: Some(&billed),
+            charged: Some(&charged),
+            finish_reason: &finish_reason,
+            response_preview: &preview,
+            input_ledgered: ctx.input_ledgered,
+            ..Default::default()
+        },
     );
 
     if ctx.client_wants_stream {
         // The backend could not stream, so replay the finished answer as SSE.
-        return replay_as_sse(&ctx, &content, &usage);
+        return replay_as_sse(&ctx, &content, &charged);
     }
     json_with_id(&ctx.record.id, shaped)
 }
@@ -793,7 +914,7 @@ async fn finalise_usage(ctx: &Ctx, pumped: &Pumped, streaming_to_client: bool) -
     )
 }
 
-fn record_stream_outcome(ctx: &Ctx, pumped: &Pumped, usage: Usage) {
+fn record_stream_outcome(ctx: &Ctx, pumped: &Pumped, billed: &Usage, charged: &Usage) {
     let (status, error) = if pumped.disconnected {
         (499, "client disconnected mid-stream".to_string())
     } else if let Some(err) = &pumped.error {
@@ -811,60 +932,74 @@ fn record_stream_outcome(ctx: &Ctx, pumped: &Pumped, usage: Usage) {
     finish(
         &ctx.state,
         ctx.record.clone(),
-        status,
-        &error,
-        Some(ctx.started),
-        pumped.first_token_at,
-        pumped.last_token_at,
-        Some(&usage),
-        &pumped.finish_reason,
-        &preview,
+        Outcome {
+            status,
+            error: &error,
+            started: Some(ctx.started),
+            first_token_at: pumped.first_token_at,
+            last_token_at: pumped.last_token_at,
+            billed: Some(billed),
+            charged: Some(charged),
+            finish_reason: &pumped.finish_reason,
+            response_preview: &preview,
+            input_ledgered: ctx.input_ledgered,
+        },
     );
 }
 
-/// Compute the derived metrics and hand the row to the writer.
-#[allow(clippy::too_many_arguments)]
-fn finish(
-    state: &Arc<AppState>,
-    mut record: RequestRecord,
-    status: i64,
-    error: &str,
-    started: Option<Instant>,
-    first_token_at: Option<Instant>,
-    last_token_at: Option<Instant>,
-    usage: Option<&Usage>,
-    finish_reason: &str,
-    response_preview: &str,
-) {
+/// Compute the derived metrics, then write both records: the detail row the
+/// dashboard browses, and the closing row of the immutable ledger.
+fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
     let end = Instant::now();
-    let total_ms = started.map_or(0.0, |s| end.duration_since(s).as_secs_f64() * 1000.0);
-    let ttft_ms = match (started, first_token_at) {
+    let total_ms = out
+        .started
+        .map_or(0.0, |s| end.duration_since(s).as_secs_f64() * 1000.0);
+    let ttft_ms = match (out.started, out.first_token_at) {
         (Some(s), Some(f)) => f.duration_since(s).as_secs_f64() * 1000.0,
         _ => 0.0,
     };
-    let gen_ms = match (first_token_at, last_token_at) {
+    let gen_ms = match (out.first_token_at, out.last_token_at) {
         (Some(f), Some(l)) if l > f => l.duration_since(f).as_secs_f64() * 1000.0,
         _ => 0.0,
     };
 
-    let completion = usage.map_or(0, |u| u.completion_tokens);
-    record.status = status;
-    record.error = truncate(error, 800);
-    record.finish_reason = finish_reason.to_string();
+    let completion = out.billed.map_or(0, |u| u.completion_tokens);
+    record.status = out.status;
+    record.error = truncate(out.error, 800);
+    record.finish_reason = out.finish_reason.to_string();
     record.total_ms = round(total_ms, 1);
     record.ttft_ms = round(ttft_ms, 1);
     record.gen_ms = round(gen_ms, 1);
-    record.prompt_tokens = usage.map_or(record.local_prompt, |u| u.prompt_tokens as i64);
+
+    // `prompt_tokens` is the caller's number, and the only one they ever see.
+    // What the backend charged is kept beside it rather than in place of it.
+    record.billed_prompt_tokens = out
+        .billed
+        .map_or(record.billed_prompt_tokens, |u| u.prompt_tokens as i64);
+    record.user_prompt_tokens = out
+        .charged
+        .map_or(record.user_prompt_tokens, |u| u.prompt_tokens as i64);
+    record.prompt_tokens = record.user_prompt_tokens;
+    // `system_prompt_tokens` is deliberately left as the relay's own local
+    // measurement of what it injected, rather than restated as billed minus
+    // user. It answers "what is my system prompt costing me", which stays a
+    // real question even when the caller is billed for it — and it keeps
+    // meaning the same thing whether or not the backend reports usage of its
+    // own. The overhead actually absorbed is billed minus user, which the
+    // dashboard computes from those two.
     record.completion_tokens = completion as i64;
-    record.total_tokens = usage.map_or(record.prompt_tokens, |u| u.total_tokens as i64);
-    record.cached_tokens = usage.map_or(0, |u| u.cached_tokens as i64);
-    record.reasoning_tokens = usage.map_or(0, |u| u.reasoning_tokens as i64);
-    record.usage_source = usage.map_or(String::new(), |u| u.source.to_string());
-    record.exact = usage.map_or(record.exact, |u| i64::from(u.exact));
-    record.local_prompt = usage.map_or(record.local_prompt, |u| u.local_prompt as i64);
-    record.local_completion = usage.map_or(0, |u| u.local_completion as i64);
-    record.drift_prompt = usage.map_or(0, |u| u.drift_prompt);
-    record.drift_completion = usage.map_or(0, |u| u.drift_completion);
+    record.total_tokens = record.prompt_tokens + record.completion_tokens;
+    record.cached_tokens = out.billed.map_or(0, |u| u.cached_tokens as i64);
+    record.cache_hit = i64::from(record.cached_tokens > 0);
+    record.reasoning_tokens = out.billed.map_or(0, |u| u.reasoning_tokens as i64);
+    record.usage_source = out.billed.map_or(String::new(), |u| u.source.to_string());
+    record.exact = out.billed.map_or(record.exact, |u| i64::from(u.exact));
+    record.local_prompt = out
+        .billed
+        .map_or(record.local_prompt, |u| u.local_prompt as i64);
+    record.local_completion = out.billed.map_or(0, |u| u.local_completion as i64);
+    record.drift_prompt = out.billed.map_or(0, |u| u.drift_prompt);
+    record.drift_completion = out.billed.map_or(0, |u| u.drift_completion);
     // Throughput over the generation phase only, which is the number that
     // actually describes how fast the model produced tokens.
     record.tokens_per_sec = if gen_ms > 0.0 && completion > 0 {
@@ -872,9 +1007,9 @@ fn finish(
     } else {
         0.0
     };
-    record.res_preview = response_preview.to_string();
+    record.res_preview = out.response_preview.to_string();
 
-    let tag = if status >= 400 || status == 0 {
+    let tag = if out.status >= 400 || out.status == 0 {
         "error"
     } else {
         "ok"
@@ -889,10 +1024,10 @@ fn finish(
         record.total_ms,
         record.tokens_per_sec,
         record.key_label,
-        if error.is_empty() {
+        if out.error.is_empty() {
             String::new()
         } else {
-            format!(" err={}", truncate(error, 160))
+            format!(" err={}", truncate(out.error, 160))
         },
     ));
 
@@ -902,11 +1037,89 @@ fn finish(
         record.total_tokens.max(0) as u64,
     );
 
+    ledger_final(state, &record, out.input_ledgered);
+
     if !state.store.insert(record) {
         state
             .logger
             .warn("metrics queue is full; dropped a request row rather than blocking the relay");
     }
+}
+
+/* -------------------------------------------------------------- ledger -- */
+
+/// The shared half of both ledger rows: who asked, for what, and when.
+fn ledger_stub(record: &RequestRecord, phase: Phase) -> LedgerEntry {
+    LedgerEntry {
+        request_id: record.id.clone(),
+        phase,
+        ts: record.ts,
+        day: record.day.clone(),
+        hour: record.hour.clone(),
+        key_id: record.key_id.clone(),
+        public_model: record.public_model.clone(),
+        backend_id: record.backend_id.clone(),
+        queued_ms: record.queued_ms,
+        ..Default::default()
+    }
+}
+
+fn append(state: &Arc<AppState>, entry: LedgerEntry) {
+    if !state.store.ledger(entry) {
+        // Unlike a detail row, this one is the accounting record, so losing it
+        // is worth saying loudly. It still must not block the request.
+        state.logger.error(
+            "usage ledger queue is full; a usage row was dropped — the relay is writing to \
+             disk more slowly than requests are arriving",
+        );
+    }
+}
+
+/// Record the input the moment the backend has it.
+fn ledger_input(state: &Arc<AppState>, record: &RequestRecord) {
+    append(
+        state,
+        LedgerEntry {
+            requests: 1,
+            input_tokens: record.user_prompt_tokens,
+            billed_input_tokens: record.billed_prompt_tokens,
+            ..ledger_stub(record, Phase::Input)
+        },
+    );
+}
+
+/// Close the request out.
+///
+/// The input figures are repeated here only when no input row was written —
+/// a request refused before it ever reached a backend. Otherwise this row
+/// carries the output alone, so summing the ledger counts nothing twice.
+fn ledger_final(state: &Arc<AppState>, record: &RequestRecord, input_ledgered: bool) {
+    append(
+        state,
+        LedgerEntry {
+            status: record.status,
+            requests: i64::from(!input_ledgered),
+            input_tokens: if input_ledgered {
+                0
+            } else {
+                record.user_prompt_tokens
+            },
+            billed_input_tokens: if input_ledgered {
+                0
+            } else {
+                record.billed_prompt_tokens
+            },
+            output_tokens: record.completion_tokens,
+            cached_tokens: record.cached_tokens,
+            reasoning_tokens: record.reasoning_tokens,
+            cache_hit: record.cache_hit,
+            ttft_ms: record.ttft_ms,
+            gen_ms: record.gen_ms,
+            total_ms: record.total_ms,
+            tokens_per_sec: record.tokens_per_sec,
+            ..ledger_stub(record, Phase::Final)
+        },
+    );
 }
 
 fn json_with_id(request_id: &str, body: Value) -> Response {

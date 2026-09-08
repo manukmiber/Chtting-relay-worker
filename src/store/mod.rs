@@ -14,6 +14,7 @@
 //! * [`RateLimiter`] is a sharded sliding window, so one busy key does not
 //!   serialise everyone else behind a single mutex.
 
+pub mod ledger;
 pub mod schema;
 
 use anyhow::Result;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+pub use ledger::{LedgerEntry, Phase};
 pub use schema::RequestRecord;
 
 /// How many rows the writer will commit in one transaction.
@@ -46,10 +48,12 @@ impl Store {
 
         let path = file.to_path_buf();
         let setup = path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let last_hash = tokio::task::spawn_blocking(move || -> Result<String> {
             let conn = Connection::open(&setup)?;
             conn.execute_batch(schema::CREATE_SQL)?;
-            Ok(())
+            conn.execute_batch(ledger::CREATE_SQL)?;
+            migrate(&conn)?;
+            Ok(last_ledger_hash(&conn)?)
         })
         .await??;
 
@@ -64,7 +68,7 @@ impl Store {
         };
 
         let (tx, rx) = mpsc::channel::<WriteMsg>(8192);
-        spawn_writer(path.clone(), rx, logger);
+        spawn_writer(path.clone(), rx, logger, last_hash);
 
         Ok(Arc::new(Self {
             file: file.to_path_buf(),
@@ -89,6 +93,16 @@ impl Store {
     pub fn insert(&self, record: RequestRecord) -> bool {
         // Boxed so the channel's slots stay small; the record is 35 fields wide.
         self.tx.try_send(WriteMsg::Row(Box::new(record))).is_ok()
+    }
+
+    /// Append a row to the immutable usage ledger.
+    ///
+    /// Same channel as [`insert`](Self::insert), and for the same reason: the
+    /// request path never waits on the disk. It also means the ledger's rows
+    /// reach the writer in the order they happened, which is what lets the
+    /// writer chain them together.
+    pub fn ledger(&self, entry: LedgerEntry) -> bool {
+        self.tx.try_send(WriteMsg::Ledger(Box::new(entry))).is_ok()
     }
 
     /// Wait until everything queued so far has been committed.
@@ -123,6 +137,7 @@ impl Store {
 /// What the writer task accepts.
 enum WriteMsg {
     Row(Box<RequestRecord>),
+    Ledger(Box<LedgerEntry>),
     /// Commit whatever is pending, then answer.
     Flush(tokio::sync::oneshot::Sender<()>),
 }
@@ -131,6 +146,7 @@ fn spawn_writer(
     path: PathBuf,
     mut rx: mpsc::Receiver<WriteMsg>,
     logger: Arc<crate::logging::Logger>,
+    last_hash: String,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut conn = match Connection::open(&path) {
@@ -154,29 +170,38 @@ fn spawn_writer(
         }
 
         let mut batch: Vec<RequestRecord> = Vec::with_capacity(WRITE_BATCH);
+        let mut entries: Vec<LedgerEntry> = Vec::with_capacity(WRITE_BATCH);
         let mut acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+        // The chain's head. Only this task appends, so holding it in memory is
+        // enough to keep every row linked to the one before it.
+        let mut prev_hash = last_hash;
         // blocking_recv_many is not available, so drain by hand: take one
         // blocking read, then greedily pull whatever else is already queued.
         while let Some(first) = rx.blocking_recv() {
             match first {
                 WriteMsg::Row(record) => batch.push(*record),
+                WriteMsg::Ledger(entry) => entries.push(*entry),
                 WriteMsg::Flush(ack) => acks.push(ack),
             }
-            while batch.len() < WRITE_BATCH {
+            while batch.len() + entries.len() < WRITE_BATCH {
                 match rx.try_recv() {
                     Ok(WriteMsg::Row(record)) => batch.push(*record),
+                    Ok(WriteMsg::Ledger(entry)) => entries.push(*entry),
                     Ok(WriteMsg::Flush(ack)) => acks.push(ack),
                     Err(_) => break,
                 }
             }
-            if !batch.is_empty() {
-                if let Err(err) = write_batch(&mut conn, &batch) {
-                    logger.error(format!(
-                        "failed to record {} request(s): {err}",
-                        batch.len()
-                    ));
+            if !batch.is_empty() || !entries.is_empty() {
+                match write_batch(&mut conn, &batch, &entries, &prev_hash) {
+                    Ok(head) => prev_hash = head,
+                    Err(err) => logger.error(format!(
+                        "failed to record {} request(s) and {} ledger row(s): {err}",
+                        batch.len(),
+                        entries.len()
+                    )),
                 }
                 batch.clear();
+                entries.clear();
             }
             // Answer only after the commit, so a waiter can read the rows back.
             for ack in acks.drain(..) {
@@ -186,7 +211,17 @@ fn spawn_writer(
     });
 }
 
-fn write_batch(conn: &mut Connection, batch: &[RequestRecord]) -> Result<()> {
+/// Commit a batch and return the new head of the ledger chain.
+///
+/// Both tables go into one transaction, so a request row and its ledger rows
+/// either both land or neither does. On failure the caller keeps the old head,
+/// which is correct: nothing was appended.
+fn write_batch(
+    conn: &mut Connection,
+    batch: &[RequestRecord],
+    entries: &[LedgerEntry],
+    prev_hash: &str,
+) -> Result<String> {
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare_cached(schema::INSERT_SQL)?;
@@ -194,8 +229,47 @@ fn write_batch(conn: &mut Connection, batch: &[RequestRecord]) -> Result<()> {
             stmt.execute(rusqlite::params_from_iter(record.as_params()))?;
         }
     }
+    let mut head = prev_hash.to_string();
+    {
+        let mut stmt = tx.prepare_cached(ledger::INSERT_SQL)?;
+        for entry in entries {
+            let row_hash = entry.hash_with(&head);
+            stmt.execute(rusqlite::params_from_iter(
+                entry.as_params(&head, &row_hash),
+            ))?;
+            head = row_hash;
+        }
+    }
     tx.commit()?;
+    Ok(head)
+}
+
+/// Add columns that a database created by an earlier version does not have.
+fn migrate(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(requests)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    for (name, kind) in schema::ADDED_COLUMNS {
+        if !existing.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE requests ADD COLUMN {name} {kind}"))?;
+        }
+    }
     Ok(())
+}
+
+/// The hash of the newest ledger row, or the genesis value on an empty table.
+fn last_ledger_hash(conn: &Connection) -> rusqlite::Result<String> {
+    conn.query_row(
+        "SELECT row_hash FROM usage_ledger ORDER BY seq DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .or_else(|err| match err {
+        rusqlite::Error::QueryReturnedNoRows => Ok(ledger::GENESIS.to_string()),
+        other => Err(other),
+    })
 }
 
 /* -------------------------------------------------------------- quotas -- */

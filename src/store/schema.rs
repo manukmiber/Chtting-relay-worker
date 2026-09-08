@@ -7,7 +7,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Row;
 use serde::{Deserialize, Serialize};
 
-pub const FIELDS: [&str; 35] = [
+pub const FIELDS: [&str; 40] = [
     "id",
     "ts",
     "day",
@@ -43,6 +43,11 @@ pub const FIELDS: [&str; 35] = [
     "req_preview",
     "res_preview",
     "retries",
+    "user_prompt_tokens",
+    "billed_prompt_tokens",
+    "system_prompt_tokens",
+    "cache_hit",
+    "queued_ms",
 ];
 
 pub const CREATE_SQL: &str = "
@@ -60,7 +65,9 @@ CREATE TABLE IF NOT EXISTS requests (
   tokens_per_sec REAL, usage_source TEXT, tokenizer TEXT, exact INTEGER,
   local_prompt INTEGER, local_completion INTEGER,
   drift_prompt INTEGER, drift_completion INTEGER,
-  req_preview TEXT, res_preview TEXT, retries INTEGER
+  req_preview TEXT, res_preview TEXT, retries INTEGER,
+  user_prompt_tokens INTEGER, billed_prompt_tokens INTEGER,
+  system_prompt_tokens INTEGER, cache_hit INTEGER, queued_ms REAL
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_requests_day ON requests(day);
@@ -80,13 +87,27 @@ pub const INSERT_SQL: &str = "INSERT OR REPLACE INTO requests (
   cached_tokens, reasoning_tokens,
   tokens_per_sec, usage_source, tokenizer, exact,
   local_prompt, local_completion, drift_prompt, drift_completion,
-  req_preview, res_preview, retries
+  req_preview, res_preview, retries,
+  user_prompt_tokens, billed_prompt_tokens, system_prompt_tokens,
+  cache_hit, queued_ms
 ) VALUES (
   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
   ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-  ?31, ?32, ?33, ?34, ?35
+  ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
 )";
+
+/// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` leaves
+/// an existing table alone, so an install that predates them needs each one
+/// added by hand; SQLite has no `ADD COLUMN IF NOT EXISTS`, so the caller
+/// checks `PRAGMA table_info` first.
+pub const ADDED_COLUMNS: [(&str, &str); 5] = [
+    ("user_prompt_tokens", "INTEGER"),
+    ("billed_prompt_tokens", "INTEGER"),
+    ("system_prompt_tokens", "INTEGER"),
+    ("cache_hit", "INTEGER"),
+    ("queued_ms", "REAL"),
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestRecord {
@@ -130,6 +151,22 @@ pub struct RequestRecord {
     pub req_preview: String,
     pub res_preview: String,
     pub retries: i64,
+    /// What the caller is charged for: their own prompt, without the system
+    /// prompt the relay injected on their behalf. This is the number that
+    /// `prompt_tokens` reports back to them.
+    pub user_prompt_tokens: i64,
+    /// What the backend charged for the same prompt, injection included. The
+    /// gap between the two is the relay's own cost of doing business.
+    pub billed_prompt_tokens: i64,
+    /// The injected prompt itself, as this relay's own tokenizer counts it —
+    /// so it answers what the system prompt costs, independently of whether the
+    /// backend reported any usage. Negative when the route replaced a longer
+    /// system prompt of the caller's with a shorter one.
+    pub system_prompt_tokens: i64,
+    /// 1 when the backend served part of this prompt from its cache.
+    pub cache_hit: i64,
+    /// Time spent waiting for a concurrency slot, before any work began.
+    pub queued_ms: f64,
 }
 
 impl RequestRecord {
@@ -171,6 +208,11 @@ impl RequestRecord {
             SqlValue::Text(self.req_preview.clone()),
             SqlValue::Text(self.res_preview.clone()),
             SqlValue::Integer(self.retries),
+            SqlValue::Integer(self.user_prompt_tokens),
+            SqlValue::Integer(self.billed_prompt_tokens),
+            SqlValue::Integer(self.system_prompt_tokens),
+            SqlValue::Integer(self.cache_hit),
+            SqlValue::Real(self.queued_ms),
         ]
     }
 }

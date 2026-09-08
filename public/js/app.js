@@ -6,6 +6,7 @@ import { backendsView } from './views/backends.js';
 import { keysView } from './views/keys.js';
 import { promptsView } from './views/prompts.js';
 import { requestsView } from './views/requests.js';
+import { usageView } from './views/usage.js';
 import { tokenizerView } from './views/tokenizer.js';
 import { tunnelView } from './views/tunnel.js';
 import { playgroundView } from './views/playground.js';
@@ -19,6 +20,7 @@ const TABS = [
   ['prompts', 'Prompts', promptsView],
   ['keys', 'Keys', keysView],
   ['requests', 'Requests', requestsView],
+  ['usage', 'Usage', usageView],
   ['tokenizer', 'Tokenizer', tokenizerView],
   ['playground', 'Playground', playgroundView],
   ['tunnel', 'Tunnel', tunnelView],
@@ -138,7 +140,7 @@ async function boot() {
   } catch (err) {
     clear(view).append(card('Cannot reach the relay', h('div', {},
       h('p.muted', { text: err.message }),
-      h('p.small.muted', { text: 'Is the relay still running in Termux? Start it with: npm start' }),
+      h('p.small.muted', { text: 'Is the relay still running in Termux? Start it with: bash scripts/start-termux.sh' }),
       h('button', { onclick: boot }, 'Retry'),
     )));
   }

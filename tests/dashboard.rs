@@ -64,6 +64,22 @@ impl Dash {
             .await
             .unwrap()
     }
+
+    /// Put one real request through the relay, so there is something to report.
+    async fn relay_call(&self) {
+        let res = self
+            .relay
+            .post(
+                "/v1/chat/completions",
+                json!({
+                    "model": "manukmiberai/creative-writer",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }),
+            )
+            .await;
+        assert_eq!(res.status(), 200, "the relay call should succeed");
+        self.relay.state.store.flush().await;
+    }
 }
 
 #[tokio::test]
@@ -495,4 +511,152 @@ async fn pruning_reports_how_many_rows_it_removed() {
         .unwrap();
     assert_eq!(result["ok"], true);
     assert_eq!(result["removed"], 0, "nothing is old enough to prune yet");
+}
+
+/* ------------------------------------------------------- usage and queue -- */
+
+#[tokio::test]
+async fn the_usage_summary_is_totalled_from_the_ledger() {
+    let d = Dash::start(|_| {}).await;
+    d.relay_call().await;
+
+    let summary: Value = d.get_json("/api/usage/summary?range=30d").await;
+    let window = &summary["window"];
+    assert_eq!(window["requests"].as_i64().unwrap(), 1);
+    assert!(window["inputTokens"].as_i64().unwrap() > 0);
+    assert!(window["outputTokens"].as_i64().unwrap() > 0);
+    assert_eq!(window["completed"].as_i64().unwrap(), 1);
+    // Every field the dashboard's Usage tab reads must be present.
+    for key in [
+        "billedInputTokens",
+        "cachedTokens",
+        "cacheHits",
+        "cacheHitRate",
+        "avgTtftMs",
+        "avgTokensPerSec",
+        "avgQueuedMs",
+        "users",
+        "errors",
+        "inFlight",
+    ] {
+        assert!(window.get(key).is_some(), "usage summary is missing {key}");
+    }
+}
+
+#[tokio::test]
+async fn the_usage_totals_survive_pruning_the_request_log() {
+    let d = Dash::start(|_| {}).await;
+    d.relay_call().await;
+
+    let before: Value = d.get_json("/api/usage/summary?range=30d").await;
+    let tokens = before["all"]["inputTokens"].as_i64().unwrap();
+    assert!(tokens > 0);
+
+    // Wipe the browsable log the way the maintenance button does.
+    d.relay
+        .state
+        .store
+        .read(|conn| {
+            conn.execute("DELETE FROM requests", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let after: Value = d.get_json("/api/usage/summary?range=30d").await;
+    assert_eq!(
+        after["all"]["inputTokens"].as_i64().unwrap(),
+        tokens,
+        "the ledger must outlive the request rows"
+    );
+}
+
+#[tokio::test]
+async fn the_ledger_endpoint_reports_an_intact_chain() {
+    let d = Dash::start(|_| {}).await;
+    d.relay_call().await;
+
+    let rows: Value = d.get_json("/api/usage/ledger?limit=10").await;
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+
+    let check: Value = d.get_json("/api/usage/verify").await;
+    assert_eq!(check["ok"], true);
+    assert_eq!(check["rows"].as_i64().unwrap(), 2);
+    assert!(check["brokenAt"].is_null());
+}
+
+#[tokio::test]
+async fn the_queue_endpoint_reports_both_the_setting_and_the_live_state() {
+    let d = Dash::start(|cfg| {
+        cfg.server.max_concurrent_requests = 7;
+        cfg.server.queue_capacity = 99;
+        cfg.server.queue_timeout_ms = 12_345;
+    })
+    .await;
+
+    let queue: Value = d.get_json("/api/queue").await;
+    assert_eq!(queue["configured"]["maxConcurrentRequests"], 7);
+    assert_eq!(queue["configured"]["queueCapacity"], 99);
+    assert_eq!(queue["configured"]["queueTimeoutMs"], 12_345);
+    assert_eq!(queue["live"]["limit"], 7);
+    assert_eq!(queue["live"]["inFlight"], 0);
+}
+
+#[tokio::test]
+async fn the_concurrency_limit_can_be_raised_from_the_dashboard_without_a_restart() {
+    let d = Dash::start(|cfg| cfg.server.max_concurrent_requests = 2).await;
+
+    let res = d
+        .put(
+            "/api/config",
+            json!({"server": {"maxConcurrentRequests": 32, "queueCapacity": 500}}),
+        )
+        .await;
+    assert_eq!(res.status(), 200);
+
+    // The gate resizes on the next request rather than at startup.
+    d.relay_call().await;
+    let queue: Value = d.get_json("/api/queue").await;
+    assert_eq!(queue["configured"]["maxConcurrentRequests"], 32);
+    assert_eq!(queue["live"]["limit"], 32);
+}
+
+#[tokio::test]
+async fn the_openrouter_preview_shows_what_would_be_published() {
+    let d = Dash::start(|cfg| {
+        cfg.openrouter.enabled = true;
+        cfg.models[0].openrouter.listed = true;
+        cfg.models[0].openrouter.pricing.prompt_usd = "0.0000006".into();
+    })
+    .await;
+
+    let preview: Value = d.get_json("/api/openrouter/preview").await;
+    assert_eq!(preview["enabled"], true);
+    assert_eq!(preview["tokenRequired"], false);
+    assert_eq!(preview["document"]["data"][0]["schema_version"], "2.4");
+    assert!(!preview.to_string().contains("Deepseek-v4-flash-0731"));
+}
+
+#[tokio::test]
+async fn a_zero_retention_claim_is_refused_while_prompts_are_being_stored() {
+    let d = Dash::start(|cfg| {
+        cfg.logging.store_bodies = "preview".into();
+    })
+    .await;
+
+    let res = d
+        .put(
+            "/api/config",
+            json!({"openrouter": {"enabled": true, "compliance": {"zdr": true}}}),
+        )
+        .await;
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ZDR"),
+        "unhelpful refusal: {body}"
+    );
 }

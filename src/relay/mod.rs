@@ -1,5 +1,6 @@
 //! The relay proper.
 
+pub mod gate;
 pub mod handler;
 pub mod sse;
 pub mod transform;

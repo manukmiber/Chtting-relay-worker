@@ -331,6 +331,22 @@ async fn doctor(paths: Paths) -> Result<()> {
         cfg.dashboard.host, cfg.dashboard.port
     );
     println!("  max in flight {}", cfg.server.max_concurrent_requests);
+    println!(
+        "  queue         {} waiting, {}s to give up",
+        cfg.server.queue_capacity,
+        cfg.server.queue_timeout_ms / 1000
+    );
+    if cfg.openrouter.enabled {
+        let listed = cfg
+            .models
+            .iter()
+            .filter(|m| m.enabled && m.openrouter.listed)
+            .count();
+        println!(
+            "  openrouter    {listed} model(s) published at {}",
+            cfg.openrouter.path
+        );
+    }
 
     println!("\ntokenizers");
     for name in BUILTIN_TIKTOKEN {

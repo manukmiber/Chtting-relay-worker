@@ -67,6 +67,10 @@ percent-encoding = "2"
 base64 = "0.22"
 # Matches the hasher `tiktoken_rs::CoreBPE::new` expects for its rank tables.
 rustc-hash = "1.1"
+# Chains the usage ledger's rows together so a number that was edited behind
+# the relay's back can be spotted. Pure Rust, so it cross-compiles to Android
+# with no extra toolchain.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

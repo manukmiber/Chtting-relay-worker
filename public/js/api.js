@@ -60,6 +60,13 @@ export const api = {
   countTokens: (payload) => request('POST', '/api/tokenizer/count', payload),
   installTokenizer: (payload) => request('POST', '/api/tokenizer/install', payload),
 
+  usageSummary: (range) => request('GET', `/api/usage/summary?range=${encodeURIComponent(range)}`),
+  usageDaily: (days) => request('GET', `/api/usage/daily?days=${days}`),
+  usageLedger: (limit = 100) => request('GET', `/api/usage/ledger?limit=${limit}`),
+  verifyLedger: () => request('GET', '/api/usage/verify'),
+  queue: () => request('GET', '/api/queue'),
+  openrouterPreview: () => request('GET', '/api/openrouter/preview'),
+
   tunnel: () => request('GET', '/api/tunnel'),
   tunnelAction: (action) => request('POST', `/api/tunnel/${action}`),
 

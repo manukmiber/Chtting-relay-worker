@@ -76,6 +76,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/stats/by/{column}", get(stats_by))
         .route("/api/requests", get(list_requests))
         .route("/api/requests/{id}", get(get_request))
+        .route("/api/usage/summary", get(usage_summary))
+        .route("/api/usage/daily", get(usage_daily))
+        .route("/api/usage/ledger", get(usage_ledger))
+        .route("/api/usage/verify", get(usage_verify))
+        .route("/api/queue", get(queue_status))
+        .route("/api/openrouter/preview", get(openrouter_preview))
         .route("/api/maintenance/prune", post(prune))
         .route("/api/logs", get(read_logs))
         .route("/api/tokenizer/inventory", get(tokenizer_inventory))
@@ -202,6 +208,7 @@ async fn app_state(State(dash): State<Arc<Dashboard>>) -> Response {
         })
         .await
         .unwrap_or(0);
+    let queue = state.gate.snapshot();
 
     Json(json!({
         "config": state.config.redacted(),
@@ -237,9 +244,10 @@ async fn app_state(State(dash): State<Arc<Dashboard>>) -> Response {
             "uptime_s": state.stats.uptime_s(),
             "workers": cfg.server.worker_threads,
             "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-            "in_flight": state.stats.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            "in_flight": queue.in_flight,
             "max_concurrent": cfg.server.max_concurrent_requests,
-            "rejected_overload": state.stats.rejected_overload.load(std::sync::atomic::Ordering::Relaxed),
+            "rejected_overload": queue.refused_queue_full + queue.refused_timeout,
+            "queue": queue,
             "termux": std::env::var("PREFIX").is_ok_and(|p| p.contains("com.termux")),
         },
         "today": state.today(),
@@ -846,6 +854,218 @@ async fn get_request(State(dash): State<Arc<Dashboard>>, Path(id): Path<String>)
         Ok(None) => error(404, "request not found"),
         Err(err) => error(500, &err.to_string()),
     }
+}
+
+/* --------------------------------------------------------- usage ledger -- */
+
+/// Everything totalled from the ledger rather than the browsable request log.
+///
+/// The two can differ, and the difference is the point: request rows are
+/// prunable, the ledger is not, so after a prune this is still the whole
+/// history. It is also the only place a request that never finished is
+/// counted — its input row was written the moment the backend had it.
+const LEDGER_SUMMARY_SQL: &str = "
+    SELECT
+      COALESCE(SUM(requests),0),
+      COUNT(DISTINCT key_id),
+      COALESCE(SUM(input_tokens),0),
+      COALESCE(SUM(billed_input_tokens),0),
+      COALESCE(SUM(output_tokens),0),
+      COALESCE(SUM(cached_tokens),0),
+      COALESCE(SUM(reasoning_tokens),0),
+      COALESCE(SUM(cache_hit),0),
+      SUM(CASE WHEN phase = 'final' AND status >= 400 THEN 1 ELSE 0 END),
+      SUM(CASE WHEN phase = 'final' AND status = 200 THEN 1 ELSE 0 END),
+      AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(tokens_per_sec,0)), AVG(NULLIF(queued_ms,0))
+    FROM usage_ledger WHERE ts >= ?1 AND ts <= ?2";
+
+fn ledger_summary(conn: &rusqlite::Connection, from: i64, to: i64) -> rusqlite::Result<Value> {
+    conn.query_row(LEDGER_SUMMARY_SQL, [from, to], |r| {
+        let requests: i64 = r.get(0)?;
+        let completed: i64 = r.get(9)?;
+        let cache_hits: i64 = r.get(7)?;
+        Ok(json!({
+            "requests": requests,
+            "users": r.get::<_, i64>(1)?,
+            "inputTokens": r.get::<_, i64>(2)?,
+            "billedInputTokens": r.get::<_, i64>(3)?,
+            "outputTokens": r.get::<_, i64>(4)?,
+            "cachedTokens": r.get::<_, i64>(5)?,
+            "reasoningTokens": r.get::<_, i64>(6)?,
+            "cacheHits": cache_hits,
+            // Of the requests that finished, not of every request: one still
+            // in flight has no answer yet either way.
+            "cacheHitRate": if completed > 0 {
+                round(cache_hits as f64 / completed as f64 * 100.0, 1)
+            } else {
+                0.0
+            },
+            "errors": r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+            "completed": completed,
+            "inFlight": (requests - completed - r.get::<_, Option<i64>>(8)?.unwrap_or(0)).max(0),
+            "avgTtftMs": round(r.get::<_, Option<f64>>(10)?.unwrap_or(0.0), 1),
+            "avgTokensPerSec": round(r.get::<_, Option<f64>>(11)?.unwrap_or(0.0), 2),
+            "avgQueuedMs": round(r.get::<_, Option<f64>>(12)?.unwrap_or(0.0), 1),
+        }))
+    })
+}
+
+async fn usage_summary(
+    State(dash): State<Arc<Dashboard>>,
+    Query(q): Query<RangeQuery>,
+) -> Response {
+    let range = q.range.unwrap_or_else(|| "30d".into());
+    let since = range_start(&range);
+    let today = start_of_today(&dash.state.config.current().tz());
+
+    let result = dash
+        .state
+        .store
+        .read(move |conn| {
+            Ok(json!({
+                "range": range,
+                "since": since,
+                "all": ledger_summary(conn, 0, i64::MAX)?,
+                "window": ledger_summary(conn, since, i64::MAX)?,
+                "today": ledger_summary(conn, today, i64::MAX)?,
+            }))
+        })
+        .await;
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+async fn usage_daily(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQuery>) -> Response {
+    let days = q.days.unwrap_or(30).clamp(1, 3650);
+    let result = dash
+        .state
+        .store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT day,
+                        COALESCE(SUM(requests),0), COUNT(DISTINCT key_id),
+                        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_hit),0),
+                        AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(tokens_per_sec,0))
+                 FROM usage_ledger GROUP BY day ORDER BY day DESC LIMIT ?1",
+            )?;
+            let mut rows: Vec<Value> = stmt
+                .query_map([days], |r| {
+                    let input: i64 = r.get(3)?;
+                    let output: i64 = r.get(4)?;
+                    Ok(json!({
+                        "day": r.get::<_, String>(0)?,
+                        "requests": r.get::<_, i64>(1)?,
+                        "users": r.get::<_, i64>(2)?,
+                        "inputTokens": input,
+                        "outputTokens": output,
+                        "totalTokens": input + output,
+                        "cachedTokens": r.get::<_, i64>(5)?,
+                        "cacheHits": r.get::<_, i64>(6)?,
+                        "avgTtftMs": round(r.get::<_, Option<f64>>(7)?.unwrap_or(0.0), 1),
+                        "avgTokensPerSec": round(r.get::<_, Option<f64>>(8)?.unwrap_or(0.0), 2),
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.reverse();
+            Ok(Value::Array(rows))
+        })
+        .await;
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+async fn usage_ledger(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQuery>) -> Response {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let result = dash
+        .state
+        .store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, request_id, phase, ts, day, key_id, public_model, status,
+                        requests, input_tokens, billed_input_tokens, output_tokens,
+                        cached_tokens, cache_hit, ttft_ms, gen_ms, total_ms, queued_ms,
+                        tokens_per_sec, row_hash
+                 FROM usage_ledger ORDER BY seq DESC LIMIT ?1",
+            )?;
+            let rows: Vec<Value> = stmt
+                .query_map([limit], |r| {
+                    Ok(json!({
+                        "seq": r.get::<_, i64>(0)?,
+                        "requestId": r.get::<_, String>(1)?,
+                        "phase": r.get::<_, String>(2)?,
+                        "ts": r.get::<_, i64>(3)?,
+                        "day": r.get::<_, String>(4)?,
+                        "keyId": r.get::<_, String>(5)?,
+                        "model": r.get::<_, String>(6)?,
+                        "status": r.get::<_, i64>(7)?,
+                        "requests": r.get::<_, i64>(8)?,
+                        "inputTokens": r.get::<_, i64>(9)?,
+                        "billedInputTokens": r.get::<_, i64>(10)?,
+                        "outputTokens": r.get::<_, i64>(11)?,
+                        "cachedTokens": r.get::<_, i64>(12)?,
+                        "cacheHit": r.get::<_, i64>(13)?,
+                        "ttftMs": r.get::<_, f64>(14)?,
+                        "genMs": r.get::<_, f64>(15)?,
+                        "totalMs": r.get::<_, f64>(16)?,
+                        "queuedMs": r.get::<_, f64>(17)?,
+                        "tokensPerSec": r.get::<_, f64>(18)?,
+                        // Just the head of it: enough to eyeball, not enough
+                        // to clutter a table on a phone screen.
+                        "hash": r.get::<_, String>(19)?.chars().take(12).collect::<String>(),
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Value::Array(rows))
+        })
+        .await;
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+/// Recompute the whole chain and report whether it still holds.
+async fn usage_verify(State(dash): State<Arc<Dashboard>>) -> Response {
+    match dash
+        .state
+        .store
+        .read(|conn| Ok(crate::store::ledger::verify(conn)?))
+        .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+/// The queue as it stands right now, for a dashboard that polls it.
+async fn queue_status(State(dash): State<Arc<Dashboard>>) -> Response {
+    let cfg = dash.state.config.current();
+    Json(json!({
+        "live": dash.state.gate.snapshot(),
+        "configured": {
+            "maxConcurrentRequests": cfg.server.max_concurrent_requests,
+            "queueCapacity": cfg.server.queue_capacity,
+            "queueTimeoutMs": cfg.server.queue_timeout_ms,
+        },
+    }))
+    .into_response()
+}
+
+/// Exactly what OpenRouter would receive if it polled right now.
+async fn openrouter_preview(State(dash): State<Arc<Dashboard>>) -> Response {
+    let cfg = dash.state.config.current();
+    Json(json!({
+        "enabled": cfg.openrouter.enabled,
+        "path": cfg.openrouter.path,
+        "tokenRequired": !cfg.openrouter.token.is_empty(),
+        "document": crate::server::openrouter::document(&cfg),
+    }))
+    .into_response()
 }
 
 async fn prune(State(dash): State<Arc<Dashboard>>) -> Response {

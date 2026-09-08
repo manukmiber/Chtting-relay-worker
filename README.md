@@ -259,9 +259,48 @@ versi sqlite Termux). Handler tidak pernah menunggu disk: baris dikirim lewat
 channel ke satu writer yang menulisnya per-batch dalam satu transaksi.
 
 Yang dicatat: token input dan output, token cached dan reasoning, **TTFT**,
-jendela generasi, **tokens/detik**, total latensi, status, alasan berhenti,
-retry, alias dan model backend, client key, IP, user agent, sumber angka usage,
-drift lokal vs backend, dan preview prompt/jawaban.
+jendela generasi, **tokens/detik**, total latensi, lama antre, status, alasan
+berhenti, retry, alias dan model backend, client key, IP, user agent, sumber
+angka usage, drift lokal vs backend, dan preview prompt/jawaban.
+
+### Token input pemanggil vs token yang ditagih backend
+
+System prompt yang relay suntikkan itu biaya relay, bukan biaya pemanggil — dia
+tidak menulisnya dan tidak bisa melihatnya. Jadi tiap baris menyimpan dua angka:
+
+| Kolom | Artinya |
+|---|---|
+| `user_prompt_tokens` | yang ditagihkan ke pemanggil, dan satu-satunya yang dia lihat di `usage.prompt_tokens` |
+| `billed_prompt_tokens` | yang ditagih backend, sudah termasuk system prompt |
+| `system_prompt_tokens` | ukuran suntikan itu sendiri, menurut tokenizer relay |
+
+Bagian pemanggil dihitung sebagai **proporsi**, bukan pengurangan: `prompt_tokens`
+bisa datang dari tokenizer backend sementara pembagiannya diukur lokal, dan
+mengurangkan dua angka dari dua tokenizer berbeda bisa jadi minus. Kalau kedua
+hitungan sama, hasilnya persis sama dengan pengurangan.
+
+Mau menagihkan system prompt ke pemanggil? Nyalakan
+`tokenizer.billSystemPromptToUser`. Dua angkanya tetap dicatat, jadi selisihnya
+tetap terlihat di tab Usage.
+
+### Buku besar yang tidak bisa diubah
+
+Selain log request yang bisa di-*prune*, ada tabel `usage_ledger` yang **hanya
+menerima baris baru**:
+
+- `UPDATE` dan `DELETE` ditolak trigger SQLite — dari proses ini maupun dari
+  `sqlite3` di terminal sebelah.
+- Tiap baris membawa hash baris sebelumnya. Jadi kalau ada yang menghapus
+  trigger-nya lalu mengedit angka langsung di file, rantainya putus dan tab
+  Usage menunjukkan **baris mana** yang tidak cocok.
+- Tiap request menulis dua baris: `input` begitu backend menerima request
+  (jadi token yang sudah terpakai tetap tercatat walau jawabannya tidak pernah
+  datang), dan `final` saat selesai. Keduanya tidak pernah mencatat angka yang
+  sama dua kali, jadi `SUM` di atas tabel selalu benar.
+
+Isinya yang diringkas tab Usage: jumlah request, token masuk, token keluar,
+TTFT, token/detik, dan cache hit. Prune tidak pernah menyentuh tabel ini —
+angka usage tetap utuh walau log request-nya sudah dibersihkan.
 
 Yang diringkas dashboard: request dan **pengguna harian**, token masuk/keluar per
 hari, **rata-rata TTFT** dan p50/p95, **rata-rata TPS** dan p50/p95, error rate,
@@ -296,10 +335,11 @@ ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pu
 | Prompts | library system prompt |
 | Keys | client key, kuota, batasan model |
 | Requests | log per panggilan + rincian timing dan token |
+| Usage | angka dari buku besar: request, token, TTFT, TPS, cache hit, dan status rantai hash |
 | Tokenizer | playground token, biaya satu request chat, pasang vocabulary |
 | Playground | kirim request beneran lewat relay |
 | Tunnel | start/stop cloudflared, URL publik, output mentah |
-| Settings | server, security, logging, aturan tokenizer, default |
+| Settings | server, antrean, security, logging, aturan tokenizer, default, OpenRouter |
 | Logs | ekor `relay.log` |
 
 Beri password lewat Settings kalau HP-mu dipakai orang lain. Secret selalu
@@ -327,14 +367,78 @@ Di `config.json` bagian `server`:
 
 | Kunci | Default | Artinya |
 |---|---|---|
-| `maxConcurrentRequests` | `512` | batas panggilan yang sedang berjalan ke backend. Lewat itu relay menjawab **503 + `Retry-After`** langsung, bukan mengantre sampai HP tidak sanggup |
+| `maxConcurrentRequests` | `512` | berapa request yang dikerjakan sekaligus. Bisa diubah dari dashboard dan langsung berlaku, tanpa restart |
+| `queueCapacity` | `2048` | berapa yang boleh mengantre. `0` berarti langsung tolak, tanpa antre |
+| `queueTimeoutMs` | `30000` | berapa lama sebuah request menunggu giliran sebelum menyerah. Setel di bawah timeout client-mu |
 | `workerThreads` | `0` | jumlah thread Tokio; `0` berarti satu per core. Turunkan kalau mau menyisakan tenaga buat aplikasi lain |
 | `keepAliveTimeoutMs` | `75000` | keep-alive koneksi masuk |
+
+Request yang lewat batas **mengantre**, bukan langsung ditolak: pemanggil yang
+menunggu 300 ms lalu dapat jawaban lebih terlayani daripada yang dapat 503 lalu
+retry ke tembok yang sama. Antreannya FIFO — yang paling lama menunggu dapat slot
+berikutnya, jadi tidak ada yang kelaparan di belakang gelombang pendatang baru.
+Yang dijawab **503 + `Retry-After`** hanya kalau antreannya penuh atau
+menunggunya lewat batas waktu.
+
+Antreannya di memori, bukan di disk. Tiap request di dalamnya sudah berupa
+koneksi HTTP terbuka dengan pemanggil menunggu di ujung sana; menuliskannya ke
+disk dulu justru menambah latensi tepat di jalur yang sedang tertekan, dan tidak
+membeli apa-apa — koneksinya ikut mati bersama prosesnya.
+
+Tab **Settings** menampilkan keadaan antrean saat itu juga: berapa yang jalan,
+berapa yang menunggu, puncak antrean, rata-rata lama menunggu, dan berapa yang
+ditolak.
 
 Kuota per key (`keys[].quota`) dihitung di memori: `requestsPerMinute` pakai
 sliding window ter-*shard*, `requestsPerDay` dan `tokensPerDay` pakai counter
 harian yang di-seed dari database saat start dan berputar sendiri di tengah malam
 zona waktumu.
+
+---
+
+## Jadi provider di OpenRouter
+
+OpenRouter membaca satu URL untuk tahu model apa yang relay ini layani dan
+berapa harganya. Nyalakan lewat **Settings → OpenRouter**, lalu isi harga tiap
+model di **Models → (pilih model) → OpenRouter**.
+
+```bash
+curl http://127.0.0.1:8787/provider/models
+```
+
+Dokumennya mengikuti `schema_version` 2.4: modality masuk dan keluar,
+`supported_parameters`, `pricing`, `capacity`, kuantisasi, tokenizer, datacenter,
+dan compliance.
+
+Beberapa keputusan yang sengaja diambil:
+
+- **Nama model backend tidak pernah muncul.** Yang dipublikasikan `id` publik,
+  sama seperti `/v1/models`. Ada test yang mengunci ini.
+- **Harga yang belum diisi tidak diterbitkan**, bukan diterbitkan sebagai nol.
+  Harga salah lebih berbahaya daripada harga yang belum ada.
+- **Harga disimpan sebagai teks**, bukan angka. `0.0000006` kehilangan digit
+  terakhirnya kalau lewat `f64`, sementara OpenRouter membacanya sebagai desimal.
+- **Parameter yang relay buang tidak diiklankan.** Kalau `dropParams` memuang
+  `top_p`, dia tidak muncul di `supported_parameters`.
+- **Concurrency yang diterbitkan adalah batas relay yang sebenarnya** kalau kamu
+  tidak mengisinya sendiri. Justru itu gunanya: OpenRouter jadi tidak mengirim
+  lebih banyak daripada yang sanggup dilayani HP.
+- **Klaim zero-data-retention ditolak** selama `logging.storeBodies` masih
+  menyimpan teks prompt. Menerbitkannya berarti berbohong ke pengguna OpenRouter.
+
+Tombol **Preview what OpenRouter sees** di Settings menampilkan dokumen persis
+seperti yang akan diterima OpenRouter.
+
+Yang OpenRouter ukur sendiri — uptime, TTFT, dan throughput — adalah angka yang
+sudah relay catat juga, jadi tab Usage dan penilaian mereka melihat hal yang sama.
+
+| Setelan | Di mana |
+|---|---|
+| `openrouter.enabled` | terbitkan dokumennya atau tidak |
+| `openrouter.path` | URL-nya; ganti path perlu restart, `/provider/models` tetap aktif |
+| `openrouter.token` | opsional, kalau daftar harganya tidak mau dibaca sembarang orang |
+| `openrouter.isReady` | matikan untuk terdaftar tanpa dikirimi trafik |
+| `models[].openrouter.*` | harga, kapasitas, kuantisasi, modality, dan batas tiap model |
 
 ---
 
@@ -411,8 +515,10 @@ cargo test
 Test tokenizer membandingkan dengan fixture hasil `tiktoken` dan `tokenizers`
 Python asli. Test yang butuh vocabulary HuggingFace akan di-skip, bukan gagal,
 kalau vocabulary-nya belum dipasang. Test relay dan dashboard menjalankan server
-sungguhan lewat HTTP di depan backend tiruan — termasuk 300 pemanggil serentak
-dan pengujian bahwa kelebihan beban dijawab 503, bukan diantre.
+sungguhan lewat HTTP di depan backend tiruan — termasuk 300 pemanggil serentak,
+antrean yang menahan lonjakan tanpa menolak siapa pun, antrean penuh yang
+dijawab 503 + `Retry-After`, dan buku besar yang menolak diubah lalu tetap
+mendeteksi perubahan yang dilakukan lewat belakang trigger-nya.
 
 ## Catatan keamanan
 

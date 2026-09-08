@@ -36,9 +36,11 @@ export async function modelsView(ctx) {
       h('td.arrow', { text: '→' }),
       h('td.mono', { text: m.upstreamModel || '—' }),
       h('td', { text: backends.find((b) => b.id === m.backend)?.name ?? m.backend ?? '—' }),
-      h('td', {}, m.systemPrompt?.mode && m.systemPrompt.mode !== 'none'
-        ? pill(m.systemPrompt.mode, 'accent')
-        : h('span.muted', { text: '—' })),
+      h('td', {},
+        m.systemPrompt?.mode && m.systemPrompt.mode !== 'none'
+          ? pill(m.systemPrompt.mode, 'accent')
+          : h('span.muted', { text: '—' }),
+        m.openrouter?.listed ? pill('OpenRouter', 'ok') : null),
       h('td', {}, h('button.ghost.sm', {
         onclick: (e) => { e.stopPropagation(); copy(m.id, `Copied "${m.id}"`); },
         title: 'Copy the public model name',
@@ -72,6 +74,7 @@ function editModel(ctx, existing) {
     requestTransform: {},
     responseTransform: {},
     contextLength: 0,
+    openrouter: {},
   });
 
   const inputs = {};
@@ -228,6 +231,103 @@ function editModel(ctx, existing) {
         'JSON rules, applied to buffered and streamed text alike'),
     ], true));
 
+    /* ---------------------------------------------------- openrouter */
+    // What OpenRouter is told about this model. Prices are text, not numbers:
+    // 0.0000006 loses digits through a float, and OpenRouter reads them as
+    // decimals.
+    const o = m.openrouter ?? {};
+    const price = (v, ph) => text(v ?? '', { class: 'mono', placeholder: ph, inputmode: 'decimal' });
+    inputs.orListed = h('input', { type: 'checkbox', checked: o.listed === true });
+    inputs.orSlug = text(o.slug ?? '', { class: 'mono', placeholder: 'derived from the provider slug' });
+    inputs.orHf = text(o.huggingFaceId ?? '', { class: 'mono', placeholder: 'deepseek-ai/DeepSeek-V3' });
+    inputs.orQuant = select(o.quantization ?? '', [
+      ['', 'unspecified'],
+      ...['int4', 'int8', 'fp4', 'mxfp4', 'nvfp4', 'fp6', 'fp8', 'mxfp8', 'fp16', 'bf16', 'fp32'].map((q) => [q, q]),
+    ]);
+    inputs.orTokFamily = text(o.tokenizerFamily ?? '', { placeholder: 'auto — from the tokenizer in use' });
+    inputs.orModalities = text((o.inputModalities ?? ['text']).join(', '), { class: 'mono', placeholder: 'text, image' });
+    inputs.orPromptPrice = price(o.pricing?.promptUsd, '0.0000006');
+    inputs.orCompletionPrice = price(o.pricing?.completionUsd, '0.0000018');
+    inputs.orCachedPrice = price(o.pricing?.cachedPromptUsd, '0.00000015');
+    inputs.orCacheWritePrice = price(o.pricing?.cacheWriteUsd, '');
+    inputs.orReasoningPrice = price(o.pricing?.internalReasoningUsd, '');
+    inputs.orRequestPrice = price(o.pricing?.requestUsd, 'flat fee per request');
+    inputs.orCacheTtl = number(o.pricing?.cacheTtlSeconds ?? 0, { min: 0 });
+    inputs.orCacheImplicit = h('input', { type: 'checkbox', checked: o.pricing?.cacheImplicit === true });
+    inputs.orMaxPrompt = number(o.maxPromptTokens ?? 0, { min: 0 });
+    inputs.orMaxOutput = number(o.maxOutputTokens ?? 0, { min: 0 });
+    inputs.orTempMax = number(o.temperatureMax ?? 2, { min: 0, step: 0.1 });
+    inputs.orStreaming = h('input', { type: 'checkbox', checked: o.streaming !== false });
+    inputs.orTools = h('input', { type: 'checkbox', checked: o.supportsTools !== false });
+    inputs.orStructured = h('input', { type: 'checkbox', checked: o.supportsStructuredOutputs === true });
+    inputs.orReasoning = h('input', { type: 'checkbox', checked: o.supportsReasoning === true });
+    inputs.orFree = h('input', { type: 'checkbox', checked: o.isFree === true });
+    inputs.orDiscount = number(o.discountToUser ?? 0, { min: 0, max: 0.99, step: 0.01 });
+    inputs.orDeprecation = text(o.deprecationDate ?? '', { placeholder: 'YYYY-MM-DD' });
+    inputs.orTpmIn = number(o.capacity?.promptTokensPerMinute ?? 0, { min: 0 });
+    inputs.orTpmOut = number(o.capacity?.completionTokensPerMinute ?? 0, { min: 0 });
+    inputs.orRpm = number(o.capacity?.requestsPerMinute ?? 0, { min: 0 });
+    inputs.orConcurrency = number(o.capacity?.concurrency ?? 0, { min: 0 });
+
+    body.append(section('OpenRouter', [
+      h('label.switch', { style: { marginBottom: '12px' } }, inputs.orListed,
+        h('span', { text: 'Offer this model to OpenRouter' })),
+      h('p.small.muted', {
+        text: 'Prices are US dollars for a single token. A field left empty is not '
+          + 'published at all, which is safer than publishing a zero.',
+      }),
+      h('div.grid.form', {},
+        field('Prompt', inputs.orPromptPrice, 'USD per input token'),
+        field('Completion', inputs.orCompletionPrice, 'USD per output token'),
+        field('Cached prompt', inputs.orCachedPrice, 'USD per cached input token'),
+      ),
+      h('div.grid.form', {},
+        field('Cache write', inputs.orCacheWritePrice),
+        field('Internal reasoning', inputs.orReasoningPrice),
+        field('Per request', inputs.orRequestPrice),
+      ),
+      h('div.grid.form', {},
+        field('Cache lifetime (s)', inputs.orCacheTtl, '0 = do not publish one'),
+        field('Discount to user', inputs.orDiscount, '0 to 0.99'),
+        field('Deprecation date', inputs.orDeprecation),
+      ),
+      h('div.row', { style: { marginBottom: '12px' } },
+        h('label.switch', {}, inputs.orCacheImplicit, h('span', { text: 'Caching is automatic' })),
+        h('label.switch', {}, inputs.orFree, h('span', { text: 'Free model' })),
+      ),
+      h('div.grid.form', {},
+        field('Slug', inputs.orSlug),
+        field('HuggingFace id', inputs.orHf, 'required if the model is on HuggingFace'),
+        field('Quantization', inputs.orQuant),
+      ),
+      h('div.grid.form', {},
+        field('Tokenizer family', inputs.orTokFamily),
+        field('Input modalities', inputs.orModalities, 'text, image, audio, video, file'),
+        field('Max temperature', inputs.orTempMax),
+      ),
+      h('div.grid.form', {},
+        field('Max prompt tokens', inputs.orMaxPrompt, '0 = use the limits above'),
+        field('Max output tokens', inputs.orMaxOutput, '0 = use the limits above'),
+      ),
+      h('div.row', { style: { marginBottom: '12px' } },
+        h('label.switch', {}, inputs.orStreaming, h('span', { text: 'Streaming' })),
+        h('label.switch', {}, inputs.orTools, h('span', { text: 'Tools' })),
+        h('label.switch', {}, inputs.orStructured, h('span', { text: 'Structured outputs' })),
+        h('label.switch', {}, inputs.orReasoning, h('span', { text: 'Reasoning' })),
+      ),
+      h('p.small.muted', {
+        text: 'Capacity is what this relay can actually sustain. Publishing an honest '
+          + 'number is what stops OpenRouter sending more than the phone can take; '
+          + '0 concurrency publishes the relay\'s own limit.',
+      }),
+      h('div.grid.form', {},
+        field('Input tokens / minute', inputs.orTpmIn),
+        field('Output tokens / minute', inputs.orTpmOut),
+        field('Requests / minute', inputs.orRpm),
+        field('Concurrent requests', inputs.orConcurrency),
+      ),
+    ]));
+
     /* ---------------------------------------------------- reliability */
     inputs.fallbacks = text((m.fallbacks ?? []).join(', '), { placeholder: 'backend ids, tried in order' });
     body.append(section('Fallbacks', [
@@ -278,6 +378,40 @@ function editModel(ctx, existing) {
             renameParams: parseKeyValues(inputs.renameParams.value),
             injectStop: parseList(inputs.injectStop.value),
             replace: JSON.parse(inputs.reqReplace.value || '[]'),
+          },
+          openrouter: {
+            listed: inputs.orListed.checked,
+            slug: inputs.orSlug.value.trim(),
+            huggingFaceId: inputs.orHf.value.trim(),
+            quantization: inputs.orQuant.value,
+            tokenizerFamily: inputs.orTokFamily.value.trim(),
+            inputModalities: parseList(inputs.orModalities.value),
+            maxPromptTokens: Number(inputs.orMaxPrompt.value) || 0,
+            maxOutputTokens: Number(inputs.orMaxOutput.value) || 0,
+            temperatureMax: Number(inputs.orTempMax.value) || 2,
+            streaming: inputs.orStreaming.checked,
+            supportsTools: inputs.orTools.checked,
+            supportsStructuredOutputs: inputs.orStructured.checked,
+            supportsReasoning: inputs.orReasoning.checked,
+            isFree: inputs.orFree.checked,
+            discountToUser: Number(inputs.orDiscount.value) || 0,
+            deprecationDate: inputs.orDeprecation.value.trim(),
+            pricing: {
+              promptUsd: inputs.orPromptPrice.value.trim(),
+              completionUsd: inputs.orCompletionPrice.value.trim(),
+              cachedPromptUsd: inputs.orCachedPrice.value.trim(),
+              cacheWriteUsd: inputs.orCacheWritePrice.value.trim(),
+              internalReasoningUsd: inputs.orReasoningPrice.value.trim(),
+              requestUsd: inputs.orRequestPrice.value.trim(),
+              cacheTtlSeconds: Number(inputs.orCacheTtl.value) || 0,
+              cacheImplicit: inputs.orCacheImplicit.checked,
+            },
+            capacity: {
+              promptTokensPerMinute: Number(inputs.orTpmIn.value) || 0,
+              completionTokensPerMinute: Number(inputs.orTpmOut.value) || 0,
+              requestsPerMinute: Number(inputs.orRpm.value) || 0,
+              concurrency: Number(inputs.orConcurrency.value) || 0,
+            },
           },
           responseTransform: {
             renameModel: inputs.renameModel.checked,
