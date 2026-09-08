@@ -274,10 +274,16 @@ tidak menulisnya dan tidak bisa melihatnya. Jadi tiap baris menyimpan dua angka:
 | `billed_prompt_tokens` | yang ditagih backend, sudah termasuk system prompt |
 | `system_prompt_tokens` | ukuran suntikan itu sendiri, menurut tokenizer relay |
 
-Bagian pemanggil dihitung sebagai **proporsi**, bukan pengurangan: `prompt_tokens`
-bisa datang dari tokenizer backend sementara pembagiannya diukur lokal, dan
-mengurangkan dua angka dari dua tokenizer berbeda bisa jadi minus. Kalau kedua
-hitungan sama, hasilnya persis sama dengan pengurangan.
+Pemanggil dibebani **hitungan pesannya sendiri**, diukur tokenizer relay sebelum
+suntikan terjadi. Kirim 6K token, yang balik ya 6K — bukan 10K. Dari sisi
+pemanggil, suntikan system prompt dan markup itu tidak bisa dibedakan, jadi
+angkanya memang harus sama persis dengan yang dia kirim.
+
+Angka itu dibatasi di **porsi dia atas tagihan backend yang sebenarnya**, supaya
+relay tidak pernah menagih lebih dari yang ditagihkan ke dia. Batasnya berupa
+proporsi, bukan pengurangan: `prompt_tokens` bisa datang dari tokenizer backend
+sementara pembagiannya diukur lokal, dan mengurangkan dua angka dari dua
+tokenizer berbeda bisa jadi minus. Proporsi tidak bisa.
 
 Mau menagihkan system prompt ke pemanggil? Nyalakan
 `tokenizer.billSystemPromptToUser`. Dua angkanya tetap dicatat, jadi selisihnya
@@ -297,6 +303,11 @@ menerima baris baru**:
   (jadi token yang sudah terpakai tetap tercatat walau jawabannya tidak pernah
   datang), dan `final` saat selesai. Keduanya tidak pernah mencatat angka yang
   sama dua kali, jadi `SUM` di atas tabel selalu benar.
+- Baris `input` ditulis sebelum backend sempat bicara, jadi isinya hitungan
+  lokal relay. Kalau ternyata pemanggil akhirnya ditagih lebih kecil, selisihnya
+  **diposting sebagai koreksi** di baris `final` — angka minus, baris sendiri.
+  Baris yang sudah masuk tidak pernah ditimpa, dan totalnya tetap sama persis
+  dengan `usage.prompt_tokens` yang diterima pemanggil.
 
 Isinya yang diringkas tab Usage: jumlah request, token masuk, token keluar,
 TTFT, token/detik, dan cache hit. Prune tidak pernah menyentuh tabel ini —

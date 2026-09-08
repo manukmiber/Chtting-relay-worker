@@ -254,14 +254,20 @@ impl Usage {
     /// billing them for it would be indefensible — this is the figure they are
     /// shown and accounted for.
     ///
-    /// The caller's share is applied as a proportion of the prompt rather than
-    /// subtracted from it, because the two numbers can come from two different
-    /// tokenizers: `prompt_tokens` may be the backend's own count, while the
-    /// split was measured locally. Subtracting one from the other can go
-    /// negative when the backend counts a prompt more cheaply than the relay
-    /// does — a real case, not a hypothetical. Scaling cannot: it agrees
-    /// exactly with subtraction when the two counts agree, and stays sensible
-    /// when they do not.
+    /// The caller pays their own measured count and nothing more: the relay's
+    /// tokenizer run over the caller's messages alone, before injection. Send
+    /// 6k tokens and the answer says 6k, whatever the relay bolted on top. A
+    /// caller who sees 10k come back has no way to tell an injected prompt
+    /// from a markup, and is right not to trust the difference.
+    ///
+    /// That figure is capped at the caller's share of what the backend
+    /// actually billed, so the relay can never charge out more than it was
+    /// charged. The cap is a proportion rather than a subtraction because the
+    /// two numbers can come from two different tokenizers: `prompt_tokens` may
+    /// be the backend's own count, while the split was measured locally.
+    /// Subtracting one from the other can go negative when the backend counts
+    /// a prompt more cheaply than the relay does — a real case, not a
+    /// hypothetical. A proportion cannot.
     ///
     /// `user_local >= billed_local` means nothing was injected — or the route
     /// replaced a longer system prompt of the caller's with a shorter one — so
@@ -272,8 +278,9 @@ impl Usage {
         }
         // Widened, because prompt × tokens overflows u64 only in theory but
         // costs nothing to rule out. Rounded down, in the caller's favour.
-        let prompt = (u128::from(self.prompt_tokens) * u128::from(user_local)
+        let share = (u128::from(self.prompt_tokens) * u128::from(user_local)
             / u128::from(billed_local)) as u64;
+        let prompt = user_local.min(share);
         Usage {
             prompt_tokens: prompt,
             total_tokens: prompt + self.completion_tokens,
@@ -518,18 +525,33 @@ mod usage_tests {
     }
 
     #[test]
-    fn a_backend_that_counts_differently_still_gives_a_sane_number() {
+    fn a_richer_backend_tokenizer_never_inflates_what_the_caller_sent() {
         // The backend charged 120 for what the relay measured as 100, of which
-        // 40 was the caller's: they get the same 40% of the backend's figure.
+        // 40 was the caller's. Their share of the backend's figure would be 48
+        // — but they only ever wrote 40 tokens, and 40 is what they are told.
         let charged = usage(120, 10).charged_to_caller(40, 100);
-        assert_eq!(charged.prompt_tokens, 48);
+        assert_eq!(charged.prompt_tokens, 40);
+    }
 
-        // And the case that made scaling necessary: a backend that counts the
+    #[test]
+    fn a_backend_that_undercounts_the_prompt_never_zeroes_the_caller() {
+        // The case that made a proportion necessary: a backend that counts the
         // prompt more cheaply than the relay's own tokenizer does. Subtracting
-        // would have gone negative and clamped the caller to zero.
+        // would have gone negative and clamped the caller to zero; the cap
+        // gives them their share of the smaller real bill instead.
         let charged = usage(41, 27).charged_to_caller(40, 100);
         assert_eq!(charged.prompt_tokens, 16);
         assert!(charged.prompt_tokens > 0);
+    }
+
+    #[test]
+    fn six_thousand_in_is_six_thousand_back() {
+        // The whole point, at the scale it actually bites: the caller wrote 6k
+        // and the relay injected 4k on top. The backend bills for all 10k (and
+        // counts it as 10_500 with its own tokenizer). The caller is told 6000.
+        let charged = usage(10_500, 300).charged_to_caller(6_000, 10_000);
+        assert_eq!(charged.prompt_tokens, 6_000);
+        assert_eq!(charged.total_tokens, 6_300);
     }
 
     #[test]

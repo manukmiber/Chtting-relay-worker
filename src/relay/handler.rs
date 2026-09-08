@@ -143,8 +143,17 @@ struct Ctx {
     /// body as sent. Their ratio is what the caller is charged.
     user_local: u64,
     billed_local: u64,
-    /// Whether the ledger already has this request's input row.
-    input_ledgered: bool,
+    /// What this request's input row already put in the ledger, if one was
+    /// written.
+    ledgered: Option<Ledgered>,
+}
+
+/// The input figures already on the books, so the closing row can settle
+/// against them instead of counting the same tokens twice.
+#[derive(Debug, Clone, Copy)]
+struct Ledgered {
+    input: i64,
+    billed: i64,
 }
 
 /// Everything [`finish`] needs that is not already on the record.
@@ -165,9 +174,10 @@ struct Outcome<'a> {
     charged: Option<&'a Usage>,
     finish_reason: &'a str,
     response_preview: &'a str,
-    /// True when the ledger already carries this request's input row, so the
-    /// closing row must not count the same tokens a second time.
-    input_ledgered: bool,
+    /// Set when the ledger already carries this request's input row, so the
+    /// closing row settles against it instead of counting the same tokens a
+    /// second time.
+    ledgered: Option<Ledgered>,
 }
 
 /* ------------------------------------------------------------ dispatch -- */
@@ -437,7 +447,7 @@ pub async fn handle_chat(
     // not when the answer comes back. A stream that dies halfway, a caller who
     // hangs up, a phone that loses power — the tokens were still spent, and
     // this row is what remembers that.
-    ledger_input(&state, &record);
+    let ledgered = Some(ledger_input(&state, &record));
 
     let response = match sent {
         Sent::Failed { status, body, .. } => {
@@ -449,7 +459,7 @@ pub async fn handle_chat(
                     status: i64::from(status),
                     error: &truncate(&body, 500),
                     started: Some(started),
-                    input_ledgered: true,
+                    ledgered,
                     ..Default::default()
                 },
             );
@@ -477,7 +487,7 @@ pub async fn handle_chat(
                 client_wants_stream,
                 user_local,
                 billed_local,
-                input_ledgered: true,
+                ledgered,
             };
 
             if stream_upstream && is_sse {
@@ -773,7 +783,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
                     status: 502,
                     error: &message,
                     started: Some(ctx.started),
-                    input_ledgered: ctx.input_ledgered,
+                    ledgered: ctx.ledgered,
                     ..Default::default()
                 },
             );
@@ -862,7 +872,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
             charged: Some(&charged),
             finish_reason: &finish_reason,
             response_preview: &preview,
-            input_ledgered: ctx.input_ledgered,
+            ledgered: ctx.ledgered,
             ..Default::default()
         },
     );
@@ -942,7 +952,7 @@ fn record_stream_outcome(ctx: &Ctx, pumped: &Pumped, billed: &Usage, charged: &U
             charged: Some(charged),
             finish_reason: &pumped.finish_reason,
             response_preview: &preview,
-            input_ledgered: ctx.input_ledgered,
+            ledgered: ctx.ledgered,
         },
     );
 }
@@ -1037,7 +1047,7 @@ fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
         record.total_tokens.max(0) as u64,
     );
 
-    ledger_final(state, &record, out.input_ledgered);
+    ledger_final(state, &record, out.ledgered);
 
     if !state.store.insert(record) {
         state
@@ -1075,40 +1085,54 @@ fn append(state: &Arc<AppState>, entry: LedgerEntry) {
     }
 }
 
-/// Record the input the moment the backend has it.
-fn ledger_input(state: &Arc<AppState>, record: &RequestRecord) {
+/// Record the input the moment the backend has it, and report what went down
+/// so the closing row can settle against it.
+fn ledger_input(state: &Arc<AppState>, record: &RequestRecord) -> Ledgered {
+    let booked = Ledgered {
+        input: record.user_prompt_tokens,
+        billed: record.billed_prompt_tokens,
+    };
     append(
         state,
         LedgerEntry {
             requests: 1,
-            input_tokens: record.user_prompt_tokens,
-            billed_input_tokens: record.billed_prompt_tokens,
+            input_tokens: booked.input,
+            billed_input_tokens: booked.billed,
             ..ledger_stub(record, Phase::Input)
         },
     );
+    booked
 }
 
 /// Close the request out.
 ///
-/// The input figures are repeated here only when no input row was written —
-/// a request refused before it ever reached a backend. Otherwise this row
-/// carries the output alone, so summing the ledger counts nothing twice.
-fn ledger_final(state: &Arc<AppState>, record: &RequestRecord, input_ledgered: bool) {
+/// When no input row was written — a request refused before it ever reached a
+/// backend — the input figures appear here in full. Otherwise they are already
+/// on the books, and this row carries only what settlement changed.
+///
+/// It usually changes nothing. The input row goes down before the backend has
+/// said anything, so it carries the relay's own count; if the backend then
+/// reports a prompt so much cheaper that the caller's share of it comes to
+/// less than they were first booked for, the caller is charged the lower
+/// figure and the difference belongs on the books too. Ledger rows are never
+/// rewritten, so it is posted as a correction: negative, on its own row, and
+/// the sum still comes out right.
+fn ledger_final(state: &Arc<AppState>, record: &RequestRecord, ledgered: Option<Ledgered>) {
+    let (requests, input, billed) = match ledgered {
+        Some(b) => (
+            0,
+            record.user_prompt_tokens - b.input,
+            record.billed_prompt_tokens - b.billed,
+        ),
+        None => (1, record.user_prompt_tokens, record.billed_prompt_tokens),
+    };
     append(
         state,
         LedgerEntry {
             status: record.status,
-            requests: i64::from(!input_ledgered),
-            input_tokens: if input_ledgered {
-                0
-            } else {
-                record.user_prompt_tokens
-            },
-            billed_input_tokens: if input_ledgered {
-                0
-            } else {
-                record.billed_prompt_tokens
-            },
+            requests,
+            input_tokens: input,
+            billed_input_tokens: billed,
             output_tokens: record.completion_tokens,
             cached_tokens: record.cached_tokens,
             reasoning_tokens: record.reasoning_tokens,
