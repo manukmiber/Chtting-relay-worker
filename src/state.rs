@@ -10,6 +10,7 @@ use crate::config::ConfigStore;
 use crate::logging::Logger;
 use crate::relay::gate::Gate;
 use crate::store::{QuotaTracker, RateLimiter, Store};
+use crate::system::Host;
 use crate::tokenizer::registry::Registry;
 use crate::tokenizer::TokenCounter;
 use crate::tunnel::TunnelManager;
@@ -77,6 +78,9 @@ pub struct AppState {
     pub limiter: Arc<RateLimiter>,
     pub quotas: Arc<QuotaTracker>,
     pub tunnel: Arc<TunnelManager>,
+    /// The phone itself: the service, the boot hook, the wake lock. Everything
+    /// that used to be a Termux command.
+    pub host: Arc<Host>,
     pub paths: Paths,
     pub stats: Arc<Stats>,
     /// How many calls may be in flight upstream at once, and the line waiting
@@ -94,6 +98,7 @@ impl AppState {
         let counter = Arc::new(TokenCounter::new(registry));
         let upstream = Arc::new(crate::relay::upstream::Upstream::new(logger.clone())?);
         let tunnel = Arc::new(TunnelManager::new(config.clone(), logger.clone()));
+        let host = Arc::new(Host::new(paths.clone(), logger.clone()));
 
         let today = crate::util::day_key(crate::util::now_ms(), &cfg.tz());
         let quotas = Arc::new(QuotaTracker::new(today.clone()));
@@ -116,6 +121,7 @@ impl AppState {
             limiter: Arc::new(RateLimiter::new()),
             quotas,
             tunnel,
+            host,
             paths,
             stats,
             gate,

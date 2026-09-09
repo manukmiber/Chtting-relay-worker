@@ -40,9 +40,10 @@ cd Chtting-relay-worker
 bash scripts/install-termux.sh
 ```
 
-Script itu **mengunduh binary siap pakai** untuk CPU HP-mu kalau rilisnya ada
-(checksum diverifikasi), memasang `cloudflared`, menawarkan unduh vocabulary
-tokenizer, membuat config awal, dan mencetak client key pertama.
+Tiga baris itu saja. Script-nya **mengunduh binary siap pakai** untuk CPU HP-mu
+kalau rilisnya ada (checksum diverifikasi), membuat config awal, mencetak client
+key pertama, memasang service runit + shortcut layar utama + hook boot, lalu
+menjalankan relay-nya.
 
 Kalau belum ada rilis yang cocok, script otomatis build dari source:
 
@@ -54,24 +55,28 @@ Kalau belum ada rilis yang cocok, script otomatis build dari source:
 Binary rilis dibuat untuk **arm64** (hampir semua HP sejak ~2016) dan **armv7**
 (HP 32-bit). Keduanya binary Android asli, bukan emulasi.
 
-Jalankan:
+Setelah itu buka **`http://127.0.0.1:8788`** di browser HP. Tab **Setup** yang
+mengurus sisanya — backend, model, tokenizer, tunnel, start/stop/restart,
+wake lock, service, semuanya tombol. **Tidak ada lagi yang perlu diketik di
+Termux.**
 
-```bash
-bash scripts/start-termux.sh        # pakai termux-wake-lock, aman layar mati
-```
+### Menjalankan tanpa membuka Termux
 
-Buka `http://127.0.0.1:8788` di browser HP. Itu dashboard-nya.
+Tab **Setup** menulis tiga hal untuk kamu:
 
-<details>
-<summary>Jalan otomatis sebagai service</summary>
+| | Gunanya |
+|---|---|
+| **Service runit** | relay dihidupkan lagi kalau mati, dan ikut hidup bareng Termux |
+| **Shortcut layar utama** | Start / Stop / Restart / Buka dashboard jadi ikon — butuh app **Termux:Widget** dari F-Droid |
+| **Hook boot** | relay nyala sebelum HP di-unlock — butuh app **Termux:Boot** dari F-Droid |
 
-```bash
-pkg install termux-services
-ln -s ~/Chtting-relay-worker/scripts/service $PREFIX/var/service/chtting-relay
-sv up chtting-relay
-sv status chtting-relay
-```
-</details>
+Satu hal yang **tidak bisa** dipindah ke dashboard: menyalakan relay yang sedang
+mati. Dashboard-nya kan disajikan oleh relay itu sendiri. Untuk itulah shortcut
+dan hook boot ada — menyalakannya tetap tanpa mengetik, cukup satu tap.
+
+> Restart dari dashboard itu `exec` ke diri sendiri: PID sama, port sama,
+> config dibaca ulang, halaman balik lagi dalam sedetik. Jadi mengubah port
+> relay atau bind address cukup Save lalu **Restart relay**.
 
 ---
 
@@ -345,6 +350,7 @@ ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pu
 
 | Tab | Isinya |
 |---|---|
+| Setup | checklist apa yang belum siap, service/shortcut/boot, wake lock, pasang paket, start–stop–restart relay |
 | Overview | statistik, grafik harian, rincian per model dan per key |
 | Models | editor alias: terjemahan nama, prompt, params, limit, tokenizer, reshaping |
 | Backends | provider upstream + tombol tes koneksi |
@@ -481,8 +487,12 @@ Endpoint: `GET /health`, `GET /v1/models`, `GET /v1/models/:id`,
 
 ## CLI
 
+Semua ini juga ada di tab **Setup** dashboard. CLI-nya dipertahankan buat
+scripting dan buat kalau dashboard-nya sendiri yang bermasalah.
+
 ```
 chtting-relay start [--port N] [--no-dashboard]
+chtting-relay setup                     service runit + shortcut + hook boot
 chtting-relay doctor                    periksa lingkungan dan konfigurasi
 chtting-relay config path|show
 chtting-relay key new --label "hp saya" client key baru, ditampilkan sekali
@@ -512,6 +522,7 @@ src/
   relay/         upstream + fallback, transform, SSE, handler + metrik
   server/        API publik, dashboard + admin API
   store/         SQLite, quota tracker, rate limiter
+  system.rs      service runit, shortcut, hook boot, wake lock, restart/stop
   tunnel.rs      supervisor cloudflared
 public/          dashboard (vanilla JS, ikut ter-compile ke binary)
 scripts/         setup Termux, service runit

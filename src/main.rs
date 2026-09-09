@@ -9,6 +9,7 @@ use chtting_relay::config::{Backend, ConfigStore, Model};
 use chtting_relay::logging::{Level, Logger};
 use chtting_relay::server;
 use chtting_relay::state::{AppState, Paths};
+use chtting_relay::system::Host;
 use chtting_relay::tokenizer::registry::{BUILTIN_TIKTOKEN, HF_PRESETS};
 use chtting_relay::util::{mask_secret, new_client_key, new_id};
 
@@ -40,6 +41,20 @@ enum Command {
     },
     /// Check the install and print what is and is not ready.
     Doctor,
+    /// Wire the relay into the phone: runit service, home-screen shortcuts,
+    /// start-on-boot. The installer runs this; afterwards the dashboard's
+    /// Setup screen does the same job with buttons.
+    Setup {
+        /// Skip the runit service.
+        #[arg(long)]
+        no_service: bool,
+        /// Skip the Termux:Widget shortcuts.
+        #[arg(long)]
+        no_shortcuts: bool,
+        /// Skip the Termux:Boot hook.
+        #[arg(long)]
+        no_boot: bool,
+    },
     /// Show where the config lives, or print it with secrets masked.
     Config {
         #[command(subcommand)]
@@ -169,6 +184,11 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
     }) {
         Command::Start { port, no_dashboard } => start(paths, port, no_dashboard).await,
         Command::Doctor => doctor(paths).await,
+        Command::Setup {
+            no_service,
+            no_shortcuts,
+            no_boot,
+        } => setup(paths, !no_service, !no_shortcuts, !no_boot).await,
         Command::Config { action } => config_command(paths, action).await,
         Command::Key { action } => key_command(paths, action).await,
         Command::Backend { action } => backend_command(paths, action).await,
@@ -217,6 +237,13 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
 
     if cfg.models.is_empty() {
         logger.warn("no models configured yet — open the dashboard and add a backend and a model");
+    }
+
+    // The phone suspends Termux the moment the screen goes off, which used to
+    // be the start script's job to prevent. Doing it here means it happens
+    // however the relay was started — a shortcut, the boot hook, or runit.
+    if cfg.server.wake_lock && chtting_relay::system::termux() {
+        state.host.acquire_wake_lock().await;
     }
 
     // The public, tunnel-facing server.
@@ -284,14 +311,37 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
                 None => std::future::pending().await,
             }
         } => { result??; }
-        _ = tokio::signal::ctrl_c() => {
+        // Ctrl-C from a Termux session, SIGTERM from runit's `sv down`. Both
+        // mean the same thing and deserve the same tidy exit.
+        _ = shutdown_signal() => {
             logger.info("shutting down");
             let _ = state.tunnel.stop().await;
+            state.host.release_wake_lock().await;
             // Commit whatever the metrics writer still had queued.
             state.store.flush().await;
         }
     }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            // Without SIGTERM there is still Ctrl-C.
+            Err(_) => return tokio::signal::ctrl_c().await.unwrap_or(()),
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /* ------------------------------------------------------------ doctor -- */
@@ -390,6 +440,53 @@ async fn doctor(paths: Paths) -> Result<()> {
         println!("\nconfig problems:");
         for problem in problems {
             println!("  - {problem}");
+        }
+    }
+    Ok(())
+}
+
+/* ------------------------------------------------------------- setup -- */
+
+/// Do once, from the installer, what the dashboard's Setup screen does with
+/// buttons: make the relay a thing the phone runs rather than a thing you have
+/// to remember to start.
+async fn setup(paths: Paths, service: bool, shortcuts: bool, boot: bool) -> Result<()> {
+    if !chtting_relay::system::termux() {
+        println!("not Termux — the service, shortcuts and boot hook are Termux-only.");
+        return Ok(());
+    }
+
+    let store = ConfigStore::load(&paths.config).await?;
+    let dashboard_url = format!("http://127.0.0.1:{}", store.current().dashboard.port);
+    let host = Host::new(paths, Logger::console(Level::Silent));
+
+    // Order matters: the shortcuts and the boot hook both ask whether a service
+    // exists, and write a different script depending on the answer.
+    if service {
+        match host.install_service().await {
+            Ok(status) => println!(
+                "  service     {}",
+                status["path"].as_str().unwrap_or("installed")
+            ),
+            Err(err) => println!("  service     skipped: {err}"),
+        }
+    }
+    if shortcuts {
+        match host.install_shortcuts(&dashboard_url).await {
+            Ok(status) => println!(
+                "  shortcuts   {} (needs the Termux:Widget app)",
+                status["path"].as_str().unwrap_or("written")
+            ),
+            Err(err) => println!("  shortcuts   skipped: {err}"),
+        }
+    }
+    if boot {
+        match host.install_boot().await {
+            Ok(status) => println!(
+                "  boot        {} (needs the Termux:Boot app)",
+                status["path"].as_str().unwrap_or("written")
+            ),
+            Err(err) => println!("  boot        skipped: {err}"),
         }
     }
     Ok(())

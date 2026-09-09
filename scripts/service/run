@@ -1,5 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# runit service for termux-services:
+# runit service for termux-services.
+#
+# You should not need this file: the dashboard's Setup tab writes its own copy
+# straight into $PREFIX/var/service/chtting-relay, with the right paths baked
+# in. It is kept for the older instructions that symlinked this directory:
 #
 #   pkg install termux-services
 #   ln -s ~/Chtting-relay-worker/scripts/service $PREFIX/var/service/chtting-relay
@@ -8,5 +12,4 @@
 # Logs go to the Termux service log; the relay also writes data/logs/relay.log.
 exec 2>&1
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
-termux-wake-lock 2>/dev/null || true
 exec ./target/release/chtting-relay start

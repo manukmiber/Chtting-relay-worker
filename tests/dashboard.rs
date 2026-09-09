@@ -660,3 +660,155 @@ async fn a_zero_retention_claim_is_refused_while_prompts_are_being_stored() {
         "unhelpful refusal: {body}"
     );
 }
+
+/* ---------------------------------------------------------------- setup -- */
+//
+// Nothing here calls `/api/service/restart` or `/api/service/stop`: both end
+// the process they are called on, and the process they would be called on here
+// is the test runner.
+
+#[tokio::test]
+async fn setup_lists_what_is_still_missing_before_the_relay_can_serve() {
+    let d = Dash::start(|cfg| {
+        // A relay with a backend and a model but nothing to authenticate with.
+        cfg.keys.clear();
+        cfg.security.require_client_key = true;
+    })
+    .await;
+
+    let setup: Value = d.get_json("/api/setup").await;
+    let steps = setup["steps"].as_array().expect("steps must be a list");
+    let step = |id: &str| {
+        steps
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("no \"{id}\" step in {steps:?}"))
+            .clone()
+    };
+
+    assert_eq!(step("backend")["ok"], true, "the harness has a backend");
+    assert_eq!(step("model")["ok"], true, "the harness has a model");
+    assert_eq!(step("key")["ok"], false, "a required key is missing");
+    assert!(
+        step("key")["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("No key"),
+        "the missing key should say so: {}",
+        step("key")["detail"]
+    );
+
+    // Every unfinished step has to say where it is fixed, or the screen is a
+    // list of complaints rather than a checklist.
+    for s in steps {
+        assert!(
+            s["fix"].as_str().is_some_and(|f| !f.is_empty()),
+            "step {} has nowhere to go",
+            s["id"]
+        );
+    }
+
+    // And the phone itself, honestly reported on a machine that is not one.
+    assert_eq!(setup["termux"], chtting_relay::system::termux());
+    assert!(setup["service"]["installed"].is_boolean());
+    assert!(setup["shortcuts"]["files"].as_array().is_some());
+    assert_eq!(setup["packages"].as_array().unwrap().len(), 2);
+    assert_eq!(setup["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn a_key_that_exists_finishes_the_step_that_asked_for_one() {
+    let d = Dash::start(|_| {}).await;
+    let setup: Value = d.get_json("/api/setup").await;
+    let key = setup["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "key")
+        .unwrap()
+        .clone();
+    assert_eq!(key["ok"], true, "the harness ships a client key");
+}
+
+#[tokio::test]
+async fn the_dashboard_only_installs_the_packages_it_names() {
+    let d = Dash::start(|_| {}).await;
+
+    let res = d
+        .post("/api/system/package", json!({"package": "curl; rm -rf /"}))
+        .await;
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not one of the packages"),
+        "unhelpful refusal: {body}"
+    );
+
+    // The empty package name is the same refusal, not a crash.
+    assert_eq!(d.post("/api/system/package", json!({})).await.status(), 400);
+}
+
+#[tokio::test]
+async fn an_unknown_service_action_is_refused_by_name() {
+    let d = Dash::start(|_| {}).await;
+    let res = d.post("/api/service/reboot-the-phone", json!({})).await;
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reboot-the-phone"),
+        "the refusal should name what it refused: {body}"
+    );
+}
+
+#[tokio::test]
+async fn handing_over_to_a_service_that_was_never_installed_says_so() {
+    // On a phone this would be a real handover; here there is no service, and
+    // the point is that the answer explains itself rather than exiting.
+    if chtting_relay::system::termux() {
+        return;
+    }
+    let d = Dash::start(|_| {}).await;
+    let res = d.post("/api/service/hand-over", json!({})).await;
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("$PREFIX") || message.contains("service"),
+        "unhelpful refusal: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_setup_routes_are_behind_the_password_like_everything_else() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "hunter2".into();
+    })
+    .await;
+
+    assert_eq!(d.get("/api/setup").await.status(), 401);
+    assert_eq!(
+        d.post("/api/service/install", json!({})).await.status(),
+        401
+    );
+    assert_eq!(
+        d.post("/api/system/wakelock", json!({"on": true}))
+            .await
+            .status(),
+        401
+    );
+    assert_eq!(
+        d.post("/api/system/package", json!({"package": "cloudflared"}))
+            .await
+            .status(),
+        401
+    );
+
+    d.post("/api/login", json!({"password": "hunter2"})).await;
+    assert_eq!(d.get("/api/setup").await.status(), 200);
+}

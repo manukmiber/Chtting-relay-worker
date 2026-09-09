@@ -70,5 +70,10 @@ export const api = {
   tunnel: () => request('GET', '/api/tunnel'),
   tunnelAction: (action) => request('POST', `/api/tunnel/${action}`),
 
+  setup: () => request('GET', '/api/setup'),
+  serviceAction: (action) => request('POST', `/api/service/${action}`),
+  installPackage: (name) => request('POST', '/api/system/package', { package: name }),
+  wakeLock: (on) => request('POST', '/api/system/wakelock', { on }),
+
   playground: (body) => request('POST', '/api/playground', body),
 };

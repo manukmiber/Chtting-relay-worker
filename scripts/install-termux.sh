@@ -1,34 +1,33 @@
 #!/data/data/com.termux/files/usr/bin/bash
 #
-# One-shot setup for Termux.
+# One-shot setup for Termux. Three commands, then everything else is buttons:
 #
 #   pkg install git
 #   git clone https://github.com/manukmiber/Chtting-relay-worker
 #   cd Chtting-relay-worker && bash scripts/install-termux.sh
 #
 # Downloads a prebuilt binary when one exists for your device, otherwise builds
-# from source. Then offers cloudflared and a tokenizer or two, writes a config
-# and prints your first client key.
+# from source. Then writes a config, mints your first client key, wires the
+# relay into the phone and starts it. Backends, models, tokenizers, the tunnel,
+# start, stop and restart all live in the dashboard.
 #
-#   bash scripts/install-termux.sh --build   # always build, never download
+#   bash scripts/install-termux.sh --build      # always build, never download
+#   bash scripts/install-termux.sh --no-start   # set up but do not launch
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 BIN="$ROOT/target/release/chtting-relay"
 REPO="manukmiber/Chtting-relay-worker"
 FORCE_BUILD=0
-# An `if` rather than `[ ... ] && FORCE_BUILD=1`, whose status would be the
-# script's own if it ever ended up as the last statement.
-if [ "${1:-}" = "--build" ]; then
-  FORCE_BUILD=1
-fi
+START=1
+for arg in "$@"; do
+  case "$arg" in
+    --build)    FORCE_BUILD=1 ;;
+    --no-start) START=0 ;;
+  esac
+done
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
-ask() {
-  local prompt="$1" reply
-  read -r -p "$prompt [y/N] " reply || reply=n
-  [[ "$reply" =~ ^[Yy]$ ]]
-}
 
 if [ -z "${PREFIX:-}" ] || [[ "$PREFIX" != *com.termux* ]]; then
   echo "This script is for Termux. On a desktop just run: cargo build --release" >&2
@@ -43,7 +42,7 @@ case "$(uname -m)" in
   *)               TARGET="" ;;
 esac
 
-say "1/5  binary"
+say "1/4  binary"
 
 # --- try a prebuilt release first ------------------------------------------
 download_prebuilt() {
@@ -124,47 +123,45 @@ fi
 say "ready: $(du -h "$BIN" | cut -f1) at $BIN"
 "$BIN" --version
 
-say "2/5  cloudflared"
-if command -v cloudflared >/dev/null 2>&1; then
-  echo "already installed: $(cloudflared --version 2>&1 | head -1)"
-elif ask "Install cloudflared for the public tunnel?"; then
-  pkg install -y cloudflared || echo "could not install cloudflared; the relay still works locally"
-fi
-
-say "3/5  tokenizers"
-echo "OpenAI vocabularies (cl100k_base, o200k_base, ...) are built into the binary."
-echo "Open-model vocabularies are a download each:"
-"$BIN" tokenizer list | sed -n '/downloadable presets/,/installed in/p' | head -12
-if ask "Download the DeepSeek and Qwen vocabularies now (~15 MB)?"; then
-  "$BIN" tokenizer install deepseek || true
-  "$BIN" tokenizer install qwen || true
-fi
-
-say "4/5  config"
+say "2/4  config and your first client key"
 "$BIN" config path >/dev/null   # creates it on first run
-
-say "5/5  client key"
 if [ "$("$BIN" key list | grep -c . || true)" -le 1 ]; then
   echo "your first client key (save it — it is shown once):"
   "$BIN" key new --label "first key"
 else
-  echo "keys already exist; run \`$BIN key list\` to see them"
+  echo "keys already exist; the dashboard lists them under Keys"
 fi
+
+say "3/4  wiring it into the phone"
+# The runit service, the home-screen shortcuts and the boot hook. All three are
+# also buttons on the dashboard's Setup screen, so nothing here is a one-way
+# door.
+"$BIN" setup || echo "  (setup skipped — do it from the dashboard's Setup tab)"
+pkg install -y termux-services >/dev/null 2>&1 \
+  && echo "  termux-services installed" \
+  || echo "  termux-services not installed — the Setup tab can do it later"
+
+# The default; if you have moved the dashboard you already know where it is.
+DASH="http://127.0.0.1:8788"
 
 cat <<EOF
 
-Done.
+Done. Everything else is in the dashboard:
 
-  start it            bash scripts/start-termux.sh
-  dashboard           http://127.0.0.1:8788
-  check the install   $BIN doctor
-  add a backend       $BIN backend add --name deepseek \\
-                        --base-url https://api.deepseek.com/v1 --api-key sk-...
-  add a model alias   $BIN model add --id manukmiberai/creative-writer \\
-                        --backend <id> --upstream Deepseek-v4-flash-0731
+  $DASH
 
-To keep it running in the background:
-  pkg install termux-services
-  ln -s "$ROOT/scripts/service" \$PREFIX/var/service/chtting-relay
-  sv up chtting-relay
+  Setup        backends, models, tokenizers, the tunnel, start/stop/restart
+  Termux:Widget  put Start / Stop / Restart / Open on your home screen
+  Termux:Boot    start the relay when the phone does
+
+The only command you still need is the one below, and only if you skipped the
+shortcuts:
+
+  bash scripts/start-termux.sh
 EOF
+
+if [ "$START" = 1 ]; then
+  say "4/4  starting"
+  echo "open $DASH — Ctrl-C here stops the relay"
+  exec bash "$ROOT/scripts/start-termux.sh"
+fi

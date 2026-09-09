@@ -89,6 +89,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/tokenizer/install", post(tokenizer_install))
         .route("/api/tunnel", get(tunnel_status))
         .route("/api/tunnel/{action}", post(tunnel_action))
+        .route("/api/setup", get(setup))
+        .route("/api/service/{action}", post(service_action))
+        .route("/api/system/package", post(install_package))
+        .route("/api/system/wakelock", post(wake_lock))
         .route("/api/playground", post(playground))
         .fallback(static_files)
         .layer(middleware::from_fn_with_state(dash.clone(), guard))
@@ -1342,6 +1346,278 @@ async fn tunnel_action(State(dash): State<Arc<Dashboard>>, Path(action): Path<St
     };
     match result {
         Ok(status) => Json(status).into_response(),
+        Err(err) => error(400, &err.to_string()),
+    }
+}
+
+/* -------------------------------------------------------------- setup -- */
+
+/// One step of the first-run checklist.
+///
+/// `ok` is what the Setup screen colours; `detail` is what it says underneath.
+/// Every step that can be finished from the dashboard says where, because a
+/// step whose only fix is a Termux command has failed at the job.
+fn step(id: &str, label: &str, ok: bool, detail: String, fix: &str) -> Value {
+    json!({ "id": id, "label": label, "ok": ok, "detail": detail, "fix": fix })
+}
+
+/// Is the relay ready to serve, and what is still missing?
+///
+/// This is `doctor` with the answers made actionable: the same checks, plus
+/// the state of the phone itself, in the one round trip a first-run screen can
+/// afford.
+async fn setup(State(dash): State<Arc<Dashboard>>) -> Response {
+    let state = &dash.state;
+    let cfg = state.config.current();
+    let mut steps = Vec::new();
+
+    let backends = cfg.backends.iter().filter(|b| b.enabled).count();
+    steps.push(step(
+        "backend",
+        "An upstream backend",
+        backends > 0,
+        match backends {
+            0 => "No backend yet — the relay has nowhere to send requests.".into(),
+            n => format!("{n} enabled."),
+        },
+        "backends",
+    ));
+
+    let models = cfg.models.iter().filter(|m| m.enabled).count();
+    steps.push(step(
+        "model",
+        "A public model alias",
+        models > 0,
+        match models {
+            0 => "No alias yet — callers have no model name to ask for.".into(),
+            n => format!("{n} enabled."),
+        },
+        "models",
+    ));
+
+    let keys = cfg.keys.iter().filter(|k| k.enabled).count();
+    steps.push(step(
+        "key",
+        "A client key",
+        keys > 0 || !cfg.security.require_client_key,
+        if keys > 0 {
+            format!("{keys} enabled.")
+        } else if cfg.security.require_client_key {
+            "No key yet, and every request needs one.".into()
+        } else {
+            "No key, but keys are not required — the relay is open.".into()
+        },
+        "keys",
+    ));
+
+    // An estimator counts, but it does not count *right*, and the whole billing
+    // story rests on the number being the backend's own.
+    let mut estimated: Vec<String> = Vec::new();
+    for model in cfg.models.iter().filter(|m| m.enabled) {
+        let resolved = state.counter.resolve(
+            &cfg,
+            &model.upstream_model,
+            &model.tokenizer,
+            &model.chat_profile,
+        );
+        if !state.counter.encoder_for(&resolved).await.exact() {
+            estimated.push(format!("{} ({})", model.id, resolved.tokenizer));
+        }
+    }
+    steps.push(step(
+        "tokenizer",
+        "An exact vocabulary per model",
+        estimated.is_empty(),
+        if models == 0 {
+            "Nothing to count yet.".into()
+        } else if estimated.is_empty() {
+            "Every enabled model counts against a real vocabulary.".into()
+        } else {
+            format!("Estimated, not counted: {}.", estimated.join(", "))
+        },
+        "tokenizer",
+    ));
+
+    let tunnel_ready =
+        cfg.tunnel.mode == "off" || state.tunnel.version().await["installed"] == Value::Bool(true);
+    steps.push(step(
+        "tunnel",
+        "A way in from outside",
+        tunnel_ready,
+        if cfg.tunnel.mode == "off" {
+            "Tunnel off — the relay answers on your LAN only.".into()
+        } else if tunnel_ready {
+            format!("cloudflared is installed, mode \"{}\".", cfg.tunnel.mode)
+        } else {
+            "cloudflared is not installed yet.".into()
+        },
+        "tunnel",
+    ));
+
+    let mut report = state.host.report().await;
+    let supervised = report["service"]["supervised"] == Value::Bool(true);
+    let installed = report["service"]["installed"] == Value::Bool(true);
+    steps.push(step(
+        "service",
+        "Something to keep it running",
+        supervised,
+        if supervised {
+            "Supervised: it comes back on its own if it dies.".into()
+        } else if installed {
+            "Service installed but not started — hand over to it below.".into()
+        } else {
+            "Not supervised: closing Termux stops the relay.".into()
+        },
+        // Fixed on the Setup screen itself, which is where this list is shown.
+        "setup",
+    ));
+
+    if let Some(map) = report.as_object_mut() {
+        map.insert("steps".into(), Value::Array(steps));
+        map.insert("problems".into(), json!(crate::config::validate(&cfg)));
+        map.insert(
+            "dashboardUrl".into(),
+            json!(format!("http://127.0.0.1:{}", cfg.dashboard.port)),
+        );
+        map.insert("wantsWakeLock".into(), json!(cfg.server.wake_lock));
+        map.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
+    }
+    Json(report).into_response()
+}
+
+/* ------------------------------------------------------------- service -- */
+
+/// Everything that used to be a line typed into Termux.
+///
+/// `restart` and `stop` end this process, so they answer *first* and act a
+/// moment later — otherwise the browser would be waiting on a socket that is
+/// about to close, and would report a failure for something that worked.
+async fn service_action(
+    State(dash): State<Arc<Dashboard>>,
+    Path(action): Path<String>,
+) -> Response {
+    let state = dash.state.clone();
+    let host = state.host.clone();
+
+    let result = match action.as_str() {
+        "install" => host.install_service().await,
+        "uninstall" => host.uninstall_service().await,
+        "boot-on" => host.install_boot().await,
+        "boot-off" => host.remove_boot().await,
+        "shortcuts-on" => {
+            let url = format!("http://127.0.0.1:{}", state.config.current().dashboard.port);
+            host.install_shortcuts(&url).await
+        }
+        "shortcuts-off" => host.remove_shortcuts().await,
+
+        "restart" => {
+            state.logger.info("restart requested from the dashboard");
+            leave(state.clone(), Ending::Restart);
+            Ok(json!({
+                "ok": true,
+                "action": "restart",
+                "message": "Restarting — this page comes back in a few seconds.",
+            }))
+        }
+        "stop" => {
+            state.logger.info("stop requested from the dashboard");
+            leave(state.clone(), Ending::Stop);
+            Ok(json!({
+                "ok": true,
+                "action": "stop",
+                "message": "Stopping. Start it again from a home-screen shortcut, \
+                            or from Termux.",
+            }))
+        }
+        "hand-over" => match host.hand_over().await {
+            Ok(()) => {
+                state.logger.info("handing over to the runit service");
+                leave(state.clone(), Ending::HandOver);
+                Ok(json!({
+                    "ok": true,
+                    "action": "hand-over",
+                    "message": "Handing over to the service — this page comes back \
+                                in a few seconds.",
+                }))
+            }
+            Err(err) => Err(err),
+        },
+
+        other => return error(400, &format!("unknown service action \"{other}\"")),
+    };
+
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error(400, &err.to_string()),
+    }
+}
+
+/// How this process is meant to go away.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// Come straight back, same PID, same port.
+    Restart,
+    /// Go, and stay gone.
+    Stop,
+    /// Go, and let the supervisor start the next one.
+    HandOver,
+}
+
+/// Wind down after the response has been written.
+///
+/// The delay is the whole point: the browser has to read the answer off a
+/// socket this process still owns.
+fn leave(state: Arc<AppState>, ending: Ending) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let _ = state.tunnel.stop().await;
+        state.host.release_wake_lock().await;
+        state.store.flush().await;
+
+        match ending {
+            Ending::Restart => {
+                // Only returns if it failed, and then the honest thing is to
+                // stay up rather than leave the caller with nothing.
+                let err = crate::system::exec_self();
+                state.logger.error(err.to_string());
+            }
+            Ending::Stop => {
+                // Exiting is not enough under a supervisor: runsv would have
+                // another copy up within the second.
+                state.host.supervisor_down().await;
+                std::process::exit(0);
+            }
+            // The supervisor is already on its way up with the next one.
+            Ending::HandOver => std::process::exit(0),
+        }
+    });
+}
+
+/* -------------------------------------------------------------- system -- */
+
+async fn install_package(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> Response {
+    let name = body.get("package").and_then(|v| v.as_str()).unwrap_or("");
+    match dash.state.host.install_package(name).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error(400, &err.to_string()),
+    }
+}
+
+/// Hold or release Android's wake lock, and remember the choice for next time.
+async fn wake_lock(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> Response {
+    let on = body.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+    match dash.state.host.set_wake_lock(on).await {
+        Ok(value) => {
+            if let Err(err) = dash
+                .state
+                .config
+                .update(json!({ "server": { "wakeLock": on } }))
+                .await
+            {
+                return error(400, &err.to_string());
+            }
+            Json(value).into_response()
+        }
         Err(err) => error(400, &err.to_string()),
     }
 }

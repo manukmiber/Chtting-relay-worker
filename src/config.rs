@@ -98,6 +98,9 @@ pub struct ServerConfig {
     /// How long a queued request waits before giving up. Should stay well
     /// under the client's own timeout.
     pub queue_timeout_ms: u64,
+    /// Hold Android's wake lock while the relay runs, so the phone does not
+    /// suspend it the moment the screen goes off. Ignored off Termux.
+    pub wake_lock: bool,
 }
 
 impl Default for ServerConfig {
@@ -111,6 +114,7 @@ impl Default for ServerConfig {
             worker_threads: 0,
             queue_capacity: 2048,
             queue_timeout_ms: 30_000,
+            wake_lock: true,
         }
     }
 }

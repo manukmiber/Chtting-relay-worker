@@ -240,6 +240,49 @@ tr.clickable { cursor: pointer; }
 .empty { padding: 28px 14px; text-align: center; color: var(--muted); }
 .arrow { color: var(--muted); padding: 0 6px; }
 
+/* ------------------------------------------------------------- setup -- */
+
+.checklist { display: flex; flex-direction: column; }
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+}
+.check:last-child { border-bottom: 0; }
+.check .spacer { flex: 1; }
+.check .mark {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.check .mark.ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+.check-label { font-size: 13px; font-weight: 550; }
+
+/* A filesystem path on a phone is wider than the phone. */
+.path { overflow-wrap: anywhere; word-break: break-all; }
+.pathrow { padding: 7px 0; border-bottom: 1px solid var(--border); }
+.pathrow:last-child { border-bottom: 0; }
+.pathrow .path { flex: 1; min-width: 0; }
+
+.card hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 16px 0 12px;
+}
+.card h3.small { margin: 0 0 4px; font-size: 12.5px; font-weight: 600; }
+
 /* ------------------------------------------------------------- charts -- */
 
 .chart {

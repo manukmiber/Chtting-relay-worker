@@ -11,9 +11,11 @@ import { tokenizerView } from './views/tokenizer.js';
 import { tunnelView } from './views/tunnel.js';
 import { playgroundView } from './views/playground.js';
 import { settingsView } from './views/settings.js';
+import { setupView } from './views/setup.js';
 import { logsView } from './views/logs.js';
 
 const TABS = [
+  ['setup', 'Setup', setupView],
   ['overview', 'Overview', overviewView],
   ['models', 'Models', modelsView],
   ['backends', 'Backends', backendsView],
@@ -135,12 +137,15 @@ async function boot() {
     if (!session.authenticated) return showLogin();
     document.getElementById('logout').hidden = !session.passwordSet;
     state = await api.state();
+    // A relay with nothing configured has nothing to show on Overview, and
+    // Setup is the screen that fixes that.
+    if (!location.hash && !state.config?.models?.length) current = 'setup';
     paintHeader();
     await render();
   } catch (err) {
     clear(view).append(card('Cannot reach the relay', h('div', {},
       h('p.muted', { text: err.message }),
-      h('p.small.muted', { text: 'Is the relay still running in Termux? Start it with: bash scripts/start-termux.sh' }),
+      h('p.small.muted', { text: 'The relay is not answering. Tap the chtting-relay-start shortcut, or run: sv up chtting-relay' }),
       h('button', { onclick: boot }, 'Retry'),
     )));
   }

@@ -44,9 +44,25 @@ export async function tunnelView(ctx) {
         : null,
       s.lastError ? h('p.small', { style: { color: 'var(--err)' }, text: s.lastError } ) : null,
       !s.cloudflared?.installed
-        ? h('div', {},
-          h('p.small.muted', { text: 'Install it in Termux first:' }),
-          h('pre.log', { text: 'pkg install cloudflared' }))
+        ? h('div', { style: { marginTop: '10px' } },
+          h('p.small.muted', { text: 'cloudflared has to be installed before a tunnel can start.' }),
+          h('button.sm.primary', {
+            onclick: async (ev) => {
+              const btn = ev.currentTarget;
+              btn.disabled = true;
+              btn.textContent = 'Installing…';
+              try {
+                const res = await api.installPackage('cloudflared');
+                toast(res.ok ? 'cloudflared installed' : 'Install failed', res.ok ? 'ok' : 'err');
+                await refresh();
+              } catch (err) {
+                toast(err.message, 'err');
+              } finally {
+                btn.disabled = false;
+                btn.textContent = 'Install cloudflared';
+              }
+            },
+          }, 'Install cloudflared'))
         : null,
     );
 
