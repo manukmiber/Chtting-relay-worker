@@ -19,24 +19,19 @@ use crate::store::RequestRecord;
 use crate::util::{day_key, hour_key, new_id, now_ms, round, truncate};
 
 use super::{bearer_token, client_ip, cors_headers};
-
 pub fn router(state: Arc<AppState>) -> Router {
     let cfg = state.config.current();
     let limit = cfg.server.max_body_bytes;
     let mut router = Router::new()
         .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/models/{id}", get(model_by_id))
-        .route("/v1/chat/completions", post(chat))
-        .route("/chat/completions", post(chat))
-        .route("/v1/completions", post(completions))
-        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/models", get(models).options(preflight))
+        .route("/v1/models/{id}", get(model_by_id).options(preflight))
+        .route("/v1/chat/completions", post(chat).options(preflight))
+        .route("/chat/completions", post(chat).options(preflight))
+        .route("/v1/completions", post(completions).options(preflight))
+        .route("/v1/embeddings", post(embeddings).options(preflight))
         .route(DEFAULT_PROVIDER_PATH, get(provider_models));
 
-    // The listing is always mounted, whether or not it is switched on, so
-    // toggling it in the dashboard takes effect at once; the handler is what
-    // checks. Only moving it to a different path needs a restart, which the
-    // dashboard says.
     let custom = cfg.openrouter.path.trim();
     if custom.starts_with('/') && custom != DEFAULT_PROVIDER_PATH {
         router = router.route(custom, get(provider_models));
@@ -48,6 +43,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+async fn preflight(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    with_cors(&state, &headers, StatusCode::NO_CONTENT.into_response())
+}
 /// Where the OpenRouter listing lives unless the config moves it.
 const DEFAULT_PROVIDER_PATH: &str = "/provider/models";
 
