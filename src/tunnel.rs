@@ -31,6 +31,37 @@ pub enum State {
     Failed,
 }
 
+pub async fn ensure_cloudflared_running(config: &TunnelConfig, relay_port: u16) {
+    if !config.auto_start || config.mode == "off" {
+        return;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            tracing::info!("[TUNNEL] Memulai Cloudflare Tunnel...");
+            let mut cmd = tokio::process::Command::new("cloudflared");
+            cmd.arg("tunnel");
+
+            if config.mode == "quick" {
+                cmd.args(["--url", &format!("http://127.0.0.1:{}", relay_port)]);
+            } else if !config.token.is_empty() {
+                cmd.args(["run", "--token", &config.token]);
+            }
+
+            cmd.stdout(std::process::Stdio::piped())
+               .stderr(std::process::Stdio::piped());
+
+            if let Ok(mut child) = cmd.spawn() {
+                let _ = child.wait().await;
+                tracing::warn!("[TUNNEL] Cloudflared terhenti, memulai ulang dalam 3 detik...");
+            } else {
+                tracing::error!("[TUNNEL] Gagal mengeksekusi cloudflared. Pastikan terinstall!");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        }
+    });
+}
+
 impl State {
     fn label(self) -> &'static str {
         match self {

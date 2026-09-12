@@ -17,7 +17,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::util::{deep_merge, mask_secret, new_id, write_atomic};
+use rand::Rng;
 
+pub fn generate_client_key() -> String {
+    // 32 karakter kombinasi: Huruf besar, huruf kecil, angka, dan tanda/simbol
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
+    let mut rng = rand::rng();
+    let random_part: String = (0..32)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect();
+    
+    format!("Kunci-Zeiko-{}", random_part)
+}
 const SECRET_KEYS: [&str; 4] = ["apiKey", "key", "password", "token"];
 
 /* ------------------------------------------------------------- helpers -- */
@@ -36,9 +50,16 @@ mod double_option {
 }
 
 /* -------------------------------------------------------------- schema -- */
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyConfig {
+    pub id: String,
+    pub label: String, // Sekarang bebas diubah namanya
+    pub key: String,
+    pub enabled: bool,
+    pub models: Vec<String>,
+    pub quota: KeyQuota,
+}
 pub struct Config {
     pub version: u32,
     pub timezone: String,
@@ -1384,5 +1405,123 @@ mod tests {
             "Deepseek-v4-flash-0731"
         );
         assert!(cfg.find_model("Deepseek-v4-flash-0731").is_none());
+    }
+}
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_backend_type")]
+    pub r#type: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,          // Key tunggal (backward compatibility)
+    #[serde(default)]
+    pub api_keys: Vec<String>,    // Multi-key pool
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_true")]
+    pub stream_options: bool,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+
+    #[serde(skip)]
+    pub key_counter: std::sync::Arc<AtomicUsize>,
+}
+
+impl BackendConfig {
+    /// Mengambil API key berikutnya secara round-robin dari pool multi-key
+    pub fn get_active_api_key(&self) -> String {
+        if !self.api_keys.is_empty() {
+            let idx = self.key_counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+            self.api_keys[idx].clone()
+        } else {
+            self.api_key.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TieredPricingConfig {
+    pub base_input_usd_per_m: f64,      // Harga backend per 1M token input
+    pub base_output_usd_per_m: f64,     // Harga backend per 1M token output
+    pub reasoning_multiplier: f64,      // Pengali untuk thinking token (cth: 1.5x)
+    pub proxy_margin_percent: f64,      // Margin proxy (cth: 30.0 untuk profit 30%)
+    pub peak_hours: Option<Vec<u32>>,   // Jam-jam sibuk (0-23)
+    pub peak_multiplier: Option<f64>,   // Pengali jam sibuk (cth: 1.25x)
+    pub volume_threshold: Option<u64>,  // Ambang token (cth: 32000 token)
+    pub high_volume_multiplier: Option<f64>, // Diskon/perubahan volume tinggi
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfig {
+    pub id: String,
+    pub backend: String,
+    pub upstream_model: String,
+    // ... field lainnya ...
+    #[serde(default)]
+    pub target_tps: Option<f64>,        // Batasi speed keluar tunnel (cth: 35.0 TPs)
+    #[serde(default)]
+    pub pricing: TieredPricingConfig,   // Tiered pricing
+}
+
+pub struct PriceResult {
+    pub backend_cost: f64,
+    pub proxy_price: f64,
+    pub profit: f64,
+}
+
+pub fn calculate_pricing(
+    pricing: &TieredPricingConfig,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    reasoning_tokens: u64,
+    hour: u32,
+) -> PriceResult {
+    let mut input_rate = pricing.base_input_usd_per_m;
+    let mut output_rate = pricing.base_output_usd_per_m;
+
+    // 1. Cek jam sibuk (Time of day)
+    if let (Some(hours), Some(mult)) = (&pricing.peak_hours, pricing.peak_multiplier) {
+        if hours.contains(&hour) {
+            input_rate *= mult;
+            output_rate *= mult;
+        }
+    }
+
+    // 2. Cek volume input token
+    if let (Some(thresh), Some(mult)) = (pricing.volume_threshold, pricing.high_volume_multiplier) {
+        if prompt_tokens > thresh {
+            input_rate *= mult;
+        }
+    }
+
+    // 3. Hitung biaya backend
+    let input_cost = (prompt_tokens as f64 / 1_000_000.0) * input_rate;
+    let standard_output = completion_tokens.saturating_sub(reasoning_tokens);
+    let reasoning_mult = if pricing.reasoning_multiplier > 0.0 { pricing.reasoning_multiplier } else { 1.0 };
+    let output_cost = ((standard_output as f64 + (reasoning_tokens as f64 * reasoning_mult)) / 1_000_000.0) * output_rate;
+    
+    let backend_cost = input_cost + output_cost;
+
+    // 4. Hitung harga jual proxy & profit
+    let margin = if pricing.proxy_margin_percent > 0.0 { pricing.proxy_margin_percent / 100.0 } else { 0.20 };
+    let proxy_price = backend_cost * (1.0 + margin);
+    let profit = proxy_price - backend_cost;
+
+    PriceResult {
+        backend_cost,
+        proxy_price,
+        profit,
     }
 }

@@ -46,6 +46,110 @@ use crate::tokenizer::chat::flatten_content;
 use crate::tokenizer::{reconcile_usage, LocalCount, Resolved, Usage};
 use crate::util::{day_key, hour_key, new_id, now_ms, round, truncate};
 
+use std::time::Instant;
+use chrono::Utc;
+use uuid::Uuid;
+
+// Fungsi membaca RAM process di Android/Linux (Zero Dependency, ~2µs)
+fn get_current_rss_mb() -> f64 {
+    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+        if let Some(rss_pages) = statm.split_whitespace().nth(1) {
+            if let Ok(pages) = rss_pages.parse::<u64>() {
+                return (pages * 4096) as f64 / (1024.0 * 1024.0);
+            }
+        }
+    }
+    0.0
+}
+
+pub async fn handle_chat_completion(...) {
+    // 5.a Request masuk: Generate UID v4 & Timestamp
+    let req_uid = Uuid::new_v4().to_string();
+    let req_start = Instant::now();
+    let start_timestamp = Utc::now().to_rfc3339();
+    
+    eprintln!("\n===================[ REQUEST START ]===================");
+    eprintln!("UID        : {}", req_uid);
+    eprintln!("Timestamp  : {}", start_timestamp);
+    eprintln!("Model      : {}", requested_model);
+
+    // 5.b Tokenizer Execution Duration
+    let tok_start = Instant::now();
+    let user_token_count = tokenizer.count_chat(&request_body.messages);
+    let tok_duration = tok_start.elapsed();
+    eprintln!("⏱️ Tokenizer Time   : {:.4}s ({} ms)", tok_duration.as_secs_f64(), tok_duration.as_millis());
+
+    // 5.c Inject System Prompt Duration
+    let inj_start = Instant::now();
+    let transformed_body = inject_system_prompt(&model_config, request_body);
+    let inj_duration = inj_start.elapsed();
+    eprintln!("⏱️ Prompt Injection : {:.4}s ({} ms)", inj_duration.as_secs_f64(), inj_duration.as_millis());
+
+    // Network metrics counter
+    let net_rx_bytes = raw_request_body.len();
+    let mut net_tx_bytes = 0usize;
+
+    // Upstream Request (Multi-key round robin)
+    let upstream_api_key = backend_config.get_active_api_key();
+    let send_start = Instant::now();
+    let mut first_token_time: Option<Instant> = None;
+
+    // 6. Token Per Second (TPS) Limiter Pacing Setup
+    let target_tps = model_config.target_tps.unwrap_or(0.0);
+    let token_interval = if target_tps > 0.0 {
+        std::time::Duration::from_secs_f64(1.0 / target_tps)
+    } else {
+        std::time::Duration::ZERO
+    };
+
+    // Saat menerima stream chunk:
+    // Pada chunk pertama:
+    if first_token_time.is_none() {
+        first_token_time = Some(Instant::now());
+        let ttft_dur = first_token_time.unwrap().duration_since(send_start);
+        eprintln!("⏱️ First Token (TTFT): {:.4}s ({} ms)", ttft_dur.as_secs_f64(), ttft_dur.as_millis());
+    }
+
+    // Pacing stream token jika target_tps disetel:
+    if target_tps > 0.0 {
+        tokio::time::sleep(token_interval).await;
+    }
+
+    // 5.e Selesai Request
+    let total_duration = req_start.elapsed();
+    eprintln!("⏱️ Total Request   : {:.4}s ({} ms)", total_duration.as_secs_f64(), total_duration.as_millis());
+
+    // Hitung Tiered Pricing
+    let current_hour = chrono::Local::now().hour();
+    let pricing_res = calculate_pricing(
+        &model_config.pricing,
+        final_prompt_tokens,
+        final_completion_tokens,
+        final_reasoning_tokens,
+        current_hour,
+    );
+
+    let ram_mb = get_current_rss_mb();
+    let ttft_ms = first_token_time.map(|t| t.duration_since(send_start).as_millis() as u64).unwrap_or(0);
+    let gen_dur = total_duration.as_secs_f64() - (ttft_ms as f64 / 1000.0);
+    let tps = if gen_dur > 0.0 { final_completion_tokens as f64 / gen_dur } else { 0.0 };
+
+    // 5.f UNIFIED SUMMARY LOG BLOCK
+    eprintln!("-------------------[ UNIFIED SUMMARY ]-------------------");
+    eprintln!("UID          : {}", req_uid);
+    eprintln!("RAM Usage    : {:.2} MB", ram_mb);
+    eprintln!("Network      : RX {} B | TX {} B", net_rx_bytes, net_tx_bytes);
+    eprintln!("Tokens       : In {} | Out {} (Reasoning: {}) | Cache: {}", 
+        final_prompt_tokens, final_completion_tokens, final_reasoning_tokens, cached_tokens);
+    eprintln!("Pricing      : Backend: ${:.6} | Proxy: ${:.6} | Profit: ${:.6}", 
+        pricing_res.backend_cost, pricing_res.proxy_price, pricing_res.profit);
+    eprintln!("Performance  : Latency: {} ms | TTFT: {} ms | TPS: {:.2}", 
+        total_duration.as_millis(), ttft_ms, tps);
+    eprintln!("=========================================================\n");
+
+    // Catat ke DB & logger memori
+}
+
 /// The outcome of an authentication attempt.
 pub enum Auth {
     Ok(ClientKey),
