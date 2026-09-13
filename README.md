@@ -21,12 +21,29 @@ channel, dan kuota harian dijawab dari memori — bukan query SQLite per request
  │  relay API  0.0.0.0:8787      │ ←──── cloudflared ────  https://xxx.trycloudflare.com
  │      │                        │
  │      ├─ terjemah nama model   │
- │      ├─ suntik system prompt  │
+ │      ├─ pilih system prompt   │  ← sesuai thinking effort si pemanggil
  │      ├─ hitung token (exact)  │
- │      ├─ ubah bentuk respons   │
+ │      ├─ bangun ulang respons  │  ← amplop kita, bukan amplop backend
+ │      ├─ rem TPS keluar        │  ← biar tunnel tidak berat
+ │      ├─ hitung harga bertier  │  ← backend / proxy / profit
  │      └─ catat metrik → SQLite │
  └──────┼────────────────────────┘
         └────────────────────────────────────────────► backend asli (DeepSeek, dst)
+```
+
+Yang keluar dari relay ini tidak menyisakan jejak backend sama sekali:
+
+```jsonc
+// dari backend                          // ke pemanggil
+{ "id": "3251459c-90b4-…",               { "id": "32dadfde-f3dd-4ad8-…",
+  "model": "deepseek-flash",               "model": "wissanggeni-512B-V1",
+  "system_fingerprint": "aeb564…",         "object": "chat.completion.chunk",
+  "created": 1789263746,                   "created": 1789285301,
+  "choices": [{ "index": 0,                "choices": [{ "index": 0,
+    "delta": { "content": "api",             "delta": { "content": "api" },
+               "reasoning_content": null },  "finish_reason": null }] }
+    "logprobs": null,
+    "finish_reason": null }] }
 ```
 
 ---
@@ -42,7 +59,7 @@ bash scripts/install-termux.sh
 
 Tiga baris itu saja. Script-nya **mengunduh binary siap pakai** untuk CPU HP-mu
 kalau rilisnya ada (checksum diverifikasi), membuat config awal, mencetak client
-key pertama, memasang service runit + shortcut layar utama + hook boot, lalu
+key pertama, memasang keeper + shortcut layar utama + hook boot, lalu
 menjalankan relay-nya.
 
 Kalau belum ada rilis yang cocok, script otomatis build dari source:
@@ -66,9 +83,15 @@ Tab **Setup** menulis tiga hal untuk kamu:
 
 | | Gunanya |
 |---|---|
-| **Service runit** | relay dihidupkan lagi kalau mati, dan ikut hidup bareng Termux |
+| **Keeper** | relay dihidupkan lagi kalau mati — loop `sh` kecil, tidak butuh paket apa pun |
 | **Shortcut layar utama** | Start / Stop / Restart / Buka dashboard jadi ikon — butuh app **Termux:Widget** dari F-Droid |
 | **Hook boot** | relay nyala sebelum HP di-unlock — butuh app **Termux:Boot** dari F-Droid |
+
+> **`termux-services` sudah tidak ada** di repo Termux, jadi service runit yang
+> dulu dipakai sekarang tidak mengawasi apa pun — cuma kelihatan terpasang.
+> Penggantinya **keeper**: satu skrip `sh` di `~/.chtting-relay/keeper.sh` yang
+> menjalankan relay dalam loop dan menghidupkannya lagi tiga detik setelah mati.
+> Tidak ada `pkg install` tambahan; `sh` selalu ada di Termux.
 
 Satu hal yang **tidak bisa** dipindah ke dashboard: menyalakan relay yang sedang
 mati. Dashboard-nya kan disajikan oleh relay itu sendiri. Untuk itulah shortcut
@@ -77,6 +100,24 @@ dan hook boot ada — menyalakannya tetap tanpa mengetik, cukup satu tap.
 > Restart dari dashboard itu `exec` ke diri sendiri: PID sama, port sama,
 > config dibaca ulang, halaman balik lagi dalam sedetik. Jadi mengubah port
 > relay atau bind address cukup Save lalu **Restart relay**.
+
+### Ganti diri sendiri tiap jam
+
+Android membunuh proses yang paling lama nongkrong di memori — biasanya tengah
+malam, biasanya tidak ada yang sadar sampai pagi. Jadi relay-nya **pensiun
+duluan sebelum dibunuh**: tiap jam ia menjalankan salinan baru dirinya sendiri,
+salinan itu bind ke port yang sama (`SO_REUSEPORT`), baru yang lama berhenti
+menerima koneksi dan menyelesaikan request yang masih jalan.
+
+```
+  lama │██████████ melayani ██████████│ meniriskan │ selesai
+  baru                │ bind │████████████ melayani ████████████ …
+```
+
+Tidak ada request yang putus dan tidak ada koneksi yang ditolak, karena selalu
+ada yang mendengarkan. Kalau salinan barunya gagal naik, yang lama jalan terus
+seperti biasa dan mencoba lagi jam berikutnya. Atur di **Settings → Staying
+alive**, atau `server.rotateHours` (`0` untuk mematikan).
 
 ---
 
@@ -96,6 +137,19 @@ bash scripts/build-android.sh aarch64 armv7  # dua-duanya
 
 Hasilnya di `target/<target>/release/chtting-relay` — tinggal salin ke HP,
 `chmod +x`, jalankan. Tidak perlu toolchain Rust di HP sama sekali.
+
+Kalau build langsung di HP dan RAM-nya pas-pasan, installer otomatis pakai
+profil `release-small` (satu codegen unit, tanpa LTO, dioptimasi ukuran) supaya
+linker-nya tidak kena OOM killer di tengah jalan. Mau memaksa:
+
+```bash
+cargo build --profile release-small -j1
+```
+
+Dependensinya sengaja dijaga supaya **tidak ada cmake, Go, Node, atau compiler
+C++**: TLS-nya `ring` bukan aws-lc, tokenizer-nya dibangun tanpa backend C++
+`esaxx`, regex-nya `fancy-regex` yang murni Rust. Yang perlu di Termux cuma
+`rust` dan `clang`.
 
 Untuk merilis: `git tag v2.1.0 && git push origin v2.1.0`. GitHub Actions
 membangun kedua arsitektur, membuat checksum, dan menempelkannya ke Release.
@@ -225,12 +279,59 @@ Prompts) supaya satu persona dipakai beberapa alias sekaligus.
 
 Aturan rewrite request tidak pernah menyentuh system prompt kamu sendiri.
 
+### Satu model, banyak prompt — dipilih dari thinking effort
+
+Panggilan tanpa reasoning dan panggilan dengan effort maksimum butuh instruksi
+yang berbeda: yang pertama perlu jawabannya dibentuk langsung, yang kedua perlu
+ruang untuk berpikir. Jadi satu model boleh punya beberapa prompt, dan yang
+dipakai dipilih dari effort yang diminta pemanggil:
+
+```json
+"systemPrompts": [
+  { "id": "thinking", "minEffort": "high",
+    "prompt": { "mode": "replace", "text": "Pikirkan pelan-pelan, jangan buru-buru." } },
+  { "id": "fast", "efforts": ["none", "minimal", "low"],
+    "prompt": { "mode": "replace", "promptId": "sp_langsung" } }
+]
+```
+
+Aturan pertama yang cocok yang menang; yang tidak cocok jatuh ke `systemPrompt`
+biasa. Effort-nya dibaca dari body pemanggil apa pun ejaannya —
+`reasoning_effort` ala OpenAI, `reasoning.effort` ala OpenRouter,
+`enable_thinking` ala Qwen, atau `thinking.budget_tokens` ala Anthropic yang
+dipetakan ke level menurut besarnya.
+
 ---
 
 ## 4. Mengubah bentuk respons
 
-Berlaku sama untuk respons utuh maupun streaming — jadi klien streaming dan
-non-streaming menerima bentuk yang identik.
+**Dibangun ulang, bukan disaring.** Relay tidak menyaring JSON backend — ia
+memulai amplop sendiri lalu menyalin segelintir field yang disebut namanya:
+
+```json
+{ "id": "<uuid v4 kita>", "object": "chat.completion.chunk",
+  "created": <saat request masuk>, "model": "<alias publik>",
+  "choices": [{ "index": 0, "delta": { "content": "…" }, "finish_reason": null }] }
+```
+
+Menyaring dengan cara menghapus itu arahnya terbalik: yang hilang cuma yang
+sempat kita sebut, jadi begitu backend menambah field baru besok, field itu ikut
+terkirim. Dengan dibangun ulang, `system_fingerprint`, id request backend,
+`created`-nya, `service_tier`, `logprobs`, dan apa pun yang belum ada hari ini
+tidak perlu dihapus — memang tidak pernah disalin.
+
+Blok `usage` juga tidak ikut. Yang dikirim relay adalah miliknya sendiri:
+`prompt_tokens` hasil hitungan tokenizer relay atas body pemanggil, bukan angka
+backend, plus harga request itu:
+
+```json
+"usage": { "prompt_tokens": 1284, "completion_tokens": 909, "total_tokens": 2193,
+           "completion_tokens_details": { "reasoning_tokens": 629 },
+           "usage": 0.001291 }
+```
+
+Selebihnya berlaku sama untuk respons utuh maupun streaming — jadi klien
+streaming dan non-streaming menerima bentuk yang identik.
 
 | Pengaturan | Fungsinya |
 |---|---|
@@ -255,9 +356,71 @@ Sisi request juga bisa dibentuk: `dropParams` untuk backend yang rewel,
 `renameParams` (misal `max_completion_tokens` → `max_tokens`), `injectStop`,
 `params` sebagai default dan `forceParams` yang tidak bisa ditawar pemanggil.
 
+### Keep-alive dengan kalimat sendiri
+
+Selama backend berpikir, tidak ada apa pun yang lewat kabel, dan cloudflared
+atau NAT operator akan menganggap koneksinya mati. Relay mengisi diam itu dengan
+komentar SSE miliknya sendiri:
+
+```
+: Zeiko is still here, Just be patience
+```
+
+Komentar bukan event, jadi tidak ada klien yang mem-parse-nya — dia cuma
+lalu-lintas, dan itu memang seluruh tujuannya. Keep-alive milik backend di-parse
+lalu dibuang, tidak diteruskan: bentuknya saja sudah jadi sidik jari backend
+mana yang ada di belakang.
+
+### Menahan kecepatan keluar
+
+Backend yang jalan di 170 token/detik mendorong 170 token/detik ke dalam tunnel,
+dan di uplink HP itulah bebannya terasa. `maxTokensPerSecond` per model menahan
+laju keluar — misalnya ke 35 — tanpa ada yang merasa lambat (tetap jauh lebih
+cepat dari kecepatan orang membaca), dan menyisakan napas buat request lain.
+
+Caranya dengan tidak membaca dari backend lebih cepat daripada menulis ke
+pemanggil, jadi jedanya merambat balik lewat TCP window, bukan menumpuk token di
+memori. Delta pertama tidak pernah ditahan, supaya TTFT tetap angka backend dan
+bukan angka bikinan remnya.
+
 ---
 
-## 5. Logging dan metrik
+## 5. Harga bertingkat
+
+Tiap request punya tiga angka: **backend** (yang ditagih ke kita), **proxy**
+(yang kita tagih), dan **profit** (selisihnya). Tarifnya per juta token, dan
+tarif jual yang dibiarkan `0` diturunkan dari tarif backend plus margin.
+
+Yang membuatnya tidak terkunci di satu harga: `tiers` itu daftar, dan **semua
+tier yang cocok ikut berlaku**, berurutan. Prompt 300 ribu token, di jam padat,
+dengan thinking effort maksimum membayar ketiganya — bukan relay yang harus
+memilih satu alasan untuk menaikkan harga.
+
+```json
+"tiers": [
+  { "name": "jam padat",     "inputMultiplier": 1.25, "outputMultiplier": 1.25,
+    "when": { "hours": [{ "from": 19, "to": 23 }] } },
+  { "name": "di atas 256K",  "inputMultiplier": 2,
+    "when": { "minInputTokens": 256000 } },
+  { "name": "mikir berat",   "reasoningMultiplier": 1.5,
+    "when": { "minEffort": "high" } },
+  { "name": "akhir pekan",   "inputUsdPerM": 0.14,
+    "when": { "weekdays": [5, 6] }, "stop": true }
+]
+```
+
+Syarat yang bisa dipakai di `when`: model (glob), thinking effort (daftar atau
+batas `minEffort`/`maxEffort`), jam (melingkar lewat tengah malam), hari,
+jumlah token input/output/total, streaming atau tidak, kena cache atau tidak.
+Jumlahnya tidak dibatasi, dan tier boleh ditaruh global atau per model — punya
+model dievaluasi belakangan, jadi dia yang berkata terakhir.
+
+Tier tidak pernah menyentuh angka backend: markup kita tidak bisa mengubah
+tagihan orang lain. Daftar lengkapnya di [docs/CONFIG.md](docs/CONFIG.md).
+
+---
+
+## 6. Logging dan metrik
 
 Satu baris per panggilan, masuk SQLite (WAL, di-*bundle* jadi tidak bergantung
 versi sqlite Termux). Handler tidak pernah menunggu disk: baris dikirim lewat
@@ -289,15 +452,18 @@ di system prompt. Aturan rewrite request (`requestTransform.replace`) yang
 memanjangkan teks pemanggil juga jadi biaya relay: yang dikirim ke backend
 memang jadi lebih panjang, tapi angka pemanggil tidak ikut naik.
 
-Angka itu dibatasi di **porsi dia atas tagihan backend yang sebenarnya**, supaya
-relay tidak pernah menagih lebih dari yang ditagihkan ke dia. Batasnya berupa
-proporsi, bukan pengurangan: `prompt_tokens` bisa datang dari tokenizer backend
-sementara pembagiannya diukur lokal, dan mengurangkan dua angka dari dua
-tokenizer berbeda bisa jadi minus. Proporsi tidak bisa.
+Angka pemanggil **tidak pernah datang dari backend**, bahkan ketika backend
+melaporkan usage-nya sendiri. Dua alasan yang mengarah ke tempat yang sama:
+tokenizer backend bukan urusan pemanggil, dan angka backend sudah termasuk
+suntikan yang bukan tulisannya. Yang backend tagih tetap dicatat di
+`billed_prompt_tokens` — itu margin operator, dan cuma operator yang melihatnya.
 
 Mau menagihkan system prompt ke pemanggil? Nyalakan
 `tokenizer.billSystemPromptToUser`. Dua angkanya tetap dicatat, jadi selisihnya
 tetap terlihat di tab Usage.
+
+Harga tiap request ikut tercatat di barisnya: `backend_usd`, `proxy_usd`,
+`profit_usd`, dan `price_tiers` — nama tier yang benar-benar berlaku.
 
 ### Buku besar yang tidak bisa diubah
 
@@ -313,11 +479,12 @@ menerima baris baru**:
   (jadi token yang sudah terpakai tetap tercatat walau jawabannya tidak pernah
   datang), dan `final` saat selesai. Keduanya tidak pernah mencatat angka yang
   sama dua kali, jadi `SUM` di atas tabel selalu benar.
-- Baris `input` ditulis sebelum backend sempat bicara, jadi isinya hitungan
-  lokal relay. Kalau ternyata pemanggil akhirnya ditagih lebih kecil, selisihnya
-  **diposting sebagai koreksi** di baris `final` — angka minus, baris sendiri.
-  Baris yang sudah masuk tidak pernah ditimpa, dan totalnya tetap sama persis
-  dengan `usage.prompt_tokens` yang diterima pemanggil.
+- Baris `input` ditulis sebelum backend sempat bicara, dan isinya hitungan lokal
+  relay — yang juga angka final pemanggil, jadi biasanya tidak ada yang berubah
+  di akhir. Kalau toh berubah, selisihnya **diposting sebagai koreksi** di baris
+  `final`: angka minus, baris sendiri. Baris yang sudah masuk tidak pernah
+  ditimpa, dan totalnya tetap sama persis dengan `usage.prompt_tokens` yang
+  diterima pemanggil.
 
 Isinya yang diringkas tab Usage: jumlah request, token masuk, token keluar,
 TTFT, token/detik, dan cache hit. Prune tidak pernah menyentuh tabel ini —
@@ -340,9 +507,44 @@ Definisi waktunya:
 TTFT hanya dicatat kalau memang ada streaming — request non-streaming tidak
 punya TTFT, dan rata-ratanya tidak dikotori angka palsu.
 
+### Jejak per request
+
+Tiap request punya **UUID v4** yang dibuat saat dia masuk, dan uuid yang sama
+itu yang dipakai di baris log, di `id` balasan, di header `x-relay-request-id`,
+dan sebagai primary key barisnya di database. Jadi keluhan yang menyebut satu
+id bisa langsung ditarik ke barisnya.
+
+```
+req 32dadfde in    2026-09-13T14:41:41.383+07:00 model=wissanggeni-512B-V1 key=hp user=tenant-42 effort=high stream=true bytes=147 ip=127.0.0.1
+req 32dadfde inj         0.1ms  rule=spr_think mode=replace
+req 32dadfde tok       811.1ms  9 caller / 9 upstream  o200k_base exact
+req 32dadfde ttft     2014.5ms
+req 32dadfde done     2766.8ms  status=200 stop
+req 32dadfde sum   uid=32dadfde-f3dd-4ad8-acc5-387b72415f46 model=wissanggeni-512B-V1 key=hp user=tenant-42 effort=high | ram=82.6MB net=147B in/1 437B out/1 889B up | tok=9 in (0 cached, 0% hit) 909 out (629 reasoning) | backend=$0.000391 proxy=$0.001291 profit=$0.000900 [jam padat, thinking effort tinggi] | latency=2766.8ms ttft=2014.5ms tps=2171.84 (held to 6)
+```
+
+Baris terakhir sengaja memuat semuanya sekaligus: RAM, jaringan masuk/keluar/ke
+backend, token in dan out beserta cache rate, total backend, total proxy,
+profit, tier yang berlaku, latensi, TTFT dan TPS. Satu layar HP yang lewat sudah
+cukup untuk tahu satu request itu berapa.
+
+Semuanya lewat logger yang sama, yang menulis ke stderr dan ke `relay.log`
+sekaligus — jadi **tab Logs di dashboard menampilkan persis yang ditampilkan
+Termux**. Matikan lewat `logging.verboseRequests` kalau mau balik ke satu baris
+per request.
+
+### Siapa yang memanggil
+
+Satu client key sering dipakai banyak orang. Kalau pemanggil mengirim `user` di
+body (atau header `x-user-id`), id itu dicatat di barisnya **dan diteruskan ke
+backend** — karena backend yang meng-cache prompt biasanya meng-*key* cache-nya
+per user, dan tanpa itu prefix cache satu orang bisa dipakai request orang lain.
+Matikan per backend lewat `forwardUserId` kalau cuma mau mencatat tanpa
+meneruskan.
+
 ---
 
-## 6. Dashboard
+## 7. Dashboard
 
 Di `http://127.0.0.1:8788`, terikat ke localhost dan **tidak pernah dilewatkan
 tunnel**. Vanilla JS, tanpa build step, tanpa CDN — dan sekarang **ikut
@@ -369,7 +571,7 @@ tampil termask, dan menyimpan form tidak akan menimpa key asli dengan masknya.
 
 ---
 
-## 7. Cloudflare Tunnel
+## 8. Cloudflare Tunnel
 
 Tab **Tunnel**, atau setel `tunnel.autoStart` di config.
 
@@ -492,7 +694,7 @@ scripting dan buat kalau dashboard-nya sendiri yang bermasalah.
 
 ```
 chtting-relay start [--port N] [--no-dashboard]
-chtting-relay setup                     service runit + shortcut + hook boot
+chtting-relay setup                     keeper + shortcut + hook boot
 chtting-relay doctor                    periksa lingkungan dan konfigurasi
 chtting-relay config path|show
 chtting-relay key new --label "hp saya" client key baru, ditampilkan sekali
@@ -519,13 +721,15 @@ src/
   state.rs       yang dibagi semua handler
   logging.rs     log berlevel, file writer di background
   tokenizer/     registry vocabulary, penghitungan chat, estimator
-  relay/         upstream + fallback, transform, SSE, handler + metrik
+  pricing.rs     thinking effort, tier bertingkat, harga backend/proxy/profit
+  relay/         upstream + fallback, transform, SSE, pacing, trace, handler
+  rotate.rs      ganti instance tiap jam tanpa memutus koneksi
   server/        API publik, dashboard + admin API
   store/         SQLite, quota tracker, rate limiter
-  system.rs      service runit, shortcut, hook boot, wake lock, restart/stop
+  system.rs      keeper, shortcut, hook boot, wake lock, restart/stop
   tunnel.rs      supervisor cloudflared
 public/          dashboard (vanilla JS, ikut ter-compile ke binary)
-scripts/         setup Termux, service runit
+scripts/         setup Termux, build Android
 tests/           test end-to-end lewat HTTP asli
 ```
 
@@ -549,6 +753,20 @@ mendeteksi perubahan yang dilakukan lewat belakang trigger-nya.
 
 ## Catatan keamanan
 
+- **Tidak ada satu pun data backend yang bocor ke pemanggil.** Setiap balasan
+  dibangun ulang dari amplop milik kita sendiri — uuid v4 kita, timestamp kita,
+  nama model publik kita — lalu hanya beberapa field yang disalin masuk. Jadi
+  `system_fingerprint`, id request backend, `created`-nya, `service_tier`,
+  `logprobs`, dan field apa pun yang backend tambahkan besok tidak ikut, karena
+  memang tidak pernah disalin. Menyaring dengan cara menghapus itu terbalik:
+  yang terhapus cuma yang sempat kita sebut namanya.
+- `usage` juga punya kita: `prompt_tokens` adalah hitungan tokenizer relay atas
+  body pemanggil sendiri, bukan angka backend, dan `usage` di dalamnya adalah
+  harga menurut daftar harga kita. Angka backend tetap dicatat di baris request
+  supaya marginnya kelihatan — oleh operator, bukan oleh pemanggil.
+- Keep-alive saat backend diam dikirim dengan kalimat kita sendiri; keep-alive
+  milik backend di-parse lalu dibuang, karena bentuknya saja sudah menunjukkan
+  backend mana yang di belakang.
 - API key backend tidak pernah keluar dari HP; pemanggil hanya memegang client key relay.
 - Dashboard default terikat `127.0.0.1` dan tidak masuk tunnel. Kalau kamu ubah
   bindingnya, pasang password.

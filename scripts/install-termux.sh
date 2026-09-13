@@ -16,7 +16,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
+# Where a build puts the binary depends on which profile the device could
+# manage, so both are looked for and the newer one wins.
 BIN="$ROOT/target/release/chtting-relay"
+resolve_bin() {
+  local newest=""
+  for candidate in "$ROOT/target/release/chtting-relay" "$ROOT/target/release-small/chtting-relay"; do
+    [ -x "$candidate" ] || continue
+    if [ -z "$newest" ] || [ "$candidate" -nt "$newest" ]; then newest="$candidate"; fi
+  done
+  # Written as an `if` rather than `[ ... ] && BIN=...`: under `set -e` a test
+  # that comes out false as the last command in a function ends the script.
+  if [ -n "$newest" ]; then BIN="$newest"; fi
+}
 REPO="manukmiber/Chtting-relay-worker"
 FORCE_BUILD=0
 START=1
@@ -98,16 +110,21 @@ download_prebuilt() {
 build_from_source() {
   say "building from source (5 to 15 minutes on a phone)"
   # rust brings cargo and rustc; clang is what `ring` and the bundled SQLite
-  # compile with.
+  # compile with. Nothing here needs cmake, Go or a C++ compiler: the TLS stack
+  # is `ring` rather than aws-lc, and the tokenizer crate is built without its
+  # C++ suffix-array backend.
   pkg install -y rust clang binutils pkg-config
 
-  # A phone has limited RAM; one codegen job at a time is slower but survives.
-  if [ "$(nproc)" -le 4 ]; then
-    echo "few cores detected — building with a single job to stay within memory"
-    cargo build --release -j1
+  # A phone has limited RAM, and the linker is where a build gets killed. Small
+  # devices get the release-small profile — one codegen unit, no LTO, optimised
+  # for size — which trades a little speed for a build that finishes.
+  if [ "$(nproc)" -le 4 ] || [ "$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 9999)" -lt 4096 ]; then
+    echo "small device detected — building for size, one job at a time"
+    cargo build --profile release-small -j1
   else
     cargo build --release
   fi
+  resolve_bin
 }
 
 if download_prebuilt; then

@@ -27,7 +27,11 @@ hyper-util = { version = "0.1", features = ["tokio", "server"] }
 # Only for SO_REUSEPORT, which is what lets a retiring instance hand its port to
 # its replacement without refusing a single connection. Pure Rust over libc, and
 # tokio already builds it, so it costs nothing extra on Android.
-socket2 = "0.6"
+#
+# `all` is not optional: socket2 puts `set_reuse_port` behind it, and relying on
+# tokio to have switched it on for us would mean the Android build breaks the day
+# tokio stops doing so.
+socket2 = { version = "0.6", features = ["all"] }
 http-body-util = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -91,4 +95,18 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 lto = "thin"
 codegen-units = 4
 strip = true
+# Never `abort`. A panic in one request's handler is caught at the task boundary
+# and answered as a 500; aborting would take the other few hundred callers down
+# with it, and on a phone that nobody is watching it would stay down.
 panic = "unwind"
+
+# A build on the phone itself, where the constraint is RAM rather than time: one
+# codegen unit at a time and no LTO, so `cargo build` does not get the process
+# killed halfway through on a 4 GB device.
+#
+#   cargo build --profile release-small
+[profile.release-small]
+inherits = "release"
+opt-level = "s"
+lto = false
+codegen-units = 1
