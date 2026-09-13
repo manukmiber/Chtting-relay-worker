@@ -66,6 +66,14 @@ pub const FIELDS: [&str; 56] = [
     "target_tps",
 ];
 
+/// The table itself, and nothing else.
+///
+/// Kept apart from the indexes on purpose. `CREATE TABLE IF NOT EXISTS` does
+/// nothing to a table that already exists, so a database written by an earlier
+/// version still has that version's columns when this runs — and an index over
+/// a column added later would fail with "no such column" before the migration
+/// that adds it ever got a chance. Table first, then the migration, then
+/// [`INDEX_SQL`].
 pub const CREATE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS requests (
   id TEXT PRIMARY KEY,
@@ -91,6 +99,10 @@ CREATE TABLE IF NOT EXISTS requests (
   backend_usd REAL, proxy_usd REAL, profit_usd REAL, price_tiers TEXT,
   target_tps REAL
 );
+";
+
+/// The indexes, built once every column they name is certain to exist.
+pub const INDEX_SQL: &str = "
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_requests_day ON requests(day);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(public_model);
