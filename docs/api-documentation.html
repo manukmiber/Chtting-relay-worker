@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="description" content="Integration guide for the chtting-relay OpenAI-compatible API: requests, user-id / KV-cache isolation, response shape, SSE streaming, and the model listing.">
+<!--
+  Source for docs/API-Documentation.pdf. Edit this file, then regenerate:
+
+      pip install weasyprint
+      python3 -c "from weasyprint import HTML; \
+        HTML('docs/api-documentation.html').write_pdf('docs/API-Documentation.pdf')"
+
+  Values here are the shipped defaults. The dashboard's API Docs tab renders the
+  same material from the *live* configuration, so prefer that for a relay whose
+  models, prices or quotas differ from the defaults.
+-->
+<title>chtting-relay — API Documentation</title>
+<style>
+  @page {
+    size: A4;
+    margin: 20mm 17mm 18mm 17mm;
+    @bottom-left {
+      content: "chtting-relay — API Documentation";
+      font-family: "DejaVu Sans", sans-serif;
+      font-size: 7.5pt;
+      color: #9aa0a6;
+    }
+    @bottom-right {
+      content: counter(page) " / " counter(pages);
+      font-family: "DejaVu Sans", sans-serif;
+      font-size: 7.5pt;
+      color: #9aa0a6;
+    }
+  }
+  @page :first {
+    @bottom-left { content: ""; }
+    @bottom-right { content: ""; }
+  }
+
+  html { font-size: 9.5pt; }
+  body {
+    font-family: "DejaVu Sans", sans-serif;
+    color: #1c1e21;
+    line-height: 1.5;
+    margin: 0;
+    hyphens: none;
+  }
+
+  h1, h2, h3, h4 { font-weight: bold; line-height: 1.25; }
+  h1 { font-size: 22pt; margin: 0 0 4mm 0; letter-spacing: -0.3pt; }
+  h2 {
+    font-size: 13pt;
+    margin: 9mm 0 3mm 0;
+    padding-bottom: 1.5mm;
+    border-bottom: 0.6pt solid #d3d7db;
+    break-after: avoid;
+    break-inside: avoid;
+  }
+  h3 {
+    font-size: 10.5pt;
+    margin: 5.5mm 0 2mm 0;
+    color: #16181a;
+    break-after: avoid;
+  }
+  h4 {
+    font-size: 9.5pt;
+    margin: 4mm 0 1.5mm 0;
+    color: #35393d;
+    break-after: avoid;
+  }
+  p { margin: 0 0 2.5mm 0; }
+  ul, ol { margin: 0 0 2.5mm 0; padding-left: 5mm; }
+  li { margin-bottom: 1.2mm; }
+
+  code, kbd {
+    font-family: "DejaVu Sans Mono", monospace;
+    font-size: 0.86em;
+    background: #f2f3f5;
+    border: 0.4pt solid #e0e3e6;
+    border-radius: 2pt;
+    padding: 0.2mm 0.9mm;
+    white-space: nowrap;
+  }
+  pre {
+    font-family: "DejaVu Sans Mono", monospace;
+    font-size: 7.6pt;
+    line-height: 1.42;
+    background: #f7f8fa;
+    border: 0.5pt solid #dfe2e6;
+    border-left: 2pt solid #b6bcc3;
+    border-radius: 2pt;
+    padding: 2.4mm 3mm;
+    margin: 0 0 3mm 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    break-inside: avoid;
+  }
+  pre code {
+    background: none; border: none; padding: 0; font-size: inherit;
+    white-space: pre-wrap;
+  }
+  pre.long { break-inside: auto; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 3.5mm 0;
+    font-size: 8.3pt;
+    break-inside: auto;
+  }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; }
+  th {
+    text-align: left;
+    background: #eef0f3;
+    border-bottom: 0.8pt solid #c8ccd1;
+    padding: 1.4mm 2mm;
+    font-weight: bold;
+    font-size: 8pt;
+  }
+  td {
+    padding: 1.4mm 2mm;
+    border-bottom: 0.4pt solid #e4e7ea;
+    vertical-align: top;
+  }
+  td code { white-space: normal; }
+  .nowrap { white-space: nowrap; }
+
+  .note, .warn {
+    border-radius: 2pt;
+    padding: 2.2mm 3mm;
+    margin: 0 0 3mm 0;
+    font-size: 8.6pt;
+    break-inside: avoid;
+  }
+  .note { background: #eef4fb; border-left: 2pt solid #5b8dd6; }
+  .warn { background: #fdf3e7; border-left: 2pt solid #d99b3d; }
+  .note p:last-child, .warn p:last-child { margin-bottom: 0; }
+
+  .lede { font-size: 10.5pt; color: #3c4043; margin-bottom: 5mm; }
+  .meta { font-size: 8.3pt; color: #70757a; }
+
+  /* Cover */
+  .cover { break-after: page; padding-top: 28mm; }
+  .cover .rule { height: 3pt; background: #1c1e21; width: 26mm; margin-bottom: 7mm; }
+  .cover .sub { font-size: 12pt; color: #5f6368; margin-bottom: 14mm; }
+  .cover table { font-size: 9pt; width: auto; }
+  .cover td { border: none; padding: 1mm 6mm 1mm 0; }
+  .cover td:first-child { color: #70757a; white-space: nowrap; }
+
+  /* Contents */
+  nav.toc { break-after: page; }
+  nav.toc ol { list-style: none; padding-left: 0; counter-reset: toc; }
+  nav.toc li { counter-increment: toc; margin-bottom: 1.8mm; }
+  nav.toc a {
+    color: #1c1e21;
+    text-decoration: none;
+  }
+  nav.toc a::before { content: counter(toc) ".  "; color: #9aa0a6; }
+  nav.toc a::after {
+    content: "  " target-counter(attr(href), page);
+    color: #9aa0a6;
+    font-size: 8.5pt;
+  }
+
+  .verbtag {
+    font-family: "DejaVu Sans Mono", monospace;
+    font-size: 7.4pt;
+    font-weight: bold;
+    color: #fff;
+    background: #4a4f55;
+    border-radius: 2pt;
+    padding: 0.4mm 1.3mm;
+    white-space: nowrap;
+  }
+  .verbtag.post { background: #2f6f43; }
+  .verbtag.get { background: #2b5b9e; }
+  .verbtag.opt { background: #7a7f85; }
+</style>
+</head>
+<body>
+
+<section class="cover">
+  <div class="rule"></div>
+  <h1>API Documentation</h1>
+  <div class="sub">chtting-relay — an OpenAI-compatible inference relay</div>
+
+  <table>
+    <tr><td>Wire protocol</td><td>OpenAI Chat Completions (HTTP + SSE)</td></tr>
+    <tr><td>Base URL</td><td><code>https://&lt;your-relay-host&gt;/v1</code></td></tr>
+    <tr><td>Auth</td><td><code>Authorization: Bearer &lt;client key&gt;</code></td></tr>
+    <tr><td>Audience</td><td>Integrators connecting a client or a service to this relay</td></tr>
+  </table>
+
+  <p class="meta" style="margin-top:16mm;">
+    Everything in this document describes the relay's own behaviour: the request it accepts,
+    the response it returns, and the fields it guarantees. The model that actually produces
+    the text sits behind the relay and is never named in any response — treat the model ids
+    in <code>GET /v1/models</code> as the only model identity that exists.
+  </p>
+</section>
+
+<nav class="toc">
+  <h2 style="margin-top:0;">Contents</h2>
+  <ol>
+    <li><a href="#s1">Base URL and endpoints</a></li>
+    <li><a href="#s2">Authentication</a></li>
+    <li><a href="#s3">Making a request</a></li>
+    <li><a href="#s4">User ID and KV-cache isolation</a></li>
+    <li><a href="#s5">The response we send back</a></li>
+    <li><a href="#s6">Streaming (SSE)</a></li>
+    <li><a href="#s7">Listing models: /v1/models and /models</a></li>
+    <li><a href="#s8">Errors</a></li>
+    <li><a href="#s9">Limits and operational notes</a></li>
+    <li><a href="#s10">Copy-paste examples</a></li>
+  </ol>
+</nav>
+
+<!-- ==================================================================== -->
+<h2 id="s1">1. Base URL and endpoints</h2>
+
+<p>The relay speaks the OpenAI HTTP API. Any OpenAI-compatible SDK, client or agent framework
+works unchanged — point its <code>base_url</code> at the relay and give it a client key.</p>
+
+<pre><code>base_url = https://&lt;your-relay-host&gt;/v1</code></pre>
+
+<p><strong>Every path exists with and without the <code>/v1</code> prefix.</strong> Some clients
+append <code>/v1</code> themselves, others are handed a base URL that already ends in it. Both
+spellings hit the same handler, so neither configuration is wrong.</p>
+
+<table>
+<thead><tr><th style="width:15%">Method</th><th style="width:32%">Path</th><th style="width:11%">Key?</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><span class="verbtag get">GET</span></td><td><code>/health</code></td><td>no</td><td>Liveness, version, how many models and backends are up, requests in flight.</td></tr>
+<tr><td><span class="verbtag get">GET</span></td><td><code>/v1/models</code><br><code>/models</code></td><td>yes</td><td>The model catalogue. See section 7.</td></tr>
+<tr><td><span class="verbtag get">GET</span></td><td><code>/v1/models/{id}</code><br><code>/models/{id}</code></td><td>yes</td><td>One model's entry, or <code>404 model_not_found</code>.</td></tr>
+<tr><td><span class="verbtag post">POST</span></td><td><code>/v1/chat/completions</code><br><code>/chat/completions</code></td><td>yes</td><td>Chat, streaming and non-streaming. The main endpoint.</td></tr>
+<tr><td><span class="verbtag post">POST</span></td><td><code>/v1/completions</code><br><code>/completions</code></td><td>yes</td><td>Legacy text completions. Same routing, same billing.</td></tr>
+<tr><td><span class="verbtag post">POST</span></td><td><code>/v1/embeddings</code><br><code>/embeddings</code></td><td>yes</td><td>Embeddings, when the routed model's backend offers them.</td></tr>
+<tr><td><span class="verbtag opt">OPTIONS</span></td><td>any of the above</td><td>no</td><td>CORS preflight.</td></tr>
+</tbody>
+</table>
+
+<p><code>GET /health</code> is the only endpoint that never needs a key, and the only one safe to
+poll from a monitor:</p>
+
+<pre><code>{"status":"ok","service":"chtting-relay","version":"2.0.0",
+ "models":3,"backends":1,"uptime_s":81422,"in_flight":2}</code></pre>
+
+<div class="note"><p><strong>Tunnel addresses move.</strong> If the relay is published through a
+quick Cloudflare tunnel, the hostname changes every time the tunnel restarts. Ask the operator for a
+named tunnel hostname before hard-coding a URL anywhere.</p></div>
+
+<!-- ==================================================================== -->
+<h2 id="s2">2. Authentication</h2>
+
+<p>Every endpoint except <code>/health</code> and CORS preflight takes a client key as a bearer
+token:</p>
+
+<pre><code>Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</code></pre>
+
+<p>A key sent bare — the value with no <code>Bearer</code> scheme in front of it — is also accepted,
+because some clients send it that way.</p>
+
+<div class="warn"><p><strong>The model listing needs a key too.</strong> <code>GET /v1/models</code>
+is authenticated on this relay. A client that fetches the model list before it has been given
+credentials will get <code>401</code>, not an empty list. Configure the key first, then discover
+models.</p></div>
+
+<h3>The two kinds of client key</h3>
+
+<p>A key has a <em>kind</em>, and the kind decides one thing: <strong>whose behalf this request is
+on</strong>. Everything else follows from that. Your operator will tell you which kind you hold.</p>
+
+<table>
+<thead><tr><th style="width:30%"></th><th style="width:35%"><code>company</code></th><th><code>private</code></th></tr></thead>
+<tbody>
+<tr><td>Who is behind the key</td><td>many end users</td><td>one holder</td></tr>
+<tr><td>Identity sent upstream</td><td>the one you send (see section 4)</td><td>the key's own identity</td></tr>
+<tr><td>If you send <code>user</code></td><td>used</td><td><strong>ignored</strong></td></tr>
+<tr><td>Usage broken down by</td><td>end user</td><td>key</td></tr>
+<tr><td>Output speed cap</td><td>may apply</td><td>never applies</td></tr>
+</tbody>
+</table>
+
+<p>A <strong>company</strong> key is a reseller key: each call carries its own end user, and that id
+is what isolates one customer's prompt cache from another's. A <strong>private</strong> key
+<em>is</em> one person, so anything you put in <code>user</code> is ignored and the key's own
+identity (a stable fingerprint, not the key itself) is used instead.</p>
+
+<!-- ==================================================================== -->
+<h2 id="s3">3. Making a request</h2>
+
+<p><code>POST /v1/chat/completions</code> takes the ordinary OpenAI request body. Two fields are
+required: <code>model</code> and <code>messages</code>.</p>
+
+<pre><code>curl -N https://&lt;your-relay-host&gt;/v1/chat/completions \
+  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: customer-42" \
+  -d '{
+    "model": "Wissangeni-512B-V1",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user",   "content": "Hello!"}
+    ],
+    "stream": true,
+    "temperature": 0.7,
+    "max_tokens": 512,
+    "user": "customer-42"
+  }'</code></pre>
+
+<h3>What the relay acts on, and what it forwards</h3>
+
+<p>Parameters the relay does not act on are forwarded to the backend untouched. Whether the second
+group has any effect therefore depends on the routed model, not on this relay.</p>
+
+<table>
+<thead><tr><th style="width:30%">Parameter</th><th style="width:13%">Handled by</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>model</code></td><td>relay</td><td><strong>Required.</strong> One of the ids from <code>/v1/models</code>, or one of that model's aliases. Matched exactly and case-sensitively. Mapped internally to the backend's own model name, which is never disclosed.</td></tr>
+<tr><td><code>messages</code></td><td>relay</td><td><strong>Required.</strong> A system prompt may be prepended, appended or merged into yours, depending on the model.</td></tr>
+<tr><td><code>stream</code></td><td>relay</td><td><code>true</code> returns SSE, <code>false</code> a single JSON body. Every model supports both.</td></tr>
+<tr><td><code>max_tokens</code><br><code>max_completion_tokens</code></td><td>relay</td><td>Clamped <em>down</em> to the model's ceiling, never refused for being too large. Whichever of the two field names you send is the one kept. Omit them and the model's ceiling is applied.</td></tr>
+<tr><td><code>stop</code></td><td>relay</td><td>Up to four entries, as OpenAI. The relay may add one of its own within that limit.</td></tr>
+<tr><td><code>user</code> / <code>user_id</code></td><td>relay</td><td>The prompt-cache isolation key. <strong>See section 4 — read it.</strong></td></tr>
+<tr><td><code>reasoning_effort</code></td><td>relay</td><td><code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>max</code>. Selects the system prompt and can move the price. Also read from <code>reasoning.effort</code>, <code>thinking.effort</code>, <code>extra_body.reasoning.effort</code>, the on/off switches <code>enable_thinking</code>, <code>reasoning.enabled</code>, <code>thinking.enabled</code>, <code>thinking.type: "disabled"</code>, and from a budget in <code>thinking.budget_tokens</code>, <code>reasoning.max_tokens</code> or <code>thinking_budget</code>.</td></tr>
+<tr><td><code>reasoning.exclude</code><br><code>include_reasoning</code></td><td>relay</td><td>Ask for the reasoning trace to be left out of the reply. Either can only <em>remove</em> a trace; neither can turn on one the model keeps to itself.</td></tr>
+<tr><td><code>stream_options</code></td><td>relay</td><td>Replaced by the relay's own. You never need <code>include_usage</code>: usage always arrives on the final chunk.</td></tr>
+<tr><td><code>usage</code>, <code>route</code>, <code>models</code>, <code>transforms</code>, <code>provider</code>, <code>plugins</code>, <code>preset</code></td><td>relay</td><td>OpenRouter's routing vocabulary. Accepted so a client that always sends them is not rejected, then dropped — routing is already settled by the time the body is built, and a strict backend answers 400 to fields it does not recognise.</td></tr>
+<tr><td><code>temperature</code>, <code>top_p</code>, <code>top_k</code>, <code>presence_penalty</code>, <code>frequency_penalty</code>, <code>repetition_penalty</code>, <code>min_p</code>, <code>seed</code>, <code>logit_bias</code>, <code>logprobs</code>, <code>top_logprobs</code></td><td>backend</td><td>Forwarded as sent.</td></tr>
+<tr><td><code>response_format</code>, <code>tools</code>, <code>tool_choice</code></td><td>backend</td><td>Forwarded as sent. Whether JSON mode or tool calling works is the backend model's business.</td></tr>
+</tbody>
+</table>
+
+<div class="note"><p><strong>Check <code>supported_parameters</code> before you rely on a
+parameter.</strong> Each model's entry in <code>/v1/models</code> lists exactly what it accepts, and
+that list is derived from the live configuration — a parameter an operator has configured the relay
+to drop disappears from it. Sending something that is not listed is not an error; it simply has no
+effect.</p></div>
+
+<h3>Requests to /v1/completions and /v1/embeddings</h3>
+
+<p><code>/v1/completions</code> takes the legacy body and goes through the same routing, the same
+quotas and the same accounting as chat. <code>/v1/embeddings</code> takes <code>model</code> plus
+<code>input</code> (a string or an array of strings) and returns the provider's embedding response
+with one change: <code>model</code> in the response is rewritten back to the public id you asked for.
+There is no streaming and no reshaping on that path.</p>
+
+<!-- ==================================================================== -->
+<h2 id="s4">4. User ID and KV-cache isolation</h2>
+
+<p><strong>Send a stable, opaque identifier for your end user on every request.</strong> This is the
+single most important thing to get right in an integration, and it is worth a section of its own.</p>
+
+<h3>Why: KV-cache isolation</h3>
+
+<p>The backends behind this relay cache the attention keys and values computed for a prompt prefix
+(the KV cache) and key that cache <em>per user</em>. The user id you send is what partitions it.</p>
+
+<ul>
+  <li><strong>Correctness.</strong> Without an id, every caller behind one API key lands in the same
+      cache partition. One tenant's prompt prefix becomes reusable by another tenant's request —
+      exactly the leak the id exists to prevent.</li>
+  <li><strong>Cost and latency.</strong> A cache hit is billed at the cache-read rate, which is a
+      fraction of the fresh-input rate, and it removes most of the time-to-first-token on a long
+      system prompt. A user id that changes between requests destroys every hit; a stable one keeps
+      them.</li>
+</ul>
+
+<h3>Where to put it</h3>
+
+<p>Two places, and the body wins over the headers:</p>
+
+<table>
+<thead><tr><th style="width:22%">Where</th><th style="width:38%">Field / header</th><th>Precedence</th></tr></thead>
+<tbody>
+<tr><td>Request body</td><td><code>user</code></td><td>1 — checked first</td></tr>
+<tr><td>Request body</td><td><code>user_id</code></td><td>2 — used when <code>user</code> is absent or blank</td></tr>
+<tr><td>Header</td><td><code>X-User-Id</code></td><td>3</td></tr>
+<tr><td>Header</td><td><code>X-User</code></td><td>4</td></tr>
+<tr><td>Header</td><td><code>X-OpenAI-User</code></td><td>5</td></tr>
+<tr><td>Header</td><td><code>X-KV-User</code></td><td>6</td></tr>
+</tbody>
+</table>
+
+<p>The first of those that carries a non-empty value (after trimming whitespace) wins. Using the body
+field <code>user</code> is recommended: every OpenAI SDK already exposes it, so nothing custom is
+needed.</p>
+
+<pre><code>// OpenAI SDK, any language — the standard field is enough
+{
+  "model": "Wissangeni-512B-V1",
+  "messages": [ ... ],
+  "user": "tenant-42:user-9f3c1ab7"
+}</code></pre>
+
+<pre><code># Or as a header, for clients that cannot add a body field
+X-User-Id: tenant-42:user-9f3c1ab7</code></pre>
+
+<h3>What we do with it</h3>
+
+<p>Whichever way it arrives, the same string is recorded on the request row, written to the log line,
+and <strong>forwarded to the backend in three places at once</strong> so that no backend spelling is
+missed:</p>
+
+<table>
+<thead><tr><th style="width:28%">Sent upstream as</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Header <code>X-User-Id</code></td><td>The header name is configurable per backend; <code>x-user-id</code> is the default. Header values must be ASCII, so an id that is not ASCII is simply not sent as a header — the body fields below still carry it.</td></tr>
+<tr><td>Body <code>user</code></td><td>OpenAI's spelling.</td></tr>
+<tr><td>Body <code>user_id</code></td><td>The second spelling, because backends disagree on which one they read. A backend reading only the one we did not send would pool every caller behind this relay into a single cache — which is the whole failure mode.</td></tr>
+</tbody>
+</table>
+
+<p>If you send nothing, that is allowed: the request is recorded with an empty user, and
+<code>user</code> and <code>user_id</code> are <em>removed</em> from the body before it goes upstream
+rather than being left at whatever unusable value arrived. Cache isolation is then whatever the
+backend does by default, which is to say: none of your own.</p>
+
+<h3>Rules for choosing the value</h3>
+
+<ul>
+  <li><strong>Stable.</strong> The same end user must get the same string on every request, across
+      sessions and across process restarts. This is what makes the cache hit.</li>
+  <li><strong>Unique per end user.</strong> Two different people must never share one id, or they
+      share a cache partition.</li>
+  <li><strong>Opaque.</strong> Send a pseudonymous identifier — a hash, a UUID, an internal account
+      id. <strong>Do not send an email address, a phone number, a username or a real name.</strong>
+      The id travels to a third-party backend and lands in its logs.</li>
+  <li><strong>Short.</strong> The recorded value is truncated at 120 characters. Keep it well
+      under that.</li>
+  <li><strong>ASCII.</strong> Non-ASCII ids still work but cannot ride in the header, so the backend
+      only sees them in the body.</li>
+</ul>
+
+<div class="note"><p><strong>Private keys:</strong> if you hold a <code>private</code> key, none of
+the above applies — whatever you send is ignored, and the key's own stable fingerprint is what
+travels upstream and what your usage is filed under. You cannot land in another holder's cache
+partition, and nobody can land in yours.</p></div>
+
+<div class="note"><p><strong>Cache retention</strong> is the backend's to state, not this relay's.
+Nothing about your prompt is stored here beyond a truncated preview on the operator's own Requests
+screen. If you need a retention figure in writing, ask the operator to obtain it from the upstream
+provider.</p></div>
+
+<!-- ==================================================================== -->
+<h2 id="s5">5. The response we send back</h2>
+
+<p>Nothing the backend says about itself reaches you. Every reply is <strong>rebuilt</strong> from an
+envelope the relay owns — its own id, its own timestamp, its own model name — and only a named
+handful of fields are copied across. The backend's model name, host, request id and error wording
+never appear in any response.</p>
+
+<h3>Non-streaming body</h3>
+
+<pre class="long"><code>{
+  "id": "32dadfde-f3dd-4ad8-acc5-387b72415f46",
+  "object": "chat.completion",
+  "created": 1789936200,
+  "model": "Wissangeni-512B-V1",
+  "provider": "zeikoai",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I help you today?",
+        "reasoning_content": "The user greeted me...",
+        "tool_calls": []
+      },
+      "finish_reason": "stop",
+      "native_finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 256,
+    "total_tokens": 274,
+    "prompt_tokens_details":     { "cached_tokens": 12 },
+    "completion_tokens_details": { "reasoning_tokens": 64 },
+    "usage": 0.102949871,
+    "cost":  0.102949871
+  }
+}</code></pre>
+
+<table>
+<thead><tr><th style="width:34%">Field</th><th style="width:13%">Type</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>A UUIDv4 minted by this relay when the request arrived. Unrelated to any id the backend used. It is the same value as the <code>X-Relay-Request-Id</code> response header and the same value on every frame of a stream. <strong>Quote it in any support request</strong> — the operator can pull the exact row.</td></tr>
+<tr><td><code>object</code></td><td>string</td><td><code>"chat.completion"</code>, or <code>"chat.completion.chunk"</code> on a stream frame.</td></tr>
+<tr><td><code>created</code></td><td>integer</td><td>Unix seconds, stamped by the relay when the request arrived.</td></tr>
+<tr><td><code>model</code></td><td>string</td><td>Always the public id you asked for, never the backend's own name.</td></tr>
+<tr><td><code>provider</code></td><td>string</td><td>The relay's provider slug. Present unless the operator blanked it.</td></tr>
+<tr><td><code>choices[].index</code></td><td>integer</td><td>Choice index, <code>0</code> for a single completion.</td></tr>
+<tr><td><code>choices[].message.role</code></td><td>string</td><td>Always <code>"assistant"</code>.</td></tr>
+<tr><td><code>choices[].message.content</code></td><td>string</td><td>The answer. May carry a configured prefix or suffix, and text rewrite rules may have been applied.</td></tr>
+<tr><td><code>choices[].message.reasoning_content</code></td><td>string</td><td>The thinking trace, when the model exposes one and the route passes it through. Depending on how the route is configured it may instead appear as <code>reasoning</code>, be folded into <code>content</code> between tags, or be stripped entirely. Absent when empty.</td></tr>
+<tr><td><code>choices[].message.tool_calls</code></td><td>array</td><td>Assembled tool calls, each <code>{id, type:"function", function:{name, arguments}}</code>. Absent when there are none.</td></tr>
+<tr><td><code>choices[].finish_reason</code></td><td>string</td><td><code>stop</code>, <code>length</code>, <code>tool_calls</code>, etc.</td></tr>
+<tr><td><code>choices[].native_finish_reason</code></td><td>string</td><td>The same value under OpenRouter's spelling, for clients that read it.</td></tr>
+</tbody>
+</table>
+
+<h3>The usage block — the fields to bill from</h3>
+
+<p><code>prompt_tokens</code> is counted by <strong>this relay's own tokenizer over your own
+messages</strong>, measured before anything was injected. A system prompt the relay adds on your
+behalf is not charged to you, so the figure matches what you actually sent.</p>
+
+<table>
+<thead><tr><th style="width:42%">Field</th><th style="width:12%">Type</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>usage.prompt_tokens</code></td><td>integer</td><td>Input tokens, over your own messages only.</td></tr>
+<tr><td><code>usage.completion_tokens</code></td><td>integer</td><td>Output tokens, reasoning tokens included.</td></tr>
+<tr><td><code>usage.total_tokens</code></td><td>integer</td><td>The two above, added.</td></tr>
+<tr><td><code>usage.prompt_tokens_details.cached_tokens</code></td><td>integer</td><td>The cache-hit portion of the input. Never larger than <code>prompt_tokens</code>. <strong>Absent when zero</strong> — this is your signal that user-id isolation is working.</td></tr>
+<tr><td><code>usage.completion_tokens_details.reasoning_tokens</code></td><td>integer</td><td>The reasoning portion of the output. Absent when zero.</td></tr>
+<tr><td><code>usage.usage</code></td><td>number</td><td>What this request cost, in USD, to nine decimal places. Absent only for a model nobody has priced at all — never <code>0</code> to mean "free".</td></tr>
+<tr><td><code>usage.cost</code></td><td>number</td><td>The same number under OpenRouter's spelling. It is never a second, different price.</td></tr>
+</tbody>
+</table>
+
+<div class="note"><p>Nine decimal places is deliberate. A short request at a tenth of a dollar per
+million tokens comes to a few millionths of a cent; rounding to six places would report every small
+request as free. Parse it as a decimal, not as a float, if you are reconciling invoices.</p></div>
+
+<h3>Response headers</h3>
+
+<table>
+<thead><tr><th style="width:32%">Header</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>X-Relay-Request-Id</code></td><td>The same UUIDv4 as <code>id</code> in the body. Present on both streaming and non-streaming replies. Log it.</td></tr>
+<tr><td><code>Content-Type</code></td><td><code>application/json</code>, or <code>text/event-stream; charset=utf-8</code> when streaming.</td></tr>
+<tr><td><code>Retry-After</code></td><td>Seconds to wait. Sent with <code>429</code> (per-minute limit) and <code>503</code> (overloaded).</td></tr>
+<tr><td><code>Access-Control-Allow-Origin</code></td><td>Per the relay's CORS policy, when the origin is allowed.</td></tr>
+</tbody>
+</table>
+
+<!-- ==================================================================== -->
+<h2 id="s6">6. Streaming (SSE)</h2>
+
+<p>Send <code>"stream": true</code> and the response is <code>text/event-stream</code>: one
+<code>data:</code> frame per chunk, then a final frame carrying usage, then <code>[DONE]</code>.</p>
+
+<h3>Response headers on a stream</h3>
+
+<pre><code>content-type:      text/event-stream; charset=utf-8
+cache-control:     no-cache, no-transform
+connection:        keep-alive
+x-accel-buffering: no
+x-relay-request-id: 32dadfde-f3dd-4ad8-acc5-387b72415f46</code></pre>
+
+<h3>The frame sequence</h3>
+
+<pre class="long"><code>data: {"id":"32dadfde…","object":"chat.completion.chunk","created":1789936200,
+       "model":"Wissangeni-512B-V1","provider":"zeikoai",
+       "choices":[{"index":0,"delta":{"role":"assistant"},
+                   "finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"32dadfde…","object":"chat.completion.chunk","created":1789936200,
+       "model":"Wissangeni-512B-V1","provider":"zeikoai",
+       "choices":[{"index":0,"delta":{"content":"Hel"},
+                   "finish_reason":null,"native_finish_reason":null}]}
+
+: Zeiko is still here, Just be patience
+
+data: {"id":"32dadfde…","object":"chat.completion.chunk","created":1789936200,
+       "model":"Wissangeni-512B-V1","provider":"zeikoai",
+       "choices":[{"index":0,"delta":{"content":"lo!"},
+                   "finish_reason":"stop","native_finish_reason":"stop"}]}
+
+data: {"id":"32dadfde…","object":"chat.completion.chunk","created":1789936200,
+       "model":"Wissangeni-512B-V1","provider":"zeikoai",
+       "choices":[],
+       "usage":{"prompt_tokens":18,"completion_tokens":256,"total_tokens":274,
+                "usage":0.010293,"cost":0.010293}}
+
+data: [DONE]</code></pre>
+
+<p class="meta">(Frames are shown wrapped for print. On the wire each <code>data:</code> payload is a
+single line, and every frame is terminated by a blank line.)</p>
+
+<h3>What a client must handle</h3>
+
+<table>
+<thead><tr><th style="width:28%">Frame</th><th>Rule</th></tr></thead>
+<tbody>
+<tr><td><strong>First frame</strong></td><td>Carries <code>delta.role: "assistant"</code> and usually no content. Do not assume it has text.</td></tr>
+<tr><td><strong>Content frames</strong></td><td><code>delta.content</code> is a string fragment. Concatenate in arrival order. A reasoning trace, when the route passes one through, arrives as <code>delta.reasoning_content</code> or <code>delta.reasoning</code> alongside — or folded into <code>content</code> between tags, depending on the route's configuration.</td></tr>
+<tr><td><strong>Tool calls</strong></td><td><code>delta.tool_calls</code> arrives as partial fragments keyed by <code>index</code>, in the usual OpenAI way: accumulate <code>function.arguments</code> across frames before parsing.</td></tr>
+<tr><td><strong>Comment lines</strong></td><td>A line beginning with <code>:</code> is an SSE comment — a keep-alive, sent after roughly 15 seconds of backend silence (the operator can change the interval and the text, or switch it off). <strong>Discard it.</strong> A compliant SSE parser already does; a hand-rolled one that does <code>line.startswith("data: ")</code> is also fine. Never try to JSON-parse it. It exists to hold the connection open through tunnels and NATs, and it is the relay's own — the backend's keep-alives are parsed and dropped here, never forwarded.</td></tr>
+<tr><td><strong>Final usage frame</strong></td><td>Has an <strong>empty <code>choices</code> array</strong> and carries <code>usage</code>. It arrives whether or not you sent <code>stream_options.include_usage</code>. A client that assumes <code>choices[0]</code> exists on every frame will crash here — guard it.</td></tr>
+<tr><td><strong>Error frame</strong></td><td>If the backend fails part-way through, a frame carrying <code>{"error":{"message":…,"type":"upstream_error"}}</code> is emitted before <code>[DONE]</code>, so a stream that has already started never just ends in silence. The HTTP status stays <code>200</code>: it was already sent.</td></tr>
+<tr><td><code>data: [DONE]</code></td><td>The terminator. Always last, and not JSON.</td></tr>
+</tbody>
+</table>
+
+<h3>Guarantees and gotchas</h3>
+
+<ul>
+  <li><code>id</code>, <code>created</code>, <code>model</code> and <code>provider</code> are
+      identical on every frame of one response.</li>
+  <li>Frames may be split across TCP reads. Buffer until a blank line before parsing, and accept
+      both <code>\n\n</code> and <code>\r\n\r\n</code> as the separator.</li>
+  <li>Multi-byte characters are reassembled by the relay, so a UTF-8 character is never split across
+      two frames' <code>delta.content</code>.</li>
+  <li>Output may be <strong>paced</strong>: a company key's stream can be held to a configured
+      tokens-per-second ceiling, so a slow stream is not necessarily a slow model. Private keys are
+      never paced.</li>
+  <li>Use <code>curl -N</code>, and turn off response buffering in your HTTP client. The relay sends
+      <code>x-accel-buffering: no</code> so nginx and cloudflared do not buffer; an intermediary you
+      control might still.</li>
+  <li>Set your client timeout above the backend timeout (default 10 minutes) — with keep-alives on,
+      an idle-read timeout will not fire spuriously, but a total-request timeout can.</li>
+  <li>If you disconnect mid-stream the relay stops and records the request as cancelled. You are
+      still accounted for what was generated up to that point.</li>
+</ul>
+
+<!-- ==================================================================== -->
+<h2 id="s7">7. Listing models: /v1/models and /models</h2>
+
+<p>Both paths return the identical document. <code>/v1/models/{id}</code> and
+<code>/models/{id}</code> return a single entry from it.</p>
+
+<pre><code>curl https://&lt;your-relay-host&gt;/v1/models \
+  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</code></pre>
+
+<h3>What you need to know before you call it</h3>
+
+<ol>
+  <li><strong>It requires a client key.</strong> Unauthenticated, it answers <code>401</code> with
+      <code>invalid_api_key</code>. Several tools fetch the model list at startup before credentials
+      are configured; that is the usual cause of a mysterious 401 on an otherwise working setup.</li>
+  <li><strong>Only enabled models appear.</strong> A model absent from the list is switched off, not
+      broken. The list reflects the live configuration and can change without warning when the
+      operator edits it — re-fetch periodically rather than caching it for the life of a process.</li>
+  <li><strong>The ids in it are the only values <code>model</code> accepts</strong> — plus each
+      model's aliases, which are <em>not</em> published in the listing. Matching is exact and
+      case-sensitive.</li>
+  <li><strong><code>/v1/models/{id}</code> matches the listed <code>id</code> only.</strong> An alias
+      that works fine in a chat request returns <code>404</code> here. Ids containing a slash
+      (<code>vendor/name</code>) work as written — the path accepts the whole remainder.</li>
+  <li><strong>The backend's real model name is never in the document</strong>, anywhere, at any
+      nesting level. Do not try to infer it; route on the public id.</li>
+  <li><strong>Prices are decimal strings in USD per single token</strong> — not per million, and not
+      JSON numbers. <code>"0.000000003"</code> loses its last digits through a float, so parse it as
+      a decimal if you are reconciling a bill.</li>
+  <li><strong>A missing <code>pricing</code> object means nobody priced that model</strong>, not that
+      it is free. A price that was never set is published as nothing rather than as zero.</li>
+</ol>
+
+<h3>The document shape</h3>
+
+<p>OpenAI's envelope on the outside, so an unmodified OpenAI client unwraps it; OpenRouter's model
+document on the inside, so a client that wants to know what a model costs and accepts can read it
+without asking anyone.</p>
+
+<pre class="long"><code>{
+  "object": "list",
+  "data": [
+    {
+      "id": "Wissangeni-512B-V1",
+      "canonical_slug": "Wissangeni-512B-V1",
+      "hugging_face_id": null,
+      "name": "Wissangeni 512B V1",
+      "created": 1789900000,
+      "description": "A sparse mixture-of-experts model.",
+      "context_length": 128000,
+      "architecture": {
+        "modality": "text-&gt;text",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "tokenizer": "o200k_base",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.00000015",
+        "completion": "0.0000006",
+        "input_cache_read": "0.000000003",
+        "internal_reasoning": "0.0000006",
+        "request": "0",
+        "overrides": [
+          { "utc_days": ["monday","friday"], "utc_start": 100, "utc_end": 400,
+            "prompt": "0.0000003", "completion": "0.0000012",
+            "input_cache_read": "0.000000006" }
+        ]
+      },
+      "top_provider": {
+        "context_length": 128000,
+        "max_completion_tokens": 8192,
+        "is_moderated": false
+      },
+      "per_request_limits": null,
+      "supported_parameters": ["frequency_penalty","max_tokens","reasoning",
+                               "reasoning_effort","response_format","seed","stop",
+                               "temperature","tool_choice","tools","top_p", "…"],
+      "default_parameters": { "temperature": 0.7 },
+      "supported_voices": null,
+      "knowledge_cutoff": null,
+      "expiration_date": null,
+      "links": {},
+      "reasoning": {
+        "mandatory": false,
+        "default_enabled": true,
+        "supported_efforts": ["max","high","medium","low","none"],
+        "default_effort": "high"
+      },
+      "object": "model",
+      "owned_by": "ZeikoAI",
+      "display_name": "Wissangeni 512B V1"
+    }
+  ]
+}</code></pre>
+
+<h3>Field reference</h3>
+
+<table>
+<thead><tr><th style="width:30%">Field</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>id</code></td><td>The value to put in <code>model</code>. The one identifier that matters.</td></tr>
+<tr><td><code>canonical_slug</code></td><td>The dated name of this exact snapshot, beside the moving <code>id</code>. Pin this one to pin a behaviour.</td></tr>
+<tr><td><code>name</code> / <code>display_name</code></td><td>Human-readable label. Falls back to <code>id</code>.</td></tr>
+<tr><td><code>created</code></td><td>Unix seconds.</td></tr>
+<tr><td><code>context_length</code></td><td>Total context window in tokens. A prompt over the model's input ceiling is <em>refused</em> with <code>413</code>, not truncated.</td></tr>
+<tr><td><code>architecture.modality</code></td><td><code>"text-&gt;text"</code> and similar, built from the two modality arrays beside it.</td></tr>
+<tr><td><code>architecture.tokenizer</code></td><td>The tokenizer family the relay counts this model with — the same one that produces <code>usage.prompt_tokens</code>. Use it if you want to pre-count locally.</td></tr>
+<tr><td><code>pricing.prompt</code></td><td>Fresh input, USD per token, as a decimal string.</td></tr>
+<tr><td><code>pricing.completion</code></td><td>Output, USD per token.</td></tr>
+<tr><td><code>pricing.input_cache_read</code></td><td>Cache-hit input. Absent means a cache hit is <strong>not</strong> discounted, not that it is free.</td></tr>
+<tr><td><code>pricing.input_cache_write</code></td><td>Cache write, when the provider charges for one.</td></tr>
+<tr><td><code>pricing.internal_reasoning</code></td><td>Reasoning tokens. Absent means they are billed at the output rate.</td></tr>
+<tr><td><code>pricing.request</code></td><td>A flat per-request amount, when there is one.</td></tr>
+<tr><td><code>pricing.overrides[]</code></td><td><strong>Time-of-day pricing.</strong> Each entry has optional <code>utc_days</code> (lowercase weekday names) and optional <code>utc_start</code>/<code>utc_end</code> as <code>HHMM</code> integers in UTC — <code>100</code> is 01:00, <code>1430</code> is 14:30. The window is half-open: start inclusive, end exclusive, and a window whose end is before its start wraps midnight. No times means all day. <strong>Every override publishes a complete price</strong>, not just the fields it moved, so you never have to walk back up the list.</td></tr>
+<tr><td><code>top_provider.max_completion_tokens</code></td><td>The output ceiling. A larger <code>max_tokens</code> is clamped to this, not refused.</td></tr>
+<tr><td><code>per_request_limits</code></td><td>Always <code>null</code> here.</td></tr>
+<tr><td><code>supported_parameters</code></td><td>Derived from the live configuration, sorted, deduplicated. A parameter the relay is configured to drop is not advertised.</td></tr>
+<tr><td><code>default_parameters</code></td><td>Defaults the relay applies when you do not send them. You can override any of these.</td></tr>
+<tr><td><code>reasoning</code></td><td>Present <strong>only on models that reason</strong>. <code>supported_efforts</code> is the menu <code>reasoning_effort</code> accepts; <code>default_effort</code> is what you get by naming none. Its absence is how you detect a non-reasoning model.</td></tr>
+<tr><td><code>owned_by</code></td><td>The relay's own owner label, never the upstream vendor.</td></tr>
+<tr><td><code>hugging_face_id</code>, <code>knowledge_cutoff</code>, <code>expiration_date</code>, <code>supported_voices</code></td><td><code>null</code> unless the operator filled them in.</td></tr>
+</tbody>
+</table>
+
+<h3>Reconciling a bill from the listing</h3>
+
+<p>The listing is a promise, and it is kept: the <code>usage.usage</code> figure on a response is the
+published rates multiplied by the token counts on the same response. Cached input is carved out of
+<code>prompt_tokens</code> and reasoning out of <code>completion_tokens</code>, so nothing is counted
+twice:</p>
+
+<pre><code>cost = (prompt_tokens - cached_tokens)         * pricing.prompt
+     +  cached_tokens                          * pricing.input_cache_read
+     + (completion_tokens - reasoning_tokens)  * pricing.completion
+     +  reasoning_tokens                       * pricing.internal_reasoning
+     +  pricing.request</code></pre>
+
+<p>Use the <code>overrides</code> entry that covers the UTC moment the request ran, if any, and the
+standing rates otherwise.</p>
+
+<div class="note"><p><strong><code>/provider/models</code></strong> is a separate document, meant for
+an aggregator polling this relay as an upstream provider. It is off by default and may require its
+own token. It is not part of the OpenAI surface — do not point a client at it.</p></div>
+
+<!-- ==================================================================== -->
+<h2 id="s8">8. Errors</h2>
+
+<p>Failures come back in the OpenAI error shape, with the HTTP status matching.</p>
+
+<pre><code>{
+  "error": {
+    "message": "model \"gpt-9\" is not available on this relay",
+    "type": "invalid_request_error",
+    "code": "model_not_found"
+  }
+}</code></pre>
+
+<table>
+<thead><tr><th style="width:11%">Status</th><th style="width:26%">code</th><th>When</th></tr></thead>
+<tbody>
+<tr><td><code>400</code></td><td>—</td><td>Malformed JSON, a missing or empty <code>model</code> field, or a body this model will not accept.</td></tr>
+<tr><td><code>401</code></td><td><code>invalid_api_key</code></td><td>Missing or unknown client key. Also what an unauthenticated <code>GET /v1/models</code> gets.</td></tr>
+<tr><td><code>403</code></td><td><code>invalid_api_key</code></td><td>The key is disabled.</td></tr>
+<tr><td><code>403</code></td><td><code>model_forbidden</code></td><td>The key exists but is not allowed that model.</td></tr>
+<tr><td><code>403</code></td><td><code>forbidden</code></td><td>The calling IP is blocked.</td></tr>
+<tr><td><code>404</code></td><td><code>model_not_found</code></td><td>Unknown model id — or a known alias asked for at <code>/v1/models/{id}</code>.</td></tr>
+<tr><td><code>404</code></td><td><code>not_found</code></td><td>No route for that path.</td></tr>
+<tr><td><code>413</code></td><td><code>too_large</code></td><td>The body is over the size limit, or the prompt is over the model's input ceiling. The message says which.</td></tr>
+<tr><td><code>429</code></td><td><code>rate_limit_exceeded</code></td><td>A per-minute rate limit or a daily request/token quota is spent. The per-minute refusal carries <code>Retry-After</code>.</td></tr>
+<tr><td><code>499</code></td><td>—</td><td>Recorded, not sent: you disconnected before the answer finished.</td></tr>
+<tr><td><code>502</code></td><td><code>upstream_unavailable</code></td><td>The model could not answer. Retry with backoff; if it persists, tell the operator and quote <code>X-Relay-Request-Id</code>.</td></tr>
+<tr><td><code>503</code></td><td><code>overloaded</code></td><td>Too many requests in flight and the queue is full or timed out. Carries <code>Retry-After</code>.</td></tr>
+<tr><td><code>504</code></td><td><code>timeout</code></td><td>The model took too long to answer.</td></tr>
+</tbody>
+</table>
+
+<div class="note"><p><strong>An upstream failure is reported as this relay's failure, on purpose.</strong>
+The status is mapped by class and the wording is ours: no upstream name, host, model or error text
+ever reaches a caller. In particular, an upstream rejection of <em>the relay's own</em> credentials
+comes back as <code>502</code>, never as <code>401</code> — because your key was fine, and telling
+you otherwise would send you debugging the wrong thing.</p></div>
+
+<h3>Retry policy we recommend</h3>
+
+<ul>
+  <li><code>429</code> and <code>503</code>: honour <code>Retry-After</code> when present, otherwise
+      exponential backoff from ~1 s.</li>
+  <li><code>502</code> and <code>504</code>: retry up to two or three times with backoff. The relay
+      already retries transient upstream failures and falls through to fallback backends before it
+      gives up, so a 502 that reaches you has already been tried more than once.</li>
+  <li><code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>, <code>413</code>: do
+      not retry. Fix the request or the credentials.</li>
+</ul>
+
+<!-- ==================================================================== -->
+<h2 id="s9">9. Limits and operational notes</h2>
+
+<p>Exact values are per-relay and per-key; ask your operator for yours. The defaults are listed so
+you know what shape of limit to expect.</p>
+
+<table>
+<thead><tr><th style="width:28%">Limit</th><th style="width:22%">Default</th><th>Behaviour when exceeded</th></tr></thead>
+<tbody>
+<tr><td>Request body size</td><td>20 MB</td><td><code>413</code> before the body is read.</td></tr>
+<tr><td>Requests in flight</td><td>512</td><td>Past this, requests queue rather than fail.</td></tr>
+<tr><td>Queue</td><td>2048 waiting, 30 s wait</td><td>A full or timed-out queue answers <code>503</code> with <code>Retry-After</code>, rather than holding you for a slot you will not reach.</td></tr>
+<tr><td>Requests per minute</td><td>per key</td><td><code>429</code> with <code>Retry-After</code>.</td></tr>
+<tr><td>Requests per day</td><td>per key</td><td><code>429</code>. Resets on the relay's local calendar day.</td></tr>
+<tr><td>Tokens per day</td><td>per key</td><td><code>429</code>. Input and output counted together.</td></tr>
+<tr><td>Max input tokens</td><td>per model</td><td><code>413</code>. The prompt is refused, never truncated.</td></tr>
+<tr><td>Max output tokens</td><td>per model</td><td>A larger <code>max_tokens</code> is clamped down, not refused.</td></tr>
+<tr><td>Upstream timeout</td><td>10 minutes</td><td><code>504</code>. Set your own client timeout above this.</td></tr>
+<tr><td>Output rate</td><td>per model, per key kind</td><td>A company key's stream may be paced to a tokens-per-second ceiling. Private keys are never paced.</td></tr>
+</tbody>
+</table>
+
+<p>There is no message-count limit of its own: a conversation is bounded by the model's context
+length and by the body size above. CORS is configured per relay; preflight is answered on every
+public path.</p>
+
+<!-- ==================================================================== -->
+<h2 id="s10">10. Copy-paste examples</h2>
+
+<h3>Streaming, curl</h3>
+<pre><code>curl -N https://&lt;your-relay-host&gt;/v1/chat/completions \
+  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: tenant-42:user-9f3c1ab7" \
+  -d '{
+    "model": "Wissangeni-512B-V1",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'</code></pre>
+
+<h3>Non-streaming, OpenAI Python SDK</h3>
+<pre class="long"><code>from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://&lt;your-relay-host&gt;/v1",
+    api_key="Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+)
+
+reply = client.chat.completions.create(
+    model="Wissangeni-512B-V1",
+    messages=[{"role": "user", "content": "Hello!"}],
+    user="tenant-42:user-9f3c1ab7",   # KV-cache isolation — send it every time
+)
+
+print(reply.id)                        # == the X-Relay-Request-Id header
+print(reply.choices[0].message.content)
+print(reply.usage.prompt_tokens, reply.usage.completion_tokens)
+print(reply.usage.model_extra.get("cost"))</code></pre>
+
+<h3>Streaming, OpenAI Python SDK</h3>
+<pre class="long"><code>stream = client.chat.completions.create(
+    model="Wissangeni-512B-V1",
+    messages=[{"role": "user", "content": "Write a haiku."}],
+    user="tenant-42:user-9f3c1ab7",
+    stream=True,
+)
+
+usage = None
+for chunk in stream:
+    if chunk.usage is not None:       # the final frame: choices is empty here
+        usage = chunk.usage
+        continue
+    if not chunk.choices:             # guard — do not assume choices[0] exists
+        continue
+    piece = chunk.choices[0].delta.content
+    if piece:
+        print(piece, end="", flush=True)
+
+print("\n", usage)</code></pre>
+
+<h3>Streaming, Node with fetch</h3>
+<pre class="long"><code>const res = await fetch("https://&lt;your-relay-host&gt;/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "Content-Type": "application/json",
+    "X-User-Id": "tenant-42:user-9f3c1ab7",
+  },
+  body: JSON.stringify({
+    model: "Wissangeni-512B-V1",
+    messages: [{ role: "user", content: "Hello!" }],
+    stream: true,
+  }),
+});
+
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let buf = "";
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buf += decoder.decode(value, { stream: true });
+
+  // Frames are separated by a blank line; tolerate CRLF from proxies.
+  let m;
+  while ((m = /\r?\n\r?\n/.exec(buf)) !== null) {
+    const frame = buf.slice(0, m.index);
+    buf = buf.slice(m.index + m[0].length);
+
+    for (const line of frame.split(/\r?\n/)) {
+      if (line.startsWith(":")) continue;          // keep-alive comment
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") continue;             // terminator, not JSON
+
+      const json = JSON.parse(data);
+      if (json.error) { console.error(json.error.message); continue; }
+      if (json.usage) { console.log("\ncost:", json.usage.cost); }
+      const piece = json.choices?.[0]?.delta?.content;
+      if (piece) process.stdout.write(piece);
+    }
+  }
+}</code></pre>
+
+<h3>Listing models</h3>
+<pre><code>curl https://&lt;your-relay-host&gt;/v1/models \
+  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+curl https://&lt;your-relay-host&gt;/v1/models/Wissangeni-512B-V1 \
+  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</code></pre>
+
+<div class="note" style="margin-top:8mm;">
+<p><strong>Getting help.</strong> Every request has a UUIDv4 that appears as <code>id</code> in the
+body and as the <code>X-Relay-Request-Id</code> response header. Log it. A support question that
+quotes one can be traced to the exact request row — timing, token counts, the backend that served
+it and what it cost. A question without one usually cannot.</p>
+</div>
+
+</body>
+</html>

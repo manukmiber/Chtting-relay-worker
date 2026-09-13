@@ -810,6 +810,25 @@ Nilai key tidak pernah ikut: contohnya memakai placeholder
 `Kunci-Zeiko-XXXX…`, jadi dokumen itu aman dikirim, dan key asli dikirim
 terpisah lewat jalur yang kamu percaya.
 
+### PDF siap kirim
+
+`docs/API-Documentation.pdf` adalah versi cetak dari dokumen yang sama, 17
+halaman, isinya: cara request, **di mana `user_id` ditaruh dan bagaimana dia
+diteruskan ke backend untuk isolasi KV cache**, bentuk respons yang kita
+kirimkan beserta blok `usage`, alur frame SSE lengkap dengan keep-alive dan
+frame penutup, dan apa yang perlu diketahui sebelum memanggil `/v1/models`
+atau `/models`. Angkanya memakai default yang dikirim bersama relay, jadi untuk
+relay yang harga atau kuotanya sudah diubah, tab **API Docs** tetap yang paling
+akurat.
+
+Sumbernya `docs/api-documentation.html`. Edit di situ, lalu bangun ulang:
+
+```bash
+pip install weasyprint
+python3 -c "from weasyprint import HTML; \
+  HTML('docs/api-documentation.html').write_pdf('docs/API-Documentation.pdf')"
+```
+
 ---
 
 ## 8. Cloudflare Tunnel
