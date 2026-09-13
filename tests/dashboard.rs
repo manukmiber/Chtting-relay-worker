@@ -835,3 +835,232 @@ async fn the_setup_routes_are_behind_the_password_like_everything_else() {
     d.post("/api/login", json!({"password": "hunter2"})).await;
     assert_eq!(d.get("/api/setup").await.status(), 200);
 }
+
+/* --------------------------------------------------- the origin guard -- */
+
+/// Loopback is not a boundary on a phone. A page on another site cannot read
+/// the answer, but nothing stops it *sending* the request — and turning the key
+/// requirement off, or adding a backend, needs no answer to be useful.
+#[tokio::test]
+async fn a_request_from_another_origin_is_refused() {
+    let d = Dash::start(|_| {}).await;
+
+    // The dashboard's own page: same origin, and it works.
+    let same = d
+        .client
+        .get(d.url("/api/state"))
+        .header("origin", format!("http://{}", d.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same.status(), 200);
+
+    for hostile in [
+        "https://evil.example.com",
+        "http://evil.example.com:8788",
+        "null",
+    ] {
+        let refused = d
+            .client
+            .post(d.url("/api/config"))
+            .header("origin", hostile)
+            .json(&json!({"security": {"requireClientKey": false}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            403,
+            "a request from {hostile} must not be served",
+        );
+    }
+
+    // And the setting really did not change.
+    let cfg = d.get_json("/api/config").await;
+    assert_eq!(cfg["security"]["requireClientKey"], true);
+}
+
+/// A name that resolves to 127.0.0.1 today can resolve elsewhere tomorrow,
+/// which is how DNS rebinding turns a browser into a client of a loopback
+/// service. Only this machine's own names are answered.
+#[tokio::test]
+async fn a_host_header_for_somewhere_else_is_refused() {
+    let d = Dash::start(|_| {}).await;
+
+    let refused = d
+        .client
+        .get(d.url("/api/state"))
+        .header("host", "relay.attacker.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+
+    // localhost by name is this machine, and is fine.
+    let allowed = d
+        .client
+        .get(d.url("/api/state"))
+        .header("host", format!("localhost:{}", d.addr.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 200);
+}
+
+/// An operator who is putting the dashboard behind something of their own can
+/// turn the guard off, and then it is off.
+#[tokio::test]
+async fn the_origin_guard_can_be_switched_off() {
+    let d = Dash::start(|cfg| {
+        cfg.security.dashboard_origin_guard = false;
+    })
+    .await;
+
+    let allowed = d
+        .client
+        .get(d.url("/api/state"))
+        .header("origin", "https://evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 200);
+}
+
+/* -------------------------------------------------------- key billing -- */
+
+/// The Keys and Billing screens, over the API they actually call.
+#[tokio::test]
+async fn a_key_reports_what_it_owes_and_an_invoice_clears_it() {
+    let d = Dash::start(|cfg| {
+        cfg.pricing.enabled = true;
+        cfg.pricing.backend_input_usd_per_m = 1.0;
+        cfg.pricing.backend_output_usd_per_m = 2.0;
+        cfg.pricing.input_usd_per_m = 30.0;
+        cfg.pricing.output_usd_per_m = 60.0;
+        cfg.billing.enabled = true;
+        cfg.billing.tax_percent = 10.0;
+    })
+    .await;
+
+    d.relay_call().await;
+    d.relay_call().await;
+    d.relay.state.store.flush().await;
+
+    // What the Keys screen shows in its "unbilled" column.
+    let rows = d.get_json("/api/usage/keys").await;
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["keyId"] == "key_test")
+        .unwrap();
+    assert_eq!(row["kind"], "company");
+    assert_eq!(row["current"]["requests"], 2);
+    let owed = row["current"]["subtotalUsd"].as_f64().unwrap();
+    assert!(owed > 0.0, "two priced calls must come to something");
+    assert!(row["lastInvoice"].is_null());
+
+    // What the drawer shows: the models used, and what each came to.
+    let detail = d.get_json("/api/keys/key_test/usage").await;
+    let lines = detail["current"]["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["model"], "manukmiberai/creative-writer");
+    assert!(lines[0]["amountUsd"].as_f64().unwrap() > 0.0);
+
+    // Issuing.
+    let issued: Value = d
+        .post("/api/invoices", json!({"keyId": "key_test"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(issued["ok"], true);
+    let inv = &issued["invoice"];
+    assert_eq!(inv["requests"], 2);
+    assert!((inv["totalUsd"].as_f64().unwrap() - owed * 1.1).abs() < 1e-6);
+    assert!(inv["number"].as_str().unwrap().starts_with("INV-"));
+
+    // The reset the invoice performs, seen from the screen that shows it.
+    let after = d.get_json("/api/keys/key_test/usage").await;
+    assert_eq!(after["current"]["requests"], 0);
+    assert_eq!(after["current"]["subtotalUsd"], 0.0);
+    assert_eq!(after["lifetime"]["requests"], 2, "history is kept");
+    assert_eq!(after["invoices"].as_array().unwrap().len(), 1);
+
+    // A second attempt with nothing new is not an invoice.
+    let again: Value = d
+        .post("/api/invoices", json!({"keyId": "key_test"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["ok"], false);
+    assert_eq!(again["skipped"], "nothingToBill");
+
+    // Paid, and the figures still verify.
+    let id = inv["id"].as_str().unwrap();
+    let paid: Value = d
+        .post(
+            &format!("/api/invoices/{id}/status"),
+            json!({"status": "paid"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(paid["invoice"]["status"], "paid");
+    assert_eq!(d.get_json("/api/invoices/verify").await["ok"], true);
+}
+
+/// Generating a key of each kind, the way the two buttons on the Keys screen do.
+#[tokio::test]
+async fn a_generated_key_carries_the_kind_it_was_asked_for() {
+    let d = Dash::start(|_| {}).await;
+
+    for kind in ["company", "private"] {
+        let created: Value = d
+            .post("/api/keys/generate", json!({"label": kind, "kind": kind}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(created["item"]["kind"], kind);
+        assert!(created["item"]["key"]
+            .as_str()
+            .unwrap()
+            .starts_with("Kunci-Zeiko-"));
+    }
+
+    // An unrecognised kind is a company key, which is the one that changes
+    // nothing about how the caller is treated.
+    let odd: Value = d
+        .post("/api/keys/generate", json!({"kind": "enterprise"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(odd["item"]["kind"], "company");
+}
+
+/// Invoicing is a write, and writes behind the password are behind the
+/// password.
+#[tokio::test]
+async fn the_billing_routes_need_a_session_too() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "hunter2".into();
+    })
+    .await;
+
+    assert_eq!(d.get("/api/usage/keys").await.status(), 401);
+    assert_eq!(d.get("/api/keys/key_test/usage").await.status(), 401);
+    assert_eq!(d.get("/api/invoices").await.status(), 401);
+    assert_eq!(
+        d.post("/api/invoices", json!({"keyId": "key_test"}))
+            .await
+            .status(),
+        401
+    );
+
+    d.post("/api/login", json!({"password": "hunter2"})).await;
+    assert_eq!(d.get("/api/invoices").await.status(), 200);
+}

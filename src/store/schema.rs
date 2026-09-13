@@ -3,11 +3,21 @@
 //! The column names are the ones the dashboard's JavaScript already reads, so
 //! the vanilla-JS frontend carries over from the Node version untouched.
 
-use rusqlite::types::Value as SqlValue;
-use rusqlite::Row;
+use rusqlite::types::ToSqlOutput;
+use rusqlite::{Result as SqlResult, Row, ToSql};
 use serde::{Deserialize, Serialize};
 
-pub const FIELDS: [&str; 56] = [
+use crate::config::KeyKind;
+
+/// Stored as the same word the config spells it with, so a row read straight
+/// out of SQLite says "private" rather than a number nobody can interpret.
+impl ToSql for KeyKind {
+    fn to_sql(&self) -> SqlResult<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(self.as_str().into()))
+    }
+}
+
+pub const FIELDS: [&str; 57] = [
     "id",
     "ts",
     "day",
@@ -64,6 +74,7 @@ pub const FIELDS: [&str; 56] = [
     "profit_usd",
     "price_tiers",
     "target_tps",
+    "key_kind",
 ];
 
 /// The table itself, and nothing else.
@@ -97,7 +108,8 @@ CREATE TABLE IF NOT EXISTS requests (
   tokenize_ms REAL, inject_ms REAL,
   bytes_in INTEGER, bytes_out INTEGER, bytes_upstream INTEGER, rss_mb REAL,
   backend_usd REAL, proxy_usd REAL, profit_usd REAL, price_tiers TEXT,
-  target_tps REAL
+  target_tps REAL,
+  key_kind TEXT
 );
 ";
 
@@ -141,21 +153,22 @@ pub const INSERT_SQL: &str = "INSERT OR REPLACE INTO requests (
   proxy_usd,
   profit_usd,
   price_tiers,
-  target_tps
+  target_tps,
+  key_kind
 ) VALUES (
   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
   ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
   ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
   ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
-  ?51, ?52, ?53, ?54, ?55, ?56
+  ?51, ?52, ?53, ?54, ?55, ?56, ?57
 )";
 
 /// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` leaves
 /// an existing table alone, so an install that predates them needs each one
 /// added by hand; SQLite has no `ADD COLUMN IF NOT EXISTS`, so the caller
 /// checks `PRAGMA table_info` first.
-pub const ADDED_COLUMNS: [(&str, &str); 21] = [
+pub const ADDED_COLUMNS: [(&str, &str); 22] = [
     ("user_prompt_tokens", "INTEGER"),
     ("billed_prompt_tokens", "INTEGER"),
     ("system_prompt_tokens", "INTEGER"),
@@ -177,6 +190,7 @@ pub const ADDED_COLUMNS: [(&str, &str); 21] = [
     ("profit_usd", "REAL"),
     ("price_tiers", "TEXT"),
     ("target_tps", "REAL"),
+    ("key_kind", "TEXT"),
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -270,70 +284,82 @@ pub struct RequestRecord {
     pub profit_usd: f64,
     /// The price tiers that applied, comma separated.
     pub price_tiers: String,
-    /// The tokens-a-second ceiling this reply was held to, or 0.
+    /// The tokens-a-second ceiling this reply was held to, or 0. Always 0 for
+    /// a private key, which is never paced.
     pub target_tps: f64,
+    /// Company or private, as the key that made the call was set up. Kept on
+    /// the row because a key's kind can be changed later and this is what it
+    /// was at the time.
+    pub key_kind: KeyKind,
 }
 
 impl RequestRecord {
-    /// Bind values in the same order as `INSERT_SQL`.
-    pub fn as_params(&self) -> Vec<SqlValue> {
-        vec![
-            SqlValue::Text(self.id.clone()),
-            SqlValue::Integer(self.ts),
-            SqlValue::Text(self.day.clone()),
-            SqlValue::Text(self.hour.clone()),
-            SqlValue::Text(self.key_id.clone()),
-            SqlValue::Text(self.key_label.clone()),
-            SqlValue::Text(self.ip.clone()),
-            SqlValue::Text(self.user_agent.clone()),
-            SqlValue::Text(self.public_model.clone()),
-            SqlValue::Text(self.backend_id.clone()),
-            SqlValue::Text(self.upstream_model.clone()),
-            SqlValue::Text(self.endpoint.clone()),
-            SqlValue::Integer(self.stream),
-            SqlValue::Integer(self.status),
-            SqlValue::Text(self.error.clone()),
-            SqlValue::Text(self.finish_reason.clone()),
-            SqlValue::Real(self.ttft_ms),
-            SqlValue::Real(self.total_ms),
-            SqlValue::Real(self.gen_ms),
-            SqlValue::Integer(self.prompt_tokens),
-            SqlValue::Integer(self.completion_tokens),
-            SqlValue::Integer(self.total_tokens),
-            SqlValue::Integer(self.cached_tokens),
-            SqlValue::Integer(self.reasoning_tokens),
-            SqlValue::Real(self.tokens_per_sec),
-            SqlValue::Text(self.usage_source.clone()),
-            SqlValue::Text(self.tokenizer.clone()),
-            SqlValue::Integer(self.exact),
-            SqlValue::Integer(self.local_prompt),
-            SqlValue::Integer(self.local_completion),
-            SqlValue::Integer(self.drift_prompt),
-            SqlValue::Integer(self.drift_completion),
-            SqlValue::Text(self.req_preview.clone()),
-            SqlValue::Text(self.res_preview.clone()),
-            SqlValue::Integer(self.retries),
-            SqlValue::Integer(self.user_prompt_tokens),
-            SqlValue::Integer(self.billed_prompt_tokens),
-            SqlValue::Integer(self.system_prompt_tokens),
-            SqlValue::Integer(self.cache_hit),
-            SqlValue::Real(self.queued_ms),
-            SqlValue::Text(self.user_id.clone()),
-            SqlValue::Text(self.reasoning_effort.clone()),
-            SqlValue::Text(self.prompt_id.clone()),
-            SqlValue::Integer(i64::from(self.local_hour)),
-            SqlValue::Integer(i64::from(self.local_weekday)),
-            SqlValue::Real(self.tokenize_ms),
-            SqlValue::Real(self.inject_ms),
-            SqlValue::Integer(self.bytes_in as i64),
-            SqlValue::Integer(self.bytes_out as i64),
-            SqlValue::Integer(self.bytes_upstream as i64),
-            SqlValue::Real(self.rss_mb),
-            SqlValue::Real(self.backend_usd),
-            SqlValue::Real(self.proxy_usd),
-            SqlValue::Real(self.profit_usd),
-            SqlValue::Text(self.price_tiers.clone()),
-            SqlValue::Real(self.target_tps),
+    /// Bind values in the same order as `INSERT_SQL`, by reference.
+    ///
+    /// Borrowed rather than owned on purpose: a row is 57 columns of which
+    /// twenty are `String`, and building an owned parameter list would copy
+    /// every one of them a second time, per request, on the writer thread that
+    /// the whole channel exists to keep free. SQLite copies what it needs out
+    /// of these while `execute` runs, and the record outlives that.
+    pub fn as_params(&self) -> [&dyn ToSql; FIELDS.len()] {
+        [
+            &self.id,
+            &self.ts,
+            &self.day,
+            &self.hour,
+            &self.key_id,
+            &self.key_label,
+            &self.ip,
+            &self.user_agent,
+            &self.public_model,
+            &self.backend_id,
+            &self.upstream_model,
+            &self.endpoint,
+            &self.stream,
+            &self.status,
+            &self.error,
+            &self.finish_reason,
+            &self.ttft_ms,
+            &self.total_ms,
+            &self.gen_ms,
+            &self.prompt_tokens,
+            &self.completion_tokens,
+            &self.total_tokens,
+            &self.cached_tokens,
+            &self.reasoning_tokens,
+            &self.tokens_per_sec,
+            &self.usage_source,
+            &self.tokenizer,
+            &self.exact,
+            &self.local_prompt,
+            &self.local_completion,
+            &self.drift_prompt,
+            &self.drift_completion,
+            &self.req_preview,
+            &self.res_preview,
+            &self.retries,
+            &self.user_prompt_tokens,
+            &self.billed_prompt_tokens,
+            &self.system_prompt_tokens,
+            &self.cache_hit,
+            &self.queued_ms,
+            &self.user_id,
+            &self.reasoning_effort,
+            &self.prompt_id,
+            &self.local_hour,
+            &self.local_weekday,
+            &self.tokenize_ms,
+            &self.inject_ms,
+            &self.bytes_in,
+            &self.bytes_out,
+            &self.bytes_upstream,
+            &self.rss_mb,
+            &self.backend_usd,
+            &self.proxy_usd,
+            &self.profit_usd,
+            &self.price_tiers,
+            &self.target_tps,
+            &self.key_kind,
         ]
     }
 }

@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::{
-    ClientKey, Config, Model, Pricing, RequestTransform, ResolvedResponseTransform,
+    ClientKey, Config, KeyIndex, Model, Pricing, RequestTransform, ResolvedResponseTransform,
     ResponseTransform,
 };
 use crate::pricing::{self, Effort, Priced, Shape};
@@ -56,18 +56,39 @@ use crate::util::{day_key, hour_key, new_uuid_v4, now_ms, round, truncate};
 
 /// The outcome of an authentication attempt.
 pub enum Auth {
-    Ok(ClientKey),
+    Ok(Arc<ClientKey>),
     Denied { status: u16, message: String },
 }
 
-pub fn authenticate(cfg: &Config, secret: Option<&str>) -> Auth {
+/// The key a relay with `requireClientKey` switched off runs every call under.
+///
+/// Built once rather than per request, and deliberately a company key: an open
+/// relay has no idea who is calling, so the caller's own `user` field is the
+/// only identity there is.
+fn anonymous_key() -> Arc<ClientKey> {
+    static ANONYMOUS: std::sync::OnceLock<Arc<ClientKey>> = std::sync::OnceLock::new();
+    ANONYMOUS
+        .get_or_init(|| {
+            Arc::new(ClientKey {
+                id: "anonymous".into(),
+                label: "anonymous".into(),
+                models: vec!["*".into()],
+                ..Default::default()
+            })
+        })
+        .clone()
+}
+
+/// Authenticate against the published key index.
+///
+/// One hash and one map lookup, whatever the key list looks like — see
+/// [`crate::config::KeyIndex`]. The `Arc` is what the rest of the request
+/// carries: cloning the key itself would copy its model list, its quota and
+/// its plaintext secret into every request's context, and the secret has no
+/// business being there at all.
+pub fn authenticate(cfg: &Config, keys: &KeyIndex, secret: Option<&str>) -> Auth {
     if !cfg.security.require_client_key {
-        return Auth::Ok(ClientKey {
-            id: "anonymous".into(),
-            label: "anonymous".into(),
-            models: vec!["*".into()],
-            ..Default::default()
-        });
+        return Auth::Ok(anonymous_key());
     }
     let Some(secret) = secret.filter(|s| !s.is_empty()) else {
         return Auth::Denied {
@@ -75,21 +96,14 @@ pub fn authenticate(cfg: &Config, secret: Option<&str>) -> Auth {
             message: "missing API key: send Authorization: Bearer <key>".into(),
         };
     };
-    match cfg.find_key_by_secret(secret) {
+    match keys.get(secret) {
         None => Auth::Denied {
             status: 401,
             message: "invalid API key".into(),
         },
         Some(key) if !key.enabled => Auth::Denied {
             status: 403,
-            message: format!(
-                "key \"{}\" is disabled",
-                if key.label.is_empty() {
-                    &key.id
-                } else {
-                    &key.label
-                }
-            ),
+            message: format!("key \"{}\" is disabled", key.display_name()),
         },
         Some(key) => Auth::Ok(key.clone()),
     }
@@ -110,6 +124,43 @@ fn reasoning_excluded(body: &Value) -> bool {
         return true;
     }
     body.get("include_reasoning").and_then(|v| v.as_bool()) == Some(false)
+}
+
+/// Who this request is on behalf of, which is not the same question for the
+/// two kinds of key.
+///
+/// * A **company** key is one customer with many people behind it, so the id
+///   the caller sends is the id that counts: it isolates the prompt cache
+///   upstream, and it is what the usage breaks down by. This is what every key
+///   did before there were two kinds, so nothing about an existing setup moves.
+/// * A **private** key *is* one person. There is nobody else behind it to name,
+///   so whatever the caller put in `user` is ignored — not merged, not
+///   preferred, ignored — and the key's own identity answers instead. A private
+///   caller therefore cannot claim to be somebody else's user, land in somebody
+///   else's cache partition, or file their spend under another name.
+///
+/// What a private key's identity *looks like* upstream is
+/// [`SecurityConfig::private_user_id`]. By default it is a fingerprint: a
+/// truncated SHA-256 of the key, which is stable and unique per key but is not
+/// the key. Sending the key itself is available and is not the default,
+/// because it would write a working credential into a third party's logs.
+pub fn effective_user_id(
+    cfg: &Config,
+    key: &ClientKey,
+    body: &Value,
+    headers: &HeaderMap,
+) -> String {
+    if !key.kind.is_private() {
+        return user_id_of(body, headers);
+    }
+    match cfg.security.private_user_id.trim() {
+        crate::config::PRIVATE_ID_SECRET => key.key.clone(),
+        crate::config::PRIVATE_ID_KEY_ID => key.id.clone(),
+        // Anything unrecognised is the safe one. `normalize` already rewrites a
+        // misspelling in the config, so this is only reachable in a test that
+        // built a `Config` by hand.
+        _ => crate::util::fingerprint(&key.key),
+    }
 }
 
 /// Who the caller says they are.
@@ -301,7 +352,7 @@ struct Outcome<'a> {
 
 pub async fn handle_chat(
     state: Arc<AppState>,
-    key: ClientKey,
+    key: Arc<ClientKey>,
     ip: String,
     headers: &HeaderMap,
     endpoint: &str,
@@ -317,7 +368,7 @@ pub async fn handle_chat(
     let local = crate::util::local_parts(started_wall, &tz);
     let trace = Trace::new(state.logger.clone(), &id, cfg.logging.verbose_requests);
     let effort = pricing::effort_of(&body);
-    let user_id = user_id_of(&body, headers);
+    let user_id = effective_user_id(&cfg, &key, &body, headers);
 
     let mut record = RequestRecord {
         id: id.clone(),
@@ -330,11 +381,8 @@ pub async fn handle_chat(
         reasoning_effort: effort.as_str().to_string(),
         bytes_in: body_bytes(headers),
         key_id: key.id.clone(),
-        key_label: if key.label.is_empty() {
-            key.id.clone()
-        } else {
-            key.label.clone()
-        },
+        key_label: key.display_name().to_string(),
+        key_kind: key.kind,
         ip,
         user_agent: truncate(
             headers
@@ -357,9 +405,10 @@ pub async fn handle_chat(
     trace.phase(
         "in",
         format!(
-            "{} model={asked_for} key={} user={} effort={} stream={} bytes={} ip={}",
+            "{} model={asked_for} key={} ({}) user={} effort={} stream={} bytes={} ip={}",
             local.stamp,
             record.key_label,
+            key.kind.as_str(),
             if record.user_id.is_empty() {
                 "-"
             } else {
@@ -415,7 +464,15 @@ pub async fn handle_chat(
 
     record.backend_id = route.backend.clone();
     record.upstream_model = route.upstream_model.clone();
-    record.target_tps = route.max_tokens_per_second;
+    // A private key is not paced. The throttle exists to keep one reseller's
+    // traffic from filling the phone's uplink on everybody else's behalf; a key
+    // with one holder behind it is the case that costs nobody else anything, so
+    // it gets whatever the backend can produce.
+    record.target_tps = if key.kind.is_private() {
+        0.0
+    } else {
+        route.max_tokens_per_second
+    };
 
     // Take a slot before doing any real work. Tokenizing a long conversation
     // is the most expensive thing this relay does, so letting an unbounded
@@ -599,6 +656,10 @@ pub async fn handle_chat(
         // operator changed it. A backend reading only its own spelling would
         // otherwise pool every caller behind this relay into one cache, which
         // is the exact leak the id exists to prevent.
+        //
+        // For a private key `user_id` is the key's own identity rather than
+        // anything the caller wrote, so writing it here is also what stops a
+        // caller naming themselves as somebody else upstream.
         let forward = backend_cfg.as_ref().is_none_or(|b| b.forward_user_id);
         let field = backend_cfg
             .as_ref()
@@ -608,7 +669,11 @@ pub async fn handle_chat(
             if !field.is_empty() && field != "user" {
                 map.insert(field.to_string(), Value::String(user_id.clone()));
             }
-        } else if !forward {
+        } else {
+            // Either the backend does not want an id, or what the caller sent
+            // was not one — whitespace, a number, an empty string. Neither is
+            // worth forwarding, and leaving the caller's own value in place
+            // would forward exactly the thing that failed to parse as an id.
             map.remove("user");
             if !field.is_empty() {
                 map.remove(field);
@@ -812,7 +877,7 @@ async fn pump(
     // whatever speed the backend managed. Reading is what gets held back, so
     // the pause travels back up the TCP window instead of piling tokens up in
     // this process's memory.
-    let mut pacer = Pacer::new(ctx.route.max_tokens_per_second);
+    let mut pacer = Pacer::new(ctx.record.target_tps);
 
     // Requirement 17: the relay's own keep-alive, never the backend's. An SSE
     // comment holds the connection open through cloudflared and every NAT on
@@ -1525,6 +1590,8 @@ fn ledger_stub(record: &RequestRecord, phase: Phase) -> LedgerEntry {
         public_model: record.public_model.clone(),
         backend_id: record.backend_id.clone(),
         queued_ms: record.queued_ms,
+        user_id: record.user_id.clone(),
+        key_kind: record.key_kind.as_str().to_string(),
         ..Default::default()
     }
 }
@@ -1596,6 +1663,13 @@ fn ledger_final(state: &Arc<AppState>, record: &RequestRecord, ledgered: Option<
             gen_ms: record.gen_ms,
             total_ms: record.total_ms,
             tokens_per_sec: record.tokens_per_sec,
+            // The money lands here and nowhere else. Until the answer is
+            // complete there is no price: the output tokens are half of it.
+            // This is also the row an invoice bills from, so a request that
+            // straddles an invoice is billed on the next one — correctly,
+            // since nothing has been charged for it yet.
+            proxy_usd: record.proxy_usd,
+            backend_usd: record.backend_usd,
             ..ledger_stub(record, Phase::Final)
         },
     );
@@ -1861,22 +1935,159 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(matches!(authenticate(&cfg, Some("sk-good")), Auth::Ok(_)));
+        let keys = KeyIndex::build(&cfg.keys);
         assert!(matches!(
-            authenticate(&cfg, None),
+            authenticate(&cfg, &keys, Some("sk-good")),
+            Auth::Ok(_)
+        ));
+        assert!(matches!(
+            authenticate(&cfg, &keys, None),
             Auth::Denied { status: 401, .. }
         ));
         assert!(matches!(
-            authenticate(&cfg, Some("sk-wrong")),
+            authenticate(&cfg, &keys, Some("sk-wrong")),
             Auth::Denied { status: 401, .. }
         ));
         assert!(matches!(
-            authenticate(&cfg, Some("sk-off")),
+            authenticate(&cfg, &keys, Some("sk-off")),
             Auth::Denied { status: 403, .. }
         ));
 
         // With the requirement switched off, anyone gets in as "anonymous".
         cfg.security.require_client_key = false;
-        assert!(matches!(authenticate(&cfg, None), Auth::Ok(k) if k.id == "anonymous"));
+        assert!(matches!(authenticate(&cfg, &keys, None), Auth::Ok(k) if k.id == "anonymous"));
+    }
+
+    /// The two kinds of key, which differ in exactly one thing: who the request
+    /// is on behalf of.
+    #[test]
+    fn a_private_key_is_its_own_user_and_a_company_key_is_not() {
+        let cfg = Config::default();
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({ "user": "someone-elses-customer" });
+
+        let company = ClientKey {
+            id: "key_co".into(),
+            key: "Kunci-Zeiko-company".into(),
+            kind: crate::config::KeyKind::Company,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_user_id(&cfg, &company, &body, &headers),
+            "someone-elses-customer",
+            "a company key passes its own end user through",
+        );
+
+        let private = ClientKey {
+            id: "key_pr".into(),
+            key: "Kunci-Zeiko-private".into(),
+            kind: crate::config::KeyKind::Private,
+            ..Default::default()
+        };
+        let id = effective_user_id(&cfg, &private, &body, &headers);
+        assert_ne!(
+            id, "someone-elses-customer",
+            "a private caller must not be able to name themselves as anyone else",
+        );
+        assert_eq!(
+            id,
+            crate::util::fingerprint(&private.key),
+            "the default is the fingerprint of the key",
+        );
+        assert!(
+            !id.contains(&private.key),
+            "the key itself must never be what travels upstream",
+        );
+
+        // Stable across calls, and different per key: those are the two things
+        // a prompt-cache isolation id has to be.
+        assert_eq!(
+            id,
+            effective_user_id(&cfg, &private, &serde_json::json!({}), &headers)
+        );
+        assert_ne!(
+            id,
+            effective_user_id(
+                &cfg,
+                &ClientKey {
+                    key: "Kunci-Zeiko-another".into(),
+                    ..private.clone()
+                },
+                &body,
+                &headers
+            )
+        );
+    }
+
+    /// An operator who genuinely needs the raw value can have it, but only by
+    /// asking for it in as many words.
+    #[test]
+    fn the_private_id_mode_chooses_what_travels() {
+        let private = ClientKey {
+            id: "key_pr".into(),
+            key: "Kunci-Zeiko-private".into(),
+            kind: crate::config::KeyKind::Private,
+            ..Default::default()
+        };
+        let body = serde_json::json!({});
+        let headers = HeaderMap::new();
+
+        let mut cfg = Config::default();
+        cfg.security.private_user_id = crate::config::PRIVATE_ID_KEY_ID.into();
+        assert_eq!(effective_user_id(&cfg, &private, &body, &headers), "key_pr");
+
+        cfg.security.private_user_id = crate::config::PRIVATE_ID_SECRET.into();
+        assert_eq!(
+            effective_user_id(&cfg, &private, &body, &headers),
+            private.key
+        );
+
+        // A misspelling falls back to the mode that gives nothing away, rather
+        // than to whichever branch happens to be last.
+        cfg.security.private_user_id = "whatever".into();
+        assert_eq!(
+            effective_user_id(&cfg, &private, &body, &headers),
+            crate::util::fingerprint(&private.key)
+        );
+    }
+
+    /// The index the request path actually authenticates against.
+    #[test]
+    fn the_key_index_finds_a_key_without_scanning_and_refuses_a_near_miss() {
+        let keys = vec![
+            ClientKey {
+                id: "k1".into(),
+                key: "Kunci-Zeiko-one".into(),
+                ..Default::default()
+            },
+            ClientKey {
+                id: "k2".into(),
+                key: "Kunci-Zeiko-two".into(),
+                ..Default::default()
+            },
+            // A key with no secret is not a key, and must not be reachable by
+            // sending an empty bearer token.
+            ClientKey {
+                id: "k3".into(),
+                key: String::new(),
+                ..Default::default()
+            },
+        ];
+        let index = KeyIndex::build(&keys);
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            index.get("Kunci-Zeiko-one").map(|k| k.id.as_str()),
+            Some("k1")
+        );
+        assert_eq!(
+            index.get("Kunci-Zeiko-two").map(|k| k.id.as_str()),
+            Some("k2")
+        );
+        assert!(index.get("Kunci-Zeiko-thr").is_none());
+        assert!(
+            index.get("Kunci-Zeiko-on").is_none(),
+            "a prefix is not the key"
+        );
+        assert!(index.get("").is_none());
     }
 }

@@ -663,6 +663,107 @@ meneruskan.
 
 ---
 
+## Dua jenis client key
+
+Sebuah client key sekarang punya **jenis**, dan jenis itu menentukan satu hal —
+**request ini atas nama siapa.** Sisanya mengikuti dari situ.
+
+|  | `company` | `private` |
+|---|---|---|
+| Di belakang key | banyak pengguna akhir | satu pemegang |
+| `user_id` yang dikirim ke backend | yang dikirim pemanggil (`user` atau `x-user-id`) | identitas key itu sendiri |
+| Kalau pemanggil mengisi `user` | dipakai | **diabaikan** |
+| Rincian usage per | pengguna akhir | key |
+| `maxTokensPerSecond` | berlaku | **tidak pernah berlaku** |
+
+**Company** itu reseller. Tiap panggilan membawa pengguna akhirnya sendiri, dan
+id itulah yang dilihat backend, yang memisahkan prompt cache satu pelanggan dari
+pelanggan lain, dan yang jadi rincian di invoice. Ini persis perilaku lama, jadi
+config yang sudah ada tidak berubah apa-apa — key tanpa `kind` dibaca sebagai
+`company`.
+
+**Private** itu satu orang, dan key-nya *adalah* penggunanya. Apa pun yang
+pemanggil tulis di `user` tidak digubris: dia tidak bisa menaruh pemakaiannya
+atas nama orang lain, dan tidak bisa masuk ke partisi cache milik orang lain.
+Yang naik ke backend diatur `security.privateUserId`, dan defaultnya **sidik
+jari** dari key (SHA-256 dipotong), bukan key-nya:
+
+```jsonc
+// company key                        // private key
+{ "model": "…",                       { "model": "…",
+  "user": "pelanggan-42",               "user": "u_9f3c1ab77e20d4e1c8b6a015",
+  "user_id": "pelanggan-42" }           "user_id": "u_9f3c1ab77e20d4e1c8b6a015" }
+```
+
+Stabil, unik per key, dan tidak membocorkan apa-apa. Mengirim key-nya sendiri
+bisa (`privateUserId: "secret"`) tapi bukan default, karena itu artinya menulis
+kredensial yang masih berlaku ke log request orang lain.
+
+### Private key tidak direm
+
+`maxTokensPerSecond` ada supaya trafik satu reseller tidak menghabiskan uplink
+HP untuk semua orang. Key dengan satu pemegang di belakangnya adalah kasus yang
+tidak merugikan siapa-siapa, jadi **balasannya keluar secepat backend bisa
+menghasilkannya** — tidak ada pacing sama sekali. Baris request-nya mencatat
+`targetTps` = 0, bukan angka batas yang sebenarnya tidak pernah dipakai.
+
+---
+
+## Usage per key, invoice, dan reset
+
+Tiap key punya **usage**-nya sendiri: total harga yang dipakai, model apa saja
+yang dipakai, dan berapa masing-masing model. Semua angka itu datang dari
+`usage_ledger`, jadi harga yang tercatat adalah harga **saat request itu jalan**
+— mengubah daftar harga besok tidak menulis ulang tagihan kemarin.
+
+```
+Billing → per key
+┌───────────────────────────────────────────────────────────────────┐
+│ acme          company   1.204 request   14,2 jt token   $38,4102  │
+│ pribadi-ku    private       310 request  2,1 jt token    $6,8830  │
+└───────────────────────────────────────────────────────────────────┘
+                    ↓ buka salah satu
+        model-a   842 request   $24,1180
+        model-b   362 request   $14,2922
+```
+
+### "Reset usage setelah invoice keluar"
+
+Buku besarnya **hanya bisa ditambah** — SQLite menolak mengubah maupun menghapus
+barisnya, dan tiap baris membawa hash baris sebelumnya. Jadi invoice tidak
+menghapus apa pun. Dia **menarik garis**:
+
+```
+  usage_ledger   ─── seq ───────────────────────────────────────────────►
+    … 41  42  43 │ 44  45  46  47 │ 48  49  50 …
+                 │                │
+           invoice #1        invoice #2         "belum ditagih"
+           toSeq = 43        toSeq = 47         = semua setelah 47
+```
+
+Angka **belum ditagih** milik sebuah key adalah semua yang dia pakai setelah
+garis yang ditarik invoice terakhirnya. Menerbitkan invoice memajukan garis itu
+— makanya angkanya jadi nol sesudahnya, tanpa satu baris pun dihapus, dan
+periode lama masih bisa dibaca ulang berbulan-bulan kemudian.
+
+Yang perlu diketahui:
+
+- Invoice tidak bisa dibatalkan penerbitannya. **Void** menandainya batal dan
+  mengembalikan periodenya, jadi invoice berikutnya menagih dua periode.
+- Request yang masih jalan saat invoice terbit masuk ke invoice berikutnya.
+  Harganya baru diketahui saat jawabannya selesai, dan memang belum ditagih.
+- `billing.minimumUsd` **menahan** periode kecil supaya tetap terbuka, bukan
+  membuangnya — pemakaiannya bergulir ke invoice berikutnya.
+- Angka di invoice yang sudah terbit ikut di-hash, dan SQLite menolak `UPDATE`
+  yang menyentuhnya. Yang masih boleh berubah cuma `status`, `settledAt`, dan
+  catatan.
+
+Terbitkan lewat tombol di tab **Billing**, atau nyalakan `billing.autoIssue`
+supaya siklus bulanan mengerjakannya sendiri — hanya untuk key yang memasang
+`billing.autoInvoice`, karena menutup periode tagihan itu keputusan.
+
+---
+
 ## 7. Dashboard
 
 Di `http://127.0.0.1:8788`, terikat ke localhost dan **tidak pernah dilewatkan
@@ -676,9 +777,10 @@ ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pu
 | Models | editor alias: terjemahan nama, prompt, params, limit, tokenizer, reshaping |
 | Backends | provider upstream + tombol tes koneksi |
 | Prompts | library system prompt |
-| Keys | client key, kuota, batasan model |
+| Keys | client key, jenisnya (company/private), kuota, batasan model, data penagihan |
 | Requests | log per panggilan + rincian timing dan token |
-| Usage | angka dari buku besar: request, token, TTFT, TPS, cache hit, dan status rantai hash |
+| Usage | angka dari buku besar: request, token, harga, TTFT, TPS, cache hit, dan status rantai hash |
+| Billing | yang belum ditagih per key + rincian per model, terbitkan invoice, riwayat invoice |
 | Tokenizer | playground token, biaya satu request chat, pasang vocabulary |
 | Playground | kirim request beneran lewat relay |
 | Tunnel | start/stop cloudflared, URL publik, output mentah |
@@ -872,7 +974,7 @@ src/
   relay/         upstream + fallback, transform, SSE, pacing, trace, handler
   rotate.rs      ganti instance tiap jam tanpa memutus koneksi
   server/        API publik, dashboard + admin API
-  store/         SQLite, quota tracker, rate limiter
+  store/         SQLite, buku besar, invoice, quota tracker, rate limiter
   system.rs      keeper, shortcut, hook boot, wake lock, restart/stop
   tunnel.rs      supervisor cloudflared
 public/          dashboard (vanilla JS, ikut ter-compile ke binary)
@@ -896,7 +998,11 @@ kalau vocabulary-nya belum dipasang. Test relay dan dashboard menjalankan server
 sungguhan lewat HTTP di depan backend tiruan — termasuk 300 pemanggil serentak,
 antrean yang menahan lonjakan tanpa menolak siapa pun, antrean penuh yang
 dijawab 503 + `Retry-After`, dan buku besar yang menolak diubah lalu tetap
-mendeteksi perubahan yang dilakukan lewat belakang trigger-nya.
+mendeteksi perubahan yang dilakukan lewat belakang trigger-nya. Ada juga
+`tests/billing.rs`: private key yang tidak bisa mengaku jadi orang lain dan
+tidak direm, company key yang meneruskan pengguna akhirnya, harga yang masuk ke
+buku besar, dan invoice yang menutup periode lalu meninggalkan periode kosong
+tanpa menghapus satu baris pun.
 
 ## Catatan keamanan
 
@@ -915,9 +1021,24 @@ mendeteksi perubahan yang dilakukan lewat belakang trigger-nya.
   milik backend di-parse lalu dibuang, karena bentuknya saja sudah menunjukkan
   backend mana yang di belakang.
 - API key backend tidak pernah keluar dari HP; pemanggil hanya memegang client key relay.
-- Dashboard default terikat `127.0.0.1` dan tidak masuk tunnel. Kalau kamu ubah
-  bindingnya, pasang password.
-- Perbandingan client key memakai constant-time compare.
+- **Client key juga tidak keluar dari HP.** Private key mengirim sidik jari
+  dirinya ke backend, bukan key-nya — stabil dan unik, tapi tidak bisa dipakai
+  siapa pun untuk memanggil relay ini.
+- **Loopback bukan pagar di Android.** Semua aplikasi di HP bisa membuka
+  `127.0.0.1:8788`, dan halaman web yang kamu buka pun bisa *mengirim* request
+  ke sana walau tidak bisa membaca jawabannya — padahal menambah backend atau
+  mematikan `requireClientKey` tidak butuh jawaban untuk jadi berguna. Karena
+  itu dashboard menolak request dengan `Origin` dari situs lain, dan `Host`
+  yang bukan nama mesin ini (itu cara kerja DNS rebinding).
+  **Tetap pasang `dashboard.password`**: penjaga origin itu urusan browser,
+  password itu urusan segala hal yang bukan browser. Tab Setup mengingatkan
+  kalau belum ada.
+- `CF-Connecting-IP` / `X-Forwarded-For` hanya dipercaya kalau koneksinya sendiri
+  datang dari mesin ini, tempat cloudflared jalan. Header dari jaringan itu cuma
+  string yang diketik pemanggil, dan `blockedIps` dicek terhadap hasilnya — kalau
+  dipercaya, daftar blokirnya cuma jadi saran.
+- Perbandingan client key memakai constant-time compare. Pencariannya lewat
+  indeks hash, jadi jumlah key tidak mengubah waktu yang dibutuhkan.
 - Prompt hanya disimpan lokal. Kalau tidak mau disimpan sama sekali, set
   `logging.storeBodies` ke `none`.
 - Client key ditampilkan penuh sekali saat dibuat, sesudah itu selalu termask.

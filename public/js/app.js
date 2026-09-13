@@ -7,6 +7,7 @@ import { keysView } from './views/keys.js';
 import { promptsView } from './views/prompts.js';
 import { requestsView } from './views/requests.js';
 import { usageView } from './views/usage.js';
+import { billingView } from './views/billing.js';
 import { tokenizerView } from './views/tokenizer.js';
 import { tunnelView } from './views/tunnel.js';
 import { playgroundView } from './views/playground.js';
@@ -24,6 +25,7 @@ const TABS = [
   ['keys', 'Keys', keysView],
   ['requests', 'Requests', requestsView],
   ['usage', 'Usage', usageView],
+  ['billing', 'Billing', billingView],
   ['tokenizer', 'Tokenizer', tokenizerView],
   ['playground', 'Playground', playgroundView],
   ['tunnel', 'Tunnel', tunnelView],

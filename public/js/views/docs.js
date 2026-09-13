@@ -74,7 +74,7 @@ function buildDoc(state) {
       chatSection(sample, models),
       streamSection(server, sample),
       usageSection(cfg),
-      identitySection(backends),
+      identitySection(backends, keys),
       limitSection(server, models, keys, backends, security),
       errorSection(),
       exampleSection(baseUrl, sample, keyPlaceholder),
@@ -132,14 +132,21 @@ function authSection(security, keys, keyPlaceholder) {
   }
   if (keys.length) {
     blocks.push({
-      columns: ['Key', 'Models', 'Requests/min', 'Requests/day', 'Tokens/day'],
+      columns: ['Key', 'Kind', 'Models', 'Requests/min', 'Requests/day', 'Tokens/day'],
       rows: keys.map((k) => [
         k.label || k.id,
+        k.kind ?? 'company',
         (k.models ?? ['*']).join(', '),
         limitText(k.quota?.requestsPerMinute),
         limitText(k.quota?.requestsPerDay),
         limitText(k.quota?.tokensPerDay),
       ]),
+    });
+    blocks.push({
+      p: 'A **company** key stands in front of many end users and must name the one '
+        + 'it is calling for — see *User ID* below. A **private** key is one holder: '
+        + 'the key is the user, anything it sends as `user` is ignored, and its '
+        + 'replies are never held to a model\u2019s tokens-a-second ceiling.',
     });
     blocks.push({ note: 'Key values are never shown here. Reveal one on the Keys tab and send it over a channel you trust — not in the same message as this guide.' });
   }
@@ -339,12 +346,20 @@ function usageSection(cfg) {
   };
 }
 
-function identitySection(backends) {
+function identitySection(backends, keys = []) {
   const forwarding = backends.filter((b) => b.forwardUserId && b.userIdHeader);
+  const anyPrivate = keys.some((k) => k.kind === 'private');
   return {
     title: 'User ID and KV-cache isolation',
     blocks: [
       { p: 'Send a stable per-end-user identifier on every request. It is what keeps two callers behind one API key from sharing a prompt-cache entry, and it is what the Usage screen groups by.' },
+      anyPrivate
+        ? {
+          note: 'This applies to **company** keys. A private key is its own user: '
+            + 'whatever it sends here is ignored, and the key\u2019s own identity is '
+            + 'what travels upstream and what its usage is filed under.',
+        }
+        : null,
       {
         columns: ['Where', 'What'],
         rows: [
@@ -363,7 +378,7 @@ function identitySection(backends) {
         ],
       },
       { note: 'Cache retention is the backend’s to state, not this relay’s: nothing about a prompt is stored here beyond the truncated preview on the Requests tab. Ask the upstream provider for the number before quoting one.' },
-    ],
+    ].filter(Boolean),
   };
 }
 

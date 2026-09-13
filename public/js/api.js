@@ -61,6 +61,14 @@ export const api = {
   installTokenizer: (payload) => request('POST', '/api/tokenizer/install', payload),
 
   usageSummary: (range) => request('GET', `/api/usage/summary?range=${encodeURIComponent(range)}`),
+  usageByKey: () => request('GET', '/api/usage/keys'),
+  keyUsage: (id) => request('GET', `/api/keys/${encodeURIComponent(id)}/usage`),
+
+  invoices: (params = {}) => request('GET', `/api/invoices?${new URLSearchParams(params)}`),
+  invoice: (id) => request('GET', `/api/invoices/${encodeURIComponent(id)}`),
+  issueInvoice: (body) => request('POST', '/api/invoices', body),
+  setInvoiceStatus: (id, status) => request('POST', `/api/invoices/${encodeURIComponent(id)}/status`, { status }),
+  verifyInvoices: () => request('GET', '/api/invoices/verify'),
   usageDaily: (days) => request('GET', `/api/usage/daily?days=${days}`),
   usageLedger: (limit = 100) => request('GET', `/api/usage/ledger?limit=${limit}`),
   verifyLedger: () => request('GET', '/api/usage/verify'),

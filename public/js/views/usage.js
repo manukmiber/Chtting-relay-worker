@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   h, card, stat, table, pill, toast, select,
-  fmtNum, fmtMs, fmtTime,
+  fmtNum, fmtMs, fmtTime, fmtUsd,
 } from '../ui.js';
 import { barChart } from '../charts.js';
 
@@ -50,6 +50,13 @@ export async function usageView(ctx) {
       stat('Tokens per second', w.avgTokensPerSec ? String(w.avgTokensPerSec) : '—',
         w.avgTokensPerSec ? 'while generating' : 'streamed replies only'),
       stat('Cache hits', `${w.cacheHitRate ?? 0}%`, `${fmtNum(w.cachedTokens)} tokens served from cache`),
+      // The figure the whole billing story rests on, and the one an operator
+      // opens this screen for. Straight from the ledger, so a prune of the
+      // request log does not change it.
+      stat('Charged', fmtUsd(w.proxyUsd ?? 0), `${fmtUsd(t.proxyUsd ?? 0)} today`),
+      stat('Cost', fmtUsd(w.backendUsd ?? 0), 'what the backends charge for it'),
+      stat('Margin', fmtUsd(w.profitUsd ?? 0),
+        w.proxyUsd ? `${(((w.profitUsd ?? 0) / w.proxyUsd) * 100).toFixed(1)}% of the sell side` : ''),
     ),
     h('p.small.muted', {
       text: `${fmtNum(w.users)} distinct keys · ${fmtNum(w.errors)} errors · `
@@ -89,7 +96,8 @@ export async function usageView(ctx) {
       table(
         ['Day', { label: 'Requests', num: true }, { label: 'In', num: true },
           { label: 'Out', num: true }, { label: 'Cache hits', num: true },
-          { label: 'TTFT', num: true }, { label: 'Tok/s', num: true }],
+          { label: 'TTFT', num: true }, { label: 'Tok/s', num: true },
+          { label: 'Charged', num: true }],
         [...daily].reverse(),
         (d) => h('tr', {},
           h('td.mono', { text: d.day }),
@@ -99,6 +107,7 @@ export async function usageView(ctx) {
           h('td.num', { text: fmtNum(d.cacheHits) }),
           h('td.num', { text: fmtMs(d.avgTtftMs) }),
           h('td.num', { text: String(d.avgTokensPerSec) }),
+          h('td.num', { text: d.proxyUsd ? fmtUsd(d.proxyUsd) : '—' }),
         ),
       ),
     )));
@@ -126,18 +135,21 @@ export async function usageView(ctx) {
 
   /* -------------------------------------------------------- recent rows */
   root.append(card(`Last ${rows.length} ledger rows`, table(
-    ['When', 'Phase', 'Model', { label: 'In', num: true }, { label: 'Out', num: true },
-      { label: 'TTFT', num: true }, { label: 'Tok/s', num: true }, 'Cache', 'Hash'],
+    ['When', 'Phase', 'Model', 'User', { label: 'In', num: true }, { label: 'Out', num: true },
+      { label: 'TTFT', num: true }, { label: 'Tok/s', num: true }, 'Cache',
+      { label: 'Charged', num: true }, 'Hash'],
     rows,
     (r) => h('tr', {},
       h('td', { text: fmtTime(r.ts) }),
       h('td', {}, pill(r.phase, r.phase === 'input' ? '' : (r.status === 200 ? 'ok' : 'err'))),
       h('td.mono.small', { text: r.model || '—' }),
+      h('td.mono.small.muted', { text: r.userId || '—' }),
       h('td.num', { text: r.inputTokens ? fmtNum(r.inputTokens) : '—' }),
       h('td.num', { text: r.outputTokens ? fmtNum(r.outputTokens) : '—' }),
       h('td.num', { text: r.ttftMs ? fmtMs(r.ttftMs) : '—' }),
       h('td.num', { text: r.tokensPerSec || '—' }),
       h('td', { text: r.cacheHit ? `${fmtNum(r.cachedTokens)}` : '—' }),
+      h('td.num', { text: r.proxyUsd ? fmtUsd(r.proxyUsd) : '—' }),
       h('td.mono.small.muted', { text: r.hash }),
     ),
   )));

@@ -115,6 +115,35 @@ pub fn random_hex(len: usize) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// SHA-256 of some bytes, as raw digest.
+///
+/// The one hash the relay uses for identity: the key index looks secrets up by
+/// it, and a private key's upstream id is a prefix of it.
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// A stable, opaque name for a secret: `u_` and 24 hex characters.
+///
+/// 96 bits of a SHA-256, which is far past the point where two client keys
+/// collide, and reveals nothing about the key it came from. This is what a
+/// private key sends upstream as its user id, so a backend can isolate its
+/// prompt cache per caller without the relay handing over the credential that
+/// would let it *be* that caller.
+pub fn fingerprint(secret: &str) -> String {
+    let digest = digest(secret.as_bytes());
+    let mut out = String::with_capacity(26);
+    out.push_str("u_");
+    for byte in &digest[..12] {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Constant-time compare that does not leak length through early return.
 pub fn safe_equal(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
@@ -166,6 +195,10 @@ fn local(ts_ms: i64, tz: &Tz) -> DateTime<Tz> {
 /// The pieces of a wall-clock time a price rule and a log line both need.
 #[derive(Debug, Clone)]
 pub struct LocalParts {
+    /// The calendar year in the configured zone. Invoice numbers count within
+    /// it, so an invoice issued at 23:30 on new year's eve in Jakarta belongs
+    /// to the year Jakarta was in, not the year UTC was in.
+    pub year: i32,
     /// 0-23 in the configured zone, never UTC — a peak-hour rule written for
     /// Jakarta evenings must not fire at Jakarta lunchtime.
     pub hour: u32,
@@ -175,10 +208,18 @@ pub struct LocalParts {
     pub stamp: String,
 }
 
+/// Day of the month, 1-31, in the given zone. What the billing cycle compares
+/// its configured day against.
+pub fn local_day_of_month(ts_ms: i64, tz: &Tz) -> u32 {
+    use chrono::Datelike;
+    local(ts_ms, tz).day()
+}
+
 pub fn local_parts(ts_ms: i64, tz: &Tz) -> LocalParts {
     use chrono::{Datelike, Timelike};
     let at = local(ts_ms, tz);
     LocalParts {
+        year: at.year(),
         hour: at.hour(),
         weekday: at.weekday().num_days_from_monday(),
         stamp: at.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),

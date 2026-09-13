@@ -125,9 +125,10 @@ async fn not_found() -> Response {
 fn require_key(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<crate::config::ClientKey, Box<Response>> {
+) -> Result<Arc<crate::config::ClientKey>, Box<Response>> {
     let cfg = state.config.current();
-    match handler::authenticate(&cfg, bearer_token(headers)) {
+    let keys = state.config.keys();
+    match handler::authenticate(&cfg, &keys, bearer_token(headers)) {
         Auth::Ok(key) => Ok(key),
         Auth::Denied { status, message } => Err(Box::new(error_response(
             status,
@@ -340,7 +341,7 @@ async fn embeddings(
     let started = std::time::Instant::now();
     let started_wall = now_ms();
     let tz = cfg.tz();
-    let user_id = crate::relay::handler::user_id_of(&body, &headers);
+    let user_id = crate::relay::handler::effective_user_id(&cfg, &key, &body, &headers);
 
     let inputs: Vec<String> = match body.get("input") {
         Some(Value::Array(items)) => items
@@ -417,11 +418,8 @@ async fn embeddings(
         day: day_key(started_wall, &tz),
         hour: hour_key(started_wall, &tz),
         key_id: key.id.clone(),
-        key_label: if key.label.is_empty() {
-            key.id.clone()
-        } else {
-            key.label.clone()
-        },
+        key_label: key.display_name().to_string(),
+        key_kind: key.kind,
         ip,
         user_agent: truncate(
             headers

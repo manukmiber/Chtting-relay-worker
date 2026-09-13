@@ -13,9 +13,20 @@
 //! Rows come in two phases. The `input` row is written as soon as the request
 //! is handed to the backend, so tokens the caller has already spent survive a
 //! crash, a hang-up, or a backend that never answers. The `final` row adds
-//! what could only be known at the end: output tokens, cache hits and timing.
-//! The two never restate the same figure, so a plain `SUM` over the table is
-//! the right answer.
+//! what could only be known at the end: output tokens, cache hits, timing and
+//! money. The two never restate the same figure, so a plain `SUM` over the
+//! table is the right answer.
+//!
+//! Money lands on the `final` row alone, because until the answer is complete
+//! there is no price to record — the output tokens are half of it. A request
+//! that was invoiced between its two rows therefore carries its cost into the
+//! next invoice, which is the honest answer: nothing was billed for it yet.
+//!
+//! Rows also carry the format they were written in. A relay that has been
+//! running since before there was a cost column has rows hashed over fewer
+//! fields, and those rows must keep verifying — so [`RowFormat`] decides which
+//! canonical form a row is checked against rather than the current code
+//! assuming its own.
 
 use rusqlite::types::Value as SqlValue;
 use serde::{Deserialize, Serialize};
@@ -24,7 +35,7 @@ use sha2::{Digest, Sha256};
 /// The hash a chain starts from.
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-pub const CREATE_SQL: &str = "
+pub const CREATE_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS usage_ledger (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id TEXT NOT NULL,
@@ -49,14 +60,13 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
   queued_ms REAL NOT NULL,
   tokens_per_sec REAL NOT NULL,
   prev_hash TEXT NOT NULL,
-  row_hash TEXT NOT NULL
+  row_hash TEXT NOT NULL,
+  user_id TEXT NOT NULL DEFAULT '',
+  key_kind TEXT NOT NULL DEFAULT 'company',
+  proxy_usd REAL NOT NULL DEFAULT 0,
+  backend_usd REAL NOT NULL DEFAULT 0,
+  fmt INTEGER NOT NULL DEFAULT 1
 );
-CREATE INDEX IF NOT EXISTS idx_ledger_day ON usage_ledger(day);
-CREATE INDEX IF NOT EXISTS idx_ledger_ts ON usage_ledger(ts DESC);
-CREATE INDEX IF NOT EXISTS idx_ledger_key ON usage_ledger(key_id);
-CREATE INDEX IF NOT EXISTS idx_ledger_model ON usage_ledger(public_model);
-CREATE INDEX IF NOT EXISTS idx_ledger_request ON usage_ledger(request_id);
-
 -- The point of the whole table. SQLite runs these for every statement, from
 -- this process or any other, so a recorded figure has no legitimate way to
 -- change.
@@ -72,15 +82,49 @@ BEGIN
 END;
 ";
 
+/// The ledger's indexes, built after the migration for the same reason the
+/// request table's are: `idx_ledger_user` names a column that a database
+/// written by an earlier build has not got yet.
+pub const INDEX_SQL: &str = "
+CREATE INDEX IF NOT EXISTS idx_ledger_day ON usage_ledger(day);
+CREATE INDEX IF NOT EXISTS idx_ledger_ts ON usage_ledger(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_key ON usage_ledger(key_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_model ON usage_ledger(public_model);
+CREATE INDEX IF NOT EXISTS idx_ledger_request ON usage_ledger(request_id);
+-- Billing reads one key's rows since its last invoice, which is exactly this
+-- index: without it, issuing an invoice is a full scan of the whole history.
+CREATE INDEX IF NOT EXISTS idx_ledger_key_seq ON usage_ledger(key_id, seq);
+-- And the per-model breakdown on that invoice groups within it.
+CREATE INDEX IF NOT EXISTS idx_ledger_key_model ON usage_ledger(key_id, public_model);
+CREATE INDEX IF NOT EXISTS idx_ledger_user ON usage_ledger(user_id);
+";
+
 pub const INSERT_SQL: &str = "INSERT INTO usage_ledger (
   request_id, phase, ts, day, hour, key_id, public_model, backend_id, status,
   requests, input_tokens, billed_input_tokens, output_tokens, cached_tokens,
   reasoning_tokens, cache_hit, ttft_ms, gen_ms, total_ms, queued_ms,
-  tokens_per_sec, prev_hash, row_hash
+  tokens_per_sec, prev_hash, row_hash,
+  user_id, key_kind, proxy_usd, backend_usd, fmt
 ) VALUES (
   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-  ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+  ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+  ?24, ?25, ?26, ?27, ?28
 )";
+
+/// Columns added to the ledger after its first release, for the same reason
+/// [`crate::store::schema::ADDED_COLUMNS`] exists: `CREATE TABLE IF NOT EXISTS`
+/// leaves an existing table exactly as it was.
+///
+/// Every one of them has a `DEFAULT`, so the rows already there keep a value
+/// that means what it should — no cost, no user, a company key, format 1 —
+/// rather than a null that every `SUM` would then have to guard against.
+pub const ADDED_COLUMNS: [(&str, &str); 5] = [
+    ("user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("key_kind", "TEXT NOT NULL DEFAULT 'company'"),
+    ("proxy_usd", "REAL NOT NULL DEFAULT 0"),
+    ("backend_usd", "REAL NOT NULL DEFAULT 0"),
+    ("fmt", "INTEGER NOT NULL DEFAULT 1"),
+];
 
 /// Which half of a request a row accounts for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +173,17 @@ pub struct LedgerEntry {
     /// How long this request waited for a slot before any work started.
     pub queued_ms: f64,
     pub tokens_per_sec: f64,
+    /// Who the request was on behalf of: the caller's own id under a company
+    /// key, the key's own identity under a private one. This is what a company
+    /// invoice breaks its usage down by.
+    pub user_id: String,
+    /// The kind of key at the time, as [`crate::config::KeyKind`] spells it.
+    pub key_kind: String,
+    /// What the caller is charged for this request, in USD. Only ever on the
+    /// `final` row — see the module header.
+    pub proxy_usd: f64,
+    /// What the relay pays the backend for the same request.
+    pub backend_usd: f64,
 }
 
 impl Default for LedgerEntry {
@@ -155,6 +210,45 @@ impl Default for LedgerEntry {
             total_ms: 0.0,
             queued_ms: 0.0,
             tokens_per_sec: 0.0,
+            user_id: String::new(),
+            key_kind: crate::config::KeyKind::Company.as_str().to_string(),
+            proxy_usd: 0.0,
+            backend_usd: 0.0,
+        }
+    }
+}
+
+/// Which set of fields a row was hashed over.
+///
+/// A number on the row rather than an assumption in the code, so a ledger
+/// written before cost was recorded still verifies against the form it was
+/// actually written in. New rows are always [`RowFormat::WithCost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowFormat {
+    /// The original twenty-one fields. Read-only: nothing writes these now.
+    Tokens,
+    /// The same, then the user, the key kind and the two money figures.
+    WithCost,
+}
+
+impl RowFormat {
+    pub const CURRENT: RowFormat = RowFormat::WithCost;
+
+    pub fn as_i64(self) -> i64 {
+        match self {
+            RowFormat::Tokens => 1,
+            RowFormat::WithCost => 2,
+        }
+    }
+
+    /// Anything unrecognised reads as the original form. A row from a *newer*
+    /// build than this one cannot be verified against fields this build does
+    /// not know about, and will show up as a break — which is the right way
+    /// round: a downgrade should not quietly bless rows it cannot check.
+    pub fn from_i64(n: i64) -> Self {
+        match n {
+            2 => RowFormat::WithCost,
+            _ => RowFormat::Tokens,
         }
     }
 }
@@ -166,8 +260,13 @@ impl LedgerEntry {
     /// floats at a fixed precision so the same row hashes the same way on any
     /// machine. `seq` is left out because SQLite assigns it after the hash is
     /// computed; position in the chain is already pinned by `prev_hash`.
-    fn canonical(&self) -> String {
-        format!(
+    ///
+    /// The money is at nine decimal places, matching what [`crate::pricing`]
+    /// rounds to: a rate of a few cents per million tokens over a short reply
+    /// is a real number several places down, and a hash that rounded it away
+    /// would leave those places unprotected.
+    fn canonical(&self, format: RowFormat) -> String {
+        let head = format!(
             "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:.3}|{:.3}|{:.3}|{:.3}|{:.3}",
             self.request_id,
             self.phase.as_str(),
@@ -190,14 +289,25 @@ impl LedgerEntry {
             self.total_ms,
             self.queued_ms,
             self.tokens_per_sec,
-        )
+        );
+        match format {
+            RowFormat::Tokens => head,
+            RowFormat::WithCost => format!(
+                "{head}|{}|{}|{:.9}|{:.9}",
+                self.user_id, self.key_kind, self.proxy_usd, self.backend_usd,
+            ),
+        }
     }
 
     pub fn hash_with(&self, prev: &str) -> String {
+        self.hash_as(prev, RowFormat::CURRENT)
+    }
+
+    pub fn hash_as(&self, prev: &str, format: RowFormat) -> String {
         let mut hasher = Sha256::new();
         hasher.update(prev.as_bytes());
         hasher.update(b"\n");
-        hasher.update(self.canonical().as_bytes());
+        hasher.update(self.canonical(format).as_bytes());
         hex(&hasher.finalize())
     }
 
@@ -227,6 +337,11 @@ impl LedgerEntry {
             SqlValue::Real(self.tokens_per_sec),
             SqlValue::Text(prev_hash.to_string()),
             SqlValue::Text(row_hash.to_string()),
+            SqlValue::Text(self.user_id.clone()),
+            SqlValue::Text(self.key_kind.clone()),
+            SqlValue::Real(self.proxy_usd),
+            SqlValue::Real(self.backend_usd),
+            SqlValue::Integer(RowFormat::CURRENT.as_i64()),
         ]
     }
 }
@@ -261,7 +376,8 @@ pub fn verify(conn: &rusqlite::Connection) -> rusqlite::Result<Verification> {
         "SELECT seq, request_id, phase, ts, day, hour, key_id, public_model, backend_id,
                 status, requests, input_tokens, billed_input_tokens, output_tokens,
                 cached_tokens, reasoning_tokens, cache_hit, ttft_ms, gen_ms, total_ms,
-                queued_ms, tokens_per_sec, prev_hash, row_hash
+                queued_ms, tokens_per_sec, prev_hash, row_hash,
+                user_id, key_kind, proxy_usd, backend_usd, fmt
          FROM usage_ledger ORDER BY seq ASC",
     )?;
 
@@ -297,11 +413,19 @@ pub fn verify(conn: &rusqlite::Connection) -> rusqlite::Result<Verification> {
             total_ms: row.get(19)?,
             queued_ms: row.get(20)?,
             tokens_per_sec: row.get(21)?,
+            user_id: row.get(24)?,
+            key_kind: row.get(25)?,
+            proxy_usd: row.get(26)?,
+            backend_usd: row.get(27)?,
         };
         let stored_prev: String = row.get(22)?;
         let stored_hash: String = row.get(23)?;
+        // The form the row says it was written in, not the one this build
+        // writes: a ledger that predates the cost columns is still intact and
+        // must still read as intact.
+        let format = RowFormat::from_i64(row.get(28)?);
 
-        if stored_prev != prev || entry.hash_with(&prev) != stored_hash {
+        if stored_prev != prev || entry.hash_as(&prev, format) != stored_hash {
             return Ok(Verification {
                 ok: false,
                 rows: count,
