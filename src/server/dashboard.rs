@@ -1728,9 +1728,18 @@ async fn static_files(request: Request) -> Response {
                 Some("ico") => "image/x-icon",
                 _ => "application/octet-stream",
             };
+            // The assets are compiled into the binary, so the binary is the
+            // only version of them there is — but a browser that cached the
+            // last build keeps showing it, and on a phone that cache outlives
+            // any number of restarts. `no-cache` still stores the file; it
+            // just makes the browser ask first, which is what a dashboard that
+            // ships with the binary needs to stay in step with it.
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, mime)],
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, "no-cache, must-revalidate"),
+                ],
                 Body::from(file.contents()),
             )
                 .into_response()
