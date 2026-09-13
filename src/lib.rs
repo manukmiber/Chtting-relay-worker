@@ -5,7 +5,9 @@
 
 pub mod config;
 pub mod logging;
+pub mod pricing;
 pub mod relay;
+pub mod rotate;
 pub mod server;
 pub mod state;
 pub mod store;

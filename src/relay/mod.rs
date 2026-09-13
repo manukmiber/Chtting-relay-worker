@@ -2,7 +2,9 @@
 
 pub mod gate;
 pub mod handler;
+pub mod pace;
 pub mod sse;
+pub mod trace;
 pub mod transform;
 pub mod upstream;
 

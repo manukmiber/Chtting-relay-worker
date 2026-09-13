@@ -40,6 +40,9 @@ export async function modelsView(ctx) {
         m.systemPrompt?.mode && m.systemPrompt.mode !== 'none'
           ? pill(m.systemPrompt.mode, 'accent')
           : h('span.muted', { text: '—' }),
+        m.systemPrompts?.length ? pill(`+${m.systemPrompts.length} by effort`, 'accent') : null,
+        m.maxTokensPerSecond ? pill(`${m.maxTokensPerSecond} tok/s`, 'warn') : null,
+        m.pricing?.enabled ? pill('priced', 'ok') : null,
         m.openrouter?.listed ? pill('OpenRouter', 'ok') : null),
       h('td', {}, h('button.ghost.sm', {
         onclick: (e) => { e.stopPropagation(); copy(m.id, `Copied "${m.id}"`); },
@@ -65,6 +68,9 @@ function editModel(ctx, existing) {
     description: '',
     aliases: [],
     systemPrompt: { mode: 'none', text: '', promptId: '' },
+    systemPrompts: [],
+    maxTokensPerSecond: 0,
+    pricing: {},
     params: {},
     forceParams: {},
     limits: { maxInputTokens: 0, maxOutputTokens: 0 },
@@ -135,10 +141,24 @@ function editModel(ctx, existing) {
     };
     inputs.spPromptId.addEventListener('change', syncPromptSource);
 
+    // One model, several prompts, chosen by how hard the caller asked the model
+    // to think. A non-reasoning call and a maximum-effort call want different
+    // instructions, and the rule that matches first wins.
+    inputs.promptRules = textarea(JSON.stringify(m.systemPrompts ?? [], null, 1), { rows: 8 });
+
     body.append(section('System prompt injection', [
       field('Mode', inputs.spMode),
       field('Use a saved prompt', inputs.spPromptId, 'from the Prompts tab; overrides the text below'),
       spTextField,
+      h('hr'),
+      h('p.small.muted', {
+        text: 'A prompt per thinking effort. The first rule whose effort matches wins; '
+          + 'a caller who named no effort falls through to the prompt above. Efforts are '
+          + 'none, minimal, low, medium, high, max and default.',
+      }),
+      field('Prompts by effort', inputs.promptRules,
+        'JSON: [{"efforts":["none","low"],"prompt":{"mode":"replace","text":"…"}}, '
+        + '{"minEffort":"high","prompt":{"mode":"replace","promptId":"sp_…"}}]'),
     ], true));
     syncPromptSource();
 
@@ -157,6 +177,55 @@ function editModel(ctx, existing) {
         field('Max output tokens', inputs.maxOut, '0 = no limit'),
         field('Context length', inputs.contextLength, 'shown in /v1/models'),
       ),
+    ]));
+
+    /* --------------------------------------------------------- pricing */
+    const pr = m.pricing ?? {};
+    inputs.maxTps = number(m.maxTokensPerSecond ?? 0, { min: 0, step: 1 });
+    inputs.prEnabled = h('input', { type: 'checkbox', checked: pr.enabled === true });
+    inputs.prBackendIn = number(pr.backendInputUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prBackendOut = number(pr.backendOutputUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prBackendCached = number(pr.backendCachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prBackendReasoning = number(pr.backendReasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prIn = number(pr.inputUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prOut = number(pr.outputUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prMargin = number(pr.marginPercent ?? 0, { min: 0, step: 1 });
+    inputs.prRequest = number(pr.requestUsd ?? 0, { min: 0, step: 0.0001 });
+    inputs.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 10 });
+
+    body.append(section('Speed and price', [
+      h('p.small.muted', {
+        text: 'A ceiling on how fast the reply leaves the relay. A backend running at '
+          + '170 tokens a second pushes 170 a second down the tunnel; holding it to 35 '
+          + 'costs the reader nothing they notice and leaves the uplink room to breathe. '
+          + '0 means full speed.',
+      }),
+      field('Tokens per second out', inputs.maxTps, '0 = as fast as the backend manages'),
+      h('hr'),
+      h('label.switch', { style: { marginBottom: '12px' } }, inputs.prEnabled,
+        h('span', { text: 'Price this model (leave off to inherit the global price list)' })),
+      h('p.small.muted', { text: 'Rates are USD per million tokens. Left at 0, each one falls back to the global list.' }),
+      h('div.grid.form', {},
+        field('Backend input', inputs.prBackendIn, 'what we are charged'),
+        field('Backend output', inputs.prBackendOut),
+        field('Backend cached input', inputs.prBackendCached, '0 = no cache discount'),
+        field('Backend reasoning', inputs.prBackendReasoning, '0 = billed as output'),
+      ),
+      h('div.grid.form', {},
+        field('Our input', inputs.prIn, '0 = backend rate + margin'),
+        field('Our output', inputs.prOut, '0 = backend rate + margin'),
+        field('Margin %', inputs.prMargin),
+        field('Per-request fee', inputs.prRequest),
+      ),
+      h('p.small.muted', {
+        text: 'Tiers change the price per request, and every tier that matches applies — '
+          + 'a long prompt during a busy hour at maximum thinking effort pays all three. '
+          + 'There is no limit on how many you add.',
+      }),
+      field('Price tiers', inputs.prTiers,
+        'JSON: [{"name":"busy hours","inputMultiplier":1.25,"when":{"hours":[{"from":19,"to":23}]}}, '
+        + '{"name":"over 256K","inputMultiplier":2,"when":{"minInputTokens":256000}}, '
+        + '{"name":"hard thinking","reasoningMultiplier":1.5,"when":{"minEffort":"high"}}]'),
     ]));
 
     /* ------------------------------------------------------- tokenizer */
@@ -361,6 +430,20 @@ function editModel(ctx, existing) {
             // model's own inline text instead of overwriting it with the copy
             text: inputs.spPromptId.value ? (m.systemPrompt?.text ?? '') : inputs.spText.value,
             promptId: inputs.spPromptId.value,
+          },
+          systemPrompts: JSON.parse(inputs.promptRules.value || '[]'),
+          maxTokensPerSecond: Number(inputs.maxTps.value) || 0,
+          pricing: {
+            enabled: inputs.prEnabled.checked,
+            backendInputUsdPerM: Number(inputs.prBackendIn.value) || 0,
+            backendOutputUsdPerM: Number(inputs.prBackendOut.value) || 0,
+            backendCachedInputUsdPerM: Number(inputs.prBackendCached.value) || 0,
+            backendReasoningUsdPerM: Number(inputs.prBackendReasoning.value) || 0,
+            inputUsdPerM: Number(inputs.prIn.value) || 0,
+            outputUsdPerM: Number(inputs.prOut.value) || 0,
+            marginPercent: Number(inputs.prMargin.value) || 0,
+            requestUsd: Number(inputs.prRequest.value) || 0,
+            tiers: JSON.parse(inputs.prTiers.value || '[]'),
           },
           params: parseKeyValues(inputs.params.value),
           forceParams: parseKeyValues(inputs.forceParams.value),

@@ -7,7 +7,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Row;
 use serde::{Deserialize, Serialize};
 
-pub const FIELDS: [&str; 40] = [
+pub const FIELDS: [&str; 56] = [
     "id",
     "ts",
     "day",
@@ -48,6 +48,22 @@ pub const FIELDS: [&str; 40] = [
     "system_prompt_tokens",
     "cache_hit",
     "queued_ms",
+    "user_id",
+    "reasoning_effort",
+    "prompt_id",
+    "local_hour",
+    "local_weekday",
+    "tokenize_ms",
+    "inject_ms",
+    "bytes_in",
+    "bytes_out",
+    "bytes_upstream",
+    "rss_mb",
+    "backend_usd",
+    "proxy_usd",
+    "profit_usd",
+    "price_tiers",
+    "target_tps",
 ];
 
 pub const CREATE_SQL: &str = "
@@ -67,7 +83,13 @@ CREATE TABLE IF NOT EXISTS requests (
   drift_prompt INTEGER, drift_completion INTEGER,
   req_preview TEXT, res_preview TEXT, retries INTEGER,
   user_prompt_tokens INTEGER, billed_prompt_tokens INTEGER,
-  system_prompt_tokens INTEGER, cache_hit INTEGER, queued_ms REAL
+  system_prompt_tokens INTEGER, cache_hit INTEGER, queued_ms REAL,
+  user_id TEXT, reasoning_effort TEXT, prompt_id TEXT,
+  local_hour INTEGER, local_weekday INTEGER,
+  tokenize_ms REAL, inject_ms REAL,
+  bytes_in INTEGER, bytes_out INTEGER, bytes_upstream INTEGER, rss_mb REAL,
+  backend_usd REAL, proxy_usd REAL, profit_usd REAL, price_tiers TEXT,
+  target_tps REAL
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_requests_day ON requests(day);
@@ -75,6 +97,8 @@ CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(public_model);
 CREATE INDEX IF NOT EXISTS idx_requests_key ON requests(key_id);
 -- Quota seeding groups by (key_id, day) on every start.
 CREATE INDEX IF NOT EXISTS idx_requests_key_day ON requests(key_id, day);
+-- The Usage screen groups by caller, which is a different question to by-key.
+CREATE INDEX IF NOT EXISTS idx_requests_user ON requests(user_id);
 ";
 
 pub const INSERT_SQL: &str = "INSERT OR REPLACE INTO requests (
@@ -89,24 +113,58 @@ pub const INSERT_SQL: &str = "INSERT OR REPLACE INTO requests (
   local_prompt, local_completion, drift_prompt, drift_completion,
   req_preview, res_preview, retries,
   user_prompt_tokens, billed_prompt_tokens, system_prompt_tokens,
-  cache_hit, queued_ms
+  cache_hit, queued_ms,
+  user_id,
+  reasoning_effort,
+  prompt_id,
+  local_hour,
+  local_weekday,
+  tokenize_ms,
+  inject_ms,
+  bytes_in,
+  bytes_out,
+  bytes_upstream,
+  rss_mb,
+  backend_usd,
+  proxy_usd,
+  profit_usd,
+  price_tiers,
+  target_tps
 ) VALUES (
   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
   ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-  ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
+  ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
+  ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
+  ?51, ?52, ?53, ?54, ?55, ?56
 )";
 
 /// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` leaves
 /// an existing table alone, so an install that predates them needs each one
 /// added by hand; SQLite has no `ADD COLUMN IF NOT EXISTS`, so the caller
 /// checks `PRAGMA table_info` first.
-pub const ADDED_COLUMNS: [(&str, &str); 5] = [
+pub const ADDED_COLUMNS: [(&str, &str); 21] = [
     ("user_prompt_tokens", "INTEGER"),
     ("billed_prompt_tokens", "INTEGER"),
     ("system_prompt_tokens", "INTEGER"),
     ("cache_hit", "INTEGER"),
     ("queued_ms", "REAL"),
+    ("user_id", "TEXT"),
+    ("reasoning_effort", "TEXT"),
+    ("prompt_id", "TEXT"),
+    ("local_hour", "INTEGER"),
+    ("local_weekday", "INTEGER"),
+    ("tokenize_ms", "REAL"),
+    ("inject_ms", "REAL"),
+    ("bytes_in", "INTEGER"),
+    ("bytes_out", "INTEGER"),
+    ("bytes_upstream", "INTEGER"),
+    ("rss_mb", "REAL"),
+    ("backend_usd", "REAL"),
+    ("proxy_usd", "REAL"),
+    ("profit_usd", "REAL"),
+    ("price_tiers", "TEXT"),
+    ("target_tps", "REAL"),
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -167,6 +225,41 @@ pub struct RequestRecord {
     pub cache_hit: i64,
     /// Time spent waiting for a concurrency slot, before any work began.
     pub queued_ms: f64,
+    /// Who the caller said they were, from the body's `user` field or the
+    /// `x-user-id` header. Passed upstream as the prompt-cache isolation key.
+    pub user_id: String,
+    /// How hard the caller asked the model to think, normalised: `none`,
+    /// `minimal`, `low`, `medium`, `high`, `max`, or `default` when they said
+    /// nothing. Drives both the system prompt and the price.
+    pub reasoning_effort: String,
+    /// Which of the model's system prompt rules answered, if one did.
+    pub prompt_id: String,
+    /// Hour of day and day of week in the relay's own zone, so a peak-hour
+    /// price can be checked against the row that paid it without re-deriving
+    /// the timezone months later.
+    pub local_hour: u32,
+    /// Monday is 0.
+    pub local_weekday: u32,
+    pub tokenize_ms: f64,
+    pub inject_ms: f64,
+    /// Request body size on the wire.
+    pub bytes_in: u64,
+    /// What was written back to the caller.
+    pub bytes_out: u64,
+    /// What was read from the backend.
+    pub bytes_upstream: u64,
+    /// Resident memory of the relay when this request finished.
+    pub rss_mb: f64,
+    /// What the backend charges for this request.
+    pub backend_usd: f64,
+    /// What the caller is charged.
+    pub proxy_usd: f64,
+    /// The difference. Negative when a tier discounted below cost.
+    pub profit_usd: f64,
+    /// The price tiers that applied, comma separated.
+    pub price_tiers: String,
+    /// The tokens-a-second ceiling this reply was held to, or 0.
+    pub target_tps: f64,
 }
 
 impl RequestRecord {
@@ -213,6 +306,22 @@ impl RequestRecord {
             SqlValue::Integer(self.system_prompt_tokens),
             SqlValue::Integer(self.cache_hit),
             SqlValue::Real(self.queued_ms),
+            SqlValue::Text(self.user_id.clone()),
+            SqlValue::Text(self.reasoning_effort.clone()),
+            SqlValue::Text(self.prompt_id.clone()),
+            SqlValue::Integer(i64::from(self.local_hour)),
+            SqlValue::Integer(i64::from(self.local_weekday)),
+            SqlValue::Real(self.tokenize_ms),
+            SqlValue::Real(self.inject_ms),
+            SqlValue::Integer(self.bytes_in as i64),
+            SqlValue::Integer(self.bytes_out as i64),
+            SqlValue::Integer(self.bytes_upstream as i64),
+            SqlValue::Real(self.rss_mb),
+            SqlValue::Real(self.backend_usd),
+            SqlValue::Real(self.proxy_usd),
+            SqlValue::Real(self.profit_usd),
+            SqlValue::Text(self.price_tiers.clone()),
+            SqlValue::Real(self.target_tps),
         ]
     }
 }

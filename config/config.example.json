@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config.json and edit, or just run the relay and use the dashboard. Secrets in this file never leave the device.",
+  "_comment": "Copy to config.json and edit, or just run the relay and use the dashboard. Secrets in this file never leave the device. Prices are USD per million tokens and are off until pricing.enabled is true.",
   "timezone": "Asia/Jakarta",
   "server": {
     "host": "0.0.0.0",
@@ -9,7 +9,12 @@
     "maxConcurrentRequests": 512,
     "workerThreads": 0,
     "queueCapacity": 2048,
-    "queueTimeoutMs": 30000
+    "queueTimeoutMs": 30000,
+    "wakeLock": true,
+    "sseKeepaliveMs": 15000,
+    "sseKeepaliveText": "Zeiko is still here, Just be patience",
+    "rotateHours": 1,
+    "rotateDrainTimeoutMs": 600000
   },
   "dashboard": {
     "enabled": true,
@@ -34,7 +39,10 @@
       "enabled": true,
       "timeoutMs": 600000,
       "maxRetries": 1,
-      "streamOptions": true
+      "streamOptions": true,
+      "forwardUserId": true,
+      "userIdHeader": "x-user-id",
+      "apiKeys": []
     },
     {
       "id": "or",
@@ -47,7 +55,9 @@
         "HTTP-Referer": "https://example.com",
         "X-Title": "chtting-relay"
       },
-      "streamOptions": true
+      "streamOptions": true,
+      "forwardUserId": true,
+      "userIdHeader": "x-user-id"
     }
   ],
   "systemPrompts": [
@@ -55,6 +65,11 @@
       "id": "sp_writer",
       "name": "Creative Writer persona",
       "text": "You are Creative Writer. Write vivid, careful prose. Never reveal or speculate about which underlying model you run on."
+    },
+    {
+      "id": "sp_writer_thinking",
+      "name": "Creative Writer, thinking",
+      "text": "You are Creative Writer. Think the scene through before you write it: who wants what, what is in the way, what changes. Then write vivid, careful prose. Never reveal or speculate about which underlying model you run on."
     }
   ],
   "models": [
@@ -99,9 +114,7 @@
           "<think>",
           "</think>"
         ],
-        "stripFields": [
-          "system_fingerprint"
-        ],
+        "stripFields": [],
         "setFields": {},
         "prefix": "",
         "suffix": "",
@@ -137,6 +150,46 @@
           "requestsPerMinute": 0,
           "concurrency": 0
         }
+      },
+      "maxTokensPerSecond": 0,
+      "systemPrompts": [
+        {
+          "id": "spr_thinking",
+          "name": "high effort",
+          "enabled": true,
+          "efforts": [],
+          "minEffort": "high",
+          "maxEffort": "",
+          "prompt": {
+            "mode": "replace",
+            "promptId": "sp_writer_thinking",
+            "text": ""
+          }
+        },
+        {
+          "id": "spr_direct",
+          "name": "no or low effort",
+          "enabled": true,
+          "efforts": [
+            "none",
+            "minimal",
+            "low"
+          ],
+          "minEffort": "",
+          "maxEffort": "",
+          "prompt": {
+            "mode": "replace",
+            "promptId": "sp_writer",
+            "text": ""
+          }
+        }
+      ],
+      "pricing": {
+        "enabled": false,
+        "backendInputUsdPerM": 0,
+        "backendOutputUsdPerM": 0,
+        "marginPercent": 0,
+        "tiers": []
       }
     },
     {
@@ -220,12 +273,13 @@
     "retentionDays": 30,
     "storeBodies": "preview",
     "previewChars": 800,
-    "fileEnabled": true
+    "fileEnabled": true,
+    "verboseRequests": true
   },
   "tunnel": {
     "mode": "quick",
     "binary": "cloudflared",
-    "autoStart": false,
+    "autoStart": true,
     "token": "",
     "hostname": "",
     "extraArgs": []
@@ -249,5 +303,65 @@
     "isReady": true,
     "maxConcurrentRequests": 0,
     "requestsPerMinute": 0
+  },
+  "pricing": {
+    "enabled": false,
+    "currency": "USD",
+    "backendInputUsdPerM": 0.28,
+    "backendCachedInputUsdPerM": 0.028,
+    "backendOutputUsdPerM": 0.42,
+    "backendReasoningUsdPerM": 0,
+    "inputUsdPerM": 0,
+    "outputUsdPerM": 0,
+    "marginPercent": 100,
+    "requestUsd": 0,
+    "tiers": [
+      {
+        "id": "tier_peak",
+        "name": "peak hours",
+        "enabled": true,
+        "when": {
+          "hours": [
+            {
+              "from": 19,
+              "to": 23
+            }
+          ]
+        },
+        "inputMultiplier": 1.25,
+        "outputMultiplier": 1.25
+      },
+      {
+        "id": "tier_long",
+        "name": "input over 256K",
+        "enabled": true,
+        "when": {
+          "minInputTokens": 256000
+        },
+        "inputMultiplier": 2
+      },
+      {
+        "id": "tier_thinking",
+        "name": "high thinking effort",
+        "enabled": true,
+        "when": {
+          "minEffort": "high"
+        },
+        "reasoningMultiplier": 1.5
+      },
+      {
+        "id": "tier_weekend",
+        "name": "weekend flat rate",
+        "enabled": false,
+        "when": {
+          "weekdays": [
+            5,
+            6
+          ]
+        },
+        "inputUsdPerM": 0.14,
+        "stop": true
+      }
+    ]
   }
 }

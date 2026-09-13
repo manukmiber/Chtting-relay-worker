@@ -41,13 +41,13 @@ export async function settingsView(ctx) {
   i.queueCapacity = number(queue.configured.queueCapacity, { min: 0, max: 100000 });
   i.queueTimeout = number(queue.configured.queueTimeoutMs, { min: 100, step: 500 });
 
-  const live = queue.live;
+  const liveQueue = queue.live;
   const queueStats = h('div.grid.stats', {},
-    stat('Running now', String(live.inFlight), `of ${live.limit} slots`),
-    stat('Waiting', String(live.waiting), `peak ${live.peakWaiting}`),
-    stat('Average wait', fmtMs(live.avgWaitMs), `${fmtNum(live.admittedAfterWait)} queued so far`),
-    stat('Turned away', fmtNum(live.refusedQueueFull + live.refusedTimeout),
-      `${fmtNum(live.refusedQueueFull)} full · ${fmtNum(live.refusedTimeout)} timed out`),
+    stat('Running now', String(liveQueue.inFlight), `of ${liveQueue.limit} slots`),
+    stat('Waiting', String(liveQueue.waiting), `peak ${liveQueue.peakWaiting}`),
+    stat('Average wait', fmtMs(liveQueue.avgWaitMs), `${fmtNum(liveQueue.admittedAfterWait)} queued so far`),
+    stat('Turned away', fmtNum(liveQueue.refusedQueueFull + liveQueue.refusedTimeout),
+      `${fmtNum(liveQueue.refusedQueueFull)} full · ${fmtNum(liveQueue.refusedTimeout)} timed out`),
   );
 
   root.append(card('Concurrency and queue', h('div', {},
@@ -62,6 +62,93 @@ export async function settingsView(ctx) {
       field('Give up after (ms)', i.queueTimeout, 'keep it under your client\'s own timeout'),
     ),
   ), [h('button.ghost.sm', { onclick: () => ctx.rerender() }, '↻ Refresh')]));
+
+  /* ---------------------------------------------------------- lifecycle */
+  i.rotateHours = number(cfg.server.rotateHours ?? 1, { min: 0, max: 168 });
+  i.rotateMinutes = number(cfg.server.rotateMinutes ?? 0, { min: 0, max: 1440 });
+  i.rotateDrain = number(cfg.server.rotateDrainTimeoutMs ?? 600000, { min: 1000, step: 1000 });
+  i.keepaliveMs = number(cfg.server.sseKeepaliveMs ?? 15000, { min: 0, step: 1000 });
+  i.keepaliveText = text(cfg.server.sseKeepaliveText ?? '');
+  i.wakeLock = h('input', { type: 'checkbox', checked: cfg.server.wakeLock !== false });
+
+  root.append(card('Staying alive', h('div', {},
+    h('p.small.muted', {
+      text: 'Android goes after whatever has been resident longest, so the relay '
+        + 'replaces itself on a clock instead of waiting to be killed. The new copy '
+        + 'binds the same port before the old one stops accepting, so nothing in '
+        + 'flight is dropped and no connection is refused. 0 hours switches it off.',
+    }),
+    h('div.grid.form', {},
+      field('Replace itself every (hours)', i.rotateHours, '0 = never'),
+      field('…or every (minutes)', i.rotateMinutes, '0 = use the hours above'),
+      field('Drain for up to (ms)', i.rotateDrain, 'how long the old copy waits for its last requests'),
+    ),
+    h('label.switch', { style: { margin: '10px 0' } }, i.wakeLock,
+      h('span', { text: 'Hold Android\'s wake lock while running' })),
+    h('hr'),
+    h('p.small.muted', {
+      text: 'While a backend is thinking, the relay sends a keep-alive comment of its '
+        + 'own so the connection survives cloudflared and every NAT on the way. The '
+        + 'backend\'s own keep-alives are never forwarded — their shape would say which '
+        + 'backend is upstream. 0 switches ours off.',
+    }),
+    h('div.grid.form', {},
+      field('Keep-alive every (ms)', i.keepaliveMs, '0 = none'),
+      field('Keep-alive text', i.keepaliveText, 'sent as an SSE comment'),
+    ),
+  )));
+
+  /* ------------------------------------------------------------ pricing */
+  const pr = cfg.pricing ?? {};
+  i.prEnabled = h('input', { type: 'checkbox', checked: pr.enabled === true });
+  i.prBackendIn = number(pr.backendInputUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prBackendOut = number(pr.backendOutputUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prBackendCached = number(pr.backendCachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prBackendReasoning = number(pr.backendReasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prIn = number(pr.inputUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prOut = number(pr.outputUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prCached = number(pr.cachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prReasoning = number(pr.reasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
+  i.prMargin = number(pr.marginPercent ?? 0, { min: 0, step: 1 });
+  i.prRequest = number(pr.requestUsd ?? 0, { min: 0, step: 0.0001 });
+  i.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 12 });
+
+  root.append(card('Pricing', h('div', {},
+    h('label.switch', { style: { marginBottom: '12px' } }, i.prEnabled,
+      h('span', { text: 'Price requests (off means no money is reported at all)' })),
+    h('p.small.muted', {
+      text: 'Rates are USD per million tokens. The backend rates are what this relay '
+        + 'is charged; ours are what callers are charged, and any of ours left at 0 is '
+        + 'taken as the backend rate plus the margin. A model can override all of it.',
+    }),
+    h('div.grid.form', {},
+      field('Backend input', i.prBackendIn),
+      field('Backend output', i.prBackendOut),
+      field('Backend cached input', i.prBackendCached, '0 = no cache discount'),
+      field('Backend reasoning', i.prBackendReasoning, '0 = billed as output'),
+    ),
+    h('div.grid.form', {},
+      field('Our input', i.prIn, '0 = backend + margin'),
+      field('Our output', i.prOut, '0 = backend + margin'),
+      field('Our cached input', i.prCached),
+      field('Our reasoning', i.prReasoning),
+    ),
+    h('div.grid.form', {},
+      field('Margin %', i.prMargin),
+      field('Per-request fee', i.prRequest),
+    ),
+    h('hr'),
+    h('p.small.muted', {
+      text: 'Tiers move the price per request, and every tier that matches applies — '
+        + 'so a 300k-token prompt at maximum thinking effort during a busy hour pays all '
+        + 'three multipliers, not whichever one happens to be first. Add as many as you '
+        + 'like; a tier with "stop": true ends the chain where it sits.',
+    }),
+    field('Price tiers', i.prTiers,
+      'each: {name, enabled, when:{models,efforts,minEffort,maxEffort,hours:[{from,to}],'
+      + 'weekdays,minInputTokens,maxInputTokens,minOutputTokens,minTotalTokens,streamed,cacheHit}, '
+      + 'inputMultiplier, outputMultiplier, reasoningMultiplier, inputUsdPerM, surchargeUsd, stop}'),
+  )));
 
   /* ---------------------------------------------------------- security */
   i.requireKey = h('input', { type: 'checkbox', checked: cfg.security.requireClientKey !== false });
@@ -88,6 +175,7 @@ export async function settingsView(ctx) {
   ]);
   i.previewChars = number(cfg.logging.previewChars, { min: 0, max: 20000 });
   i.fileEnabled = h('input', { type: 'checkbox', checked: cfg.logging.fileEnabled !== false });
+  i.verbose = h('input', { type: 'checkbox', checked: cfg.logging.verboseRequests !== false });
 
   root.append(card('Logging', h('div', {},
     h('div.grid.form', {},
@@ -97,6 +185,13 @@ export async function settingsView(ctx) {
     ),
     field('Store request bodies', i.storeBodies, 'prompts are stored on this device only'),
     h('label.switch', {}, i.fileEnabled, h('span', { text: 'Also write relay.log to disk' })),
+    h('label.switch', {}, i.verbose, h('span', { text: 'Trace every request phase by phase' })),
+    h('p.small.muted', {
+      text: 'The trace gives each request a uuid and follows it: how long tokenizing '
+        + 'took, how long injecting the prompt took, time to first token, and one '
+        + 'summary line with memory, network, tokens, cost and throughput. It goes to '
+        + 'the terminal and to relay.log alike, so the Logs tab shows what Termux shows.',
+    }),
   )));
 
   /* --------------------------------------------------------- tokenizer */
@@ -219,6 +314,12 @@ export async function settingsView(ctx) {
               maxConcurrentRequests: Number(i.maxConcurrent.value),
               queueCapacity: Number(i.queueCapacity.value),
               queueTimeoutMs: Number(i.queueTimeout.value),
+              rotateHours: Number(i.rotateHours.value) || 0,
+              rotateMinutes: Number(i.rotateMinutes.value) || 0,
+              rotateDrainTimeoutMs: Number(i.rotateDrain.value) || 600000,
+              sseKeepaliveMs: Number(i.keepaliveMs.value) || 0,
+              sseKeepaliveText: i.keepaliveText.value,
+              wakeLock: i.wakeLock.checked,
             },
             dashboard: {
               host: i.dashHost.value.trim(),
@@ -231,12 +332,27 @@ export async function settingsView(ctx) {
               corsOrigins: parseList(i.cors.value),
               blockedIps: parseList(i.blockedIps.value),
             },
+            pricing: {
+              enabled: i.prEnabled.checked,
+              backendInputUsdPerM: Number(i.prBackendIn.value) || 0,
+              backendOutputUsdPerM: Number(i.prBackendOut.value) || 0,
+              backendCachedInputUsdPerM: Number(i.prBackendCached.value) || 0,
+              backendReasoningUsdPerM: Number(i.prBackendReasoning.value) || 0,
+              inputUsdPerM: Number(i.prIn.value) || 0,
+              outputUsdPerM: Number(i.prOut.value) || 0,
+              cachedInputUsdPerM: Number(i.prCached.value) || 0,
+              reasoningUsdPerM: Number(i.prReasoning.value) || 0,
+              marginPercent: Number(i.prMargin.value) || 0,
+              requestUsd: Number(i.prRequest.value) || 0,
+              tiers: JSON.parse(i.prTiers.value || '[]'),
+            },
             logging: {
               level: i.level.value,
               retentionDays: Number(i.retention.value),
               storeBodies: i.storeBodies.value,
               previewChars: Number(i.previewChars.value),
               fileEnabled: i.fileEnabled.checked,
+              verboseRequests: i.verbose.checked,
             },
             tokenizer: {
               fallback: i.fallback.value.trim(),

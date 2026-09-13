@@ -170,11 +170,63 @@ export function fmtTime(ts) {
   return d.toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+/**
+ * A USD amount, at the precision the number actually has.
+ *
+ * A relay's per-request prices are fractions of a cent, and rounding them to
+ * two places would show every one of them as $0.00 — which reads as free. So
+ * small amounts keep their digits and large ones do not carry pointless ones.
+ */
+export function fmtUsd(n) {
+  const v = Number(n) || 0;
+  if (v === 0) return '$0';
+  const abs = Math.abs(v);
+  if (abs >= 1) return `$${v.toFixed(2)}`;
+  if (abs >= 0.01) return `$${v.toFixed(4)}`;
+  return `$${v.toFixed(6)}`;
+}
+
 export function fmtBytes(n) {
   const v = Number(n) || 0;
   if (v > 1048576) return `${(v / 1048576).toFixed(2)} MB`;
   if (v > 1024) return `${(v / 1024).toFixed(1)} kB`;
   return `${v} B`;
+}
+
+/**
+ * Re-run `tick` every `ms`, and stop when the view is left.
+ *
+ * Requirement 4: the live screens refresh themselves rather than waiting to be
+ * asked. The timer is registered with the view's `onLeave` hook so navigating
+ * away cancels it — otherwise every tab visited in a session would keep polling
+ * in the background, which on a phone is battery spent on a screen nobody is
+ * looking at.
+ *
+ * A tick that is still in flight is never overlapped, and one that throws is
+ * swallowed: a blip must not leave the page with a stopped clock.
+ */
+export function live(ctx, ms, tick) {
+  let running = false;
+  let stopped = false;
+  const timer = setInterval(async () => {
+    if (running || stopped || document.hidden) return;
+    running = true;
+    try {
+      await tick();
+    } catch {
+      /* a failed refresh is not worth a toast every few seconds */
+    } finally {
+      running = false;
+    }
+  }, ms);
+  ctx.onLeave(() => {
+    stopped = true;
+    clearInterval(timer);
+  });
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 export function copy(value, label = 'Copied') {

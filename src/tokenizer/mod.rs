@@ -88,17 +88,16 @@ impl TokenCounter {
     /// it — not the injected system prompt, not a rewrite rule. Send 6k tokens
     /// and the answer says 6k, because 6k is what was sent.
     ///
-    /// The body the backend receives is counted too, because
-    /// [`Usage::charged_to_caller`] needs it: it is the denominator the
-    /// backend's own bill is divided by. Injection only ever touches system
-    /// turns, so that figure is usually the caller's count plus the difference
-    /// between the two bodies' system turns, which are short. Only a rewrite
-    /// rule editing the caller's own text forces a second full pass, and a rule
-    /// that rewrites every message has earned one.
+    /// The body the backend receives is counted too, but for the operator
+    /// rather than the caller: it is what the backend will bill, and the gap
+    /// between the two is the relay's own cost of doing business. Injection
+    /// only ever touches system turns, so that figure is usually the caller's
+    /// count plus the difference between the two bodies' system turns, which
+    /// are short. Only a rewrite rule editing the caller's own text forces a
+    /// second full pass, and a rule that rewrites every message has earned one.
     ///
     /// One tokenizer over one conversation, so adding and subtracting here is
-    /// exact. Splitting a figure the *backend* reported is a different problem,
-    /// and `charged_to_caller` scales rather than subtracts for that reason.
+    /// exact.
     pub async fn count_prompt(
         &self,
         original: &Value,
@@ -255,49 +254,44 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// The same numbers with the relay's own system prompt taken back out.
+    /// The numbers the caller is shown and accounted for.
     ///
-    /// The backend charges for everything it received, injected prompt
-    /// included. The caller neither wrote that prompt nor can see it, so
-    /// billing them for it would be indefensible — this is the figure they are
-    /// shown and accounted for.
+    /// `prompt_tokens` is the relay's own count of the caller's own body,
+    /// measured before a word of system prompt was injected and before any
+    /// rewrite rule ran. It is never the backend's figure, for two reasons that
+    /// point the same way.
     ///
-    /// The caller pays their own measured count and nothing more: the relay's
-    /// tokenizer run over the caller's messages alone, before injection. Send
-    /// 6k tokens and the answer says 6k, whatever the relay bolted on top. A
-    /// caller who sees 10k come back has no way to tell an injected prompt
-    /// from a markup, and is right not to trust the difference.
+    /// The first is billing. The backend charges for everything it received,
+    /// injected prompt included; the caller neither wrote that prompt nor can
+    /// see it, so passing that number on would be charging them for the relay's
+    /// own words. A caller who sends 6k tokens and is told 10k has no way to
+    /// tell an injected prompt from a markup, and is right not to trust the
+    /// difference.
     ///
-    /// That figure is capped at the caller's share of what the backend
-    /// actually billed, so the relay can never charge out more than it was
-    /// charged. The cap is a proportion rather than a subtraction because the
-    /// two numbers can come from two different tokenizers: `prompt_tokens` may
-    /// be the backend's own count, while the split was measured locally.
-    /// Subtracting one from the other can go negative when the backend counts
-    /// a prompt more cheaply than the relay does — a real case, not a
-    /// hypothetical. A proportion cannot.
+    /// The second is that the backend's number is the backend's business. Its
+    /// tokenizer, its template overhead, its caching — none of that is
+    /// something a caller of this relay should be able to read off a usage
+    /// block. What they get is what this relay measured.
     ///
-    /// `user_local >= billed_local` means nothing was injected — or the route
-    /// replaced a longer system prompt of the caller's with a shorter one — so
-    /// the numbers pass through untouched.
-    pub fn charged_to_caller(&self, user_local: u64, billed_local: u64) -> Usage {
-        if billed_local == 0 || user_local >= billed_local {
-            return self.clone();
-        }
-        // Widened, because prompt × tokens overflows u64 only in theory but
-        // costs nothing to rule out. Rounded down, in the caller's favour.
-        let share = (u128::from(self.prompt_tokens) * u128::from(user_local)
-            / u128::from(billed_local)) as u64;
-        let prompt = user_local.min(share);
+    /// What the backend billed is kept beside it on the request row, so the
+    /// margin stays visible to the operator and to nobody else.
+    pub fn charged_to_caller(&self, user_local: u64) -> Usage {
         Usage {
-            prompt_tokens: prompt,
-            total_tokens: prompt + self.completion_tokens,
+            prompt_tokens: user_local,
+            total_tokens: user_local + self.completion_tokens,
+            // A cache hit is a fact about the caller's own prompt, so it
+            // travels — but it cannot be larger than the prompt it is part of.
+            cached_tokens: self.cached_tokens.min(user_local),
             ..self.clone()
         }
     }
 
     /// The `usage` object handed back to the caller.
-    pub fn public(&self) -> Value {
+    ///
+    /// `cost` is what this request came to under the relay's own price list,
+    /// which callers otherwise have no way to work out: the rates are the
+    /// relay's, not the backend's, and tiers can move them per request.
+    pub fn public(&self, cost: Option<f64>) -> Value {
         let mut out = serde_json::json!({
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
@@ -314,6 +308,12 @@ impl Usage {
             map.insert(
                 "completion_tokens_details".into(),
                 serde_json::json!({ "reasoning_tokens": self.reasoning_tokens }),
+            );
+        }
+        if let Some(cost) = cost {
+            map.insert(
+                "usage".into(),
+                serde_json::json!(crate::util::round(cost, 6)),
             );
         }
         out
@@ -524,9 +524,9 @@ mod usage_tests {
     }
 
     #[test]
-    fn the_caller_pays_for_their_share_of_the_prompt() {
-        // 100 tokens went upstream, 40 of them the caller's.
-        let charged = usage(100, 20).charged_to_caller(40, 100);
+    fn the_caller_is_charged_the_prompt_they_actually_wrote() {
+        // 100 tokens went upstream, 40 of them the caller's. They pay for 40.
+        let charged = usage(100, 20).charged_to_caller(40);
         assert_eq!(charged.prompt_tokens, 40);
         assert_eq!(charged.completion_tokens, 20, "output is theirs entirely");
         assert_eq!(charged.total_tokens, 60);
@@ -535,21 +535,19 @@ mod usage_tests {
     #[test]
     fn a_richer_backend_tokenizer_never_inflates_what_the_caller_sent() {
         // The backend charged 120 for what the relay measured as 100, of which
-        // 40 was the caller's. Their share of the backend's figure would be 48
-        // — but they only ever wrote 40 tokens, and 40 is what they are told.
-        let charged = usage(120, 10).charged_to_caller(40, 100);
+        // 40 was the caller's. The backend's arithmetic is the backend's; the
+        // caller wrote 40 tokens and 40 is what they are told.
+        let charged = usage(120, 10).charged_to_caller(40);
         assert_eq!(charged.prompt_tokens, 40);
     }
 
     #[test]
-    fn a_backend_that_undercounts_the_prompt_never_zeroes_the_caller() {
-        // The case that made a proportion necessary: a backend that counts the
-        // prompt more cheaply than the relay's own tokenizer does. Subtracting
-        // would have gone negative and clamped the caller to zero; the cap
-        // gives them their share of the smaller real bill instead.
-        let charged = usage(41, 27).charged_to_caller(40, 100);
-        assert_eq!(charged.prompt_tokens, 16);
-        assert!(charged.prompt_tokens > 0);
+    fn a_backend_that_undercounts_the_prompt_does_not_move_the_caller_either() {
+        // A backend that counts the prompt more cheaply than the relay does is
+        // a real case, and it is still not the caller's number. Theirs does not
+        // move because somebody else's tokenizer disagreed.
+        let charged = usage(41, 27).charged_to_caller(40);
+        assert_eq!(charged.prompt_tokens, 40);
     }
 
     #[test]
@@ -557,30 +555,67 @@ mod usage_tests {
         // The whole point, at the scale it actually bites: the caller wrote 6k
         // and the relay injected 4k on top. The backend bills for all 10k (and
         // counts it as 10_500 with its own tokenizer). The caller is told 6000.
-        let charged = usage(10_500, 300).charged_to_caller(6_000, 10_000);
+        let charged = usage(10_500, 300).charged_to_caller(6_000);
         assert_eq!(charged.prompt_tokens, 6_000);
         assert_eq!(charged.total_tokens, 6_300);
     }
 
     #[test]
     fn nothing_injected_means_nothing_taken_off() {
-        let charged = usage(100, 20).charged_to_caller(100, 100);
+        let charged = usage(100, 20).charged_to_caller(100);
         assert_eq!(charged.prompt_tokens, 100);
         assert_eq!(charged.total_tokens, 120);
     }
 
     #[test]
-    fn a_shorter_replacement_prompt_never_charges_the_caller_more() {
+    fn a_shorter_replacement_prompt_still_charges_what_the_caller_sent() {
         // The route replaced the caller's long system prompt with a short one,
-        // so their own count is the larger of the two. They pay the smaller.
-        let charged = usage(80, 5).charged_to_caller(200, 80);
-        assert_eq!(charged.prompt_tokens, 80);
+        // so less went upstream than came in. The caller is still accounted for
+        // the 200 tokens they sent: what the relay chose to drop on the way out
+        // is the relay's decision, not a discount it owes them. The margin is
+        // the operator's to set in the price list, not something to smuggle
+        // into a token count.
+        let charged = usage(80, 5).charged_to_caller(200);
+        assert_eq!(charged.prompt_tokens, 200);
     }
 
     #[test]
-    fn an_empty_prompt_does_not_divide_by_zero() {
-        let charged = usage(0, 0).charged_to_caller(0, 0);
+    fn an_empty_prompt_counts_as_nothing() {
+        let charged = usage(0, 0).charged_to_caller(0);
         assert_eq!(charged.prompt_tokens, 0);
         assert_eq!(charged.total_tokens, 0);
+    }
+
+    #[test]
+    fn a_cache_hit_can_never_be_larger_than_the_prompt_it_is_part_of() {
+        // The cached figure is the backend's, over the whole injected body; the
+        // prompt is the relay's, over the caller's half of it. Carried across
+        // unclamped, a caller could be shown more cached tokens than tokens.
+        let billed = Usage {
+            cached_tokens: 900,
+            ..usage(1_000, 10)
+        };
+        let charged = billed.charged_to_caller(400);
+        assert_eq!(charged.cached_tokens, 400);
+    }
+
+    #[test]
+    fn the_public_usage_carries_the_cost_and_prunes_what_is_empty() {
+        let plain = usage(10, 5).charged_to_caller(10).public(None);
+        assert_eq!(plain["prompt_tokens"], 10);
+        assert!(plain.get("usage").is_none(), "no cost, no field");
+        assert!(plain.get("prompt_tokens_details").is_none());
+        assert!(plain.get("completion_tokens_details").is_none());
+
+        let priced = Usage {
+            cached_tokens: 4,
+            reasoning_tokens: 3,
+            ..usage(10, 5)
+        }
+        .charged_to_caller(10)
+        .public(Some(0.102_949_9));
+        assert_eq!(priced["usage"], 0.10295);
+        assert_eq!(priced["prompt_tokens_details"]["cached_tokens"], 4);
+        assert_eq!(priced["completion_tokens_details"]["reasoning_tokens"], 3);
     }
 }

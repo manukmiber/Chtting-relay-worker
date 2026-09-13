@@ -271,19 +271,37 @@ async fn an_uninstalled_vocabulary_still_counts_but_says_it_is_an_estimate() {
 }
 
 #[tokio::test]
-async fn the_backends_own_usage_wins_and_the_difference_is_recorded_as_drift() {
+async fn the_backends_prompt_count_is_recorded_but_never_shown_to_the_caller() {
+    // Requirement 16: what the caller is told they sent is what this relay
+    // measured, not what the backend decided to bill for. The backend's figure
+    // still goes on the row — that is the operator's margin — and the gap
+    // between the two is recorded as drift.
     let mock = MockConfig {
         usage: Some(json!({"prompt_tokens": 111, "completion_tokens": 222})),
         ..Default::default()
     };
     let h = harness(mock, |_| {}).await;
-    h.post("/v1/chat/completions", chat("hello")).await;
+    let body: serde_json::Value = h
+        .post("/v1/chat/completions", chat("hello"))
+        .await
+        .json()
+        .await
+        .unwrap();
 
     let row = h.last_row().await;
-    assert_eq!(row["prompt_tokens"], 111);
+    let ours = row["user_prompt_tokens"].as_i64().unwrap();
+    assert!(ours > 0 && ours < 111, "the relay counted {ours}");
+    assert_eq!(row["prompt_tokens"], ours, "the row reports our own count");
+    assert_eq!(
+        body["usage"]["prompt_tokens"], ours,
+        "and so does the caller"
+    );
+    assert_eq!(
+        row["billed_prompt_tokens"], 111,
+        "what the backend charged is still on the books"
+    );
     assert_eq!(row["completion_tokens"], 222);
     assert_eq!(row["usage_source"], "upstream");
-    // The local count is kept beside it so the gap is visible.
     assert!(row["local_prompt"].as_i64().unwrap() > 0);
     assert_ne!(row["drift_prompt"], 0);
 }
@@ -397,14 +415,14 @@ async fn a_per_minute_rate_limit_refuses_with_retry_after() {
 
 #[tokio::test]
 async fn a_daily_token_quota_is_enforced_from_memory() {
-    // The backend reports a large usage, so one call is enough to blow a
-    // small daily budget regardless of how the prompt itself counts.
+    // One call is enough to blow a budget this small, and what it spends is
+    // what the caller is accounted for: their own prompt plus the reply.
     let mock = MockConfig {
         usage: Some(json!({"prompt_tokens": 40, "completion_tokens": 10})),
         ..Default::default()
     };
     let h = harness(mock, |cfg| {
-        cfg.keys[0].quota.tokens_per_day = 20;
+        cfg.keys[0].quota.tokens_per_day = 5;
     })
     .await;
 
@@ -417,7 +435,13 @@ async fn a_daily_token_quota_is_enforced_from_memory() {
     );
     // Wait for the row, which is also when the quota counter is updated.
     let row = h.last_row().await;
-    assert_eq!(row["total_tokens"], 50);
+    let spent = row["total_tokens"].as_i64().unwrap();
+    assert_eq!(
+        spent,
+        row["prompt_tokens"].as_i64().unwrap() + 10,
+        "the quota is spent on the caller's own count plus the reply"
+    );
+    assert!(spent > 5, "one call should already be over budget");
 
     let refused = h.post("/v1/chat/completions", chat("hello again")).await;
     assert_eq!(refused.status(), 429);
@@ -1271,4 +1295,539 @@ async fn the_ledger_totals_what_the_caller_was_actually_charged() {
         .await
         .unwrap();
     assert!(check.ok, "the hash chain broke: {}", check.message);
+}
+
+/* ------------------------------------- 14/15/16. nothing of the backend's -- */
+
+#[tokio::test]
+async fn not_one_field_of_the_backends_own_reply_survives_the_relay() {
+    // Requirement 14. The mock answers with everything a real backend sends:
+    // its own request id, its fingerprint, its service tier, its provider name,
+    // its created stamp, per-choice logprobs and a stop-token id. None of it is
+    // the caller's business, and none of it may reach them.
+    let h = harness(MockConfig::default(), |_| {}).await;
+    let body: serde_json::Value = h
+        .post("/v1/chat/completions", chat("who is back there?"))
+        .await
+        .json()
+        .await
+        .unwrap();
+
+    let text = body.to_string();
+    for leak in [
+        common::BACKEND_FINGERPRINT,
+        common::BACKEND_REQUEST_ID,
+        "system_fingerprint",
+        "service_tier",
+        "provider",
+        "matched_stop",
+        "logprobs",
+        "Deepseek-v4-flash-0731",
+        "1700000000",
+    ] {
+        assert!(!text.contains(leak), "\"{leak}\" leaked: {text}");
+    }
+
+    // What is left is the relay's own envelope, and it is complete.
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["model"], "manukmiberai/creative-writer");
+    assert!(body["created"].as_i64().unwrap() > 1_700_000_000);
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn the_id_the_caller_gets_is_our_own_uuid_v4() {
+    // Requirement 15. The backend's id is a uuid too, which is exactly why the
+    // test checks it is a *different* one rather than merely uuid-shaped.
+    let h = harness(MockConfig::default(), |_| {}).await;
+    let response = h.post("/v1/chat/completions", chat("hi")).await;
+    let header = response
+        .headers()
+        .get("x-relay-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body: serde_json::Value = response.json().await.unwrap();
+    let id = body["id"].as_str().unwrap();
+
+    assert_ne!(
+        id,
+        common::BACKEND_REQUEST_ID,
+        "the backend's id was reused"
+    );
+    let parts: Vec<&str> = id.split('-').collect();
+    assert_eq!(
+        parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+        vec![8, 4, 4, 4, 12],
+        "not a uuid: {id}"
+    );
+    assert!(parts[2].starts_with('4'), "not version 4: {id}");
+    assert_eq!(header, id, "the header and the body must agree");
+
+    // And it is the id the request was filed under.
+    assert_eq!(h.last_row().await["id"], id);
+}
+
+#[tokio::test]
+async fn a_streamed_reply_is_rebuilt_chunk_by_chunk_and_carries_our_usage() {
+    // Requirements 15, 16 and 18 on the streaming path, which is the one that
+    // actually matters: every chunk is ours, and the closing usage block has
+    // the input we counted plus what the request came to.
+    let mock = MockConfig {
+        reply: "one two three".into(),
+        usage: Some(json!({
+            "prompt_tokens": 34,
+            "completion_tokens": 909,
+            "total_tokens": 943,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 629},
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 34,
+        })),
+        ..Default::default()
+    };
+    let h = harness(mock, |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.pricing = chtting_relay::config::Pricing {
+            enabled: true,
+            backend_input_usd_per_m: 0.28,
+            backend_output_usd_per_m: 0.42,
+            margin_percent: 100.0,
+            ..Default::default()
+        };
+    })
+    .await;
+
+    let mut body = chat("go");
+    body["stream"] = json!(true);
+    let response = h.post("/v1/chat/completions", body).await;
+    let (events, raw) = read_sse(response).await;
+
+    for leak in [
+        common::BACKEND_FINGERPRINT,
+        common::BACKEND_REQUEST_ID,
+        "system_fingerprint",
+        "service_tier",
+        "logprobs",
+        "prompt_cache_miss_tokens",
+        "Deepseek-v4-flash-0731",
+    ] {
+        assert!(!raw.contains(leak), "\"{leak}\" leaked into the stream");
+    }
+
+    // Every chunk carries the same id, and it is ours.
+    let id = events[0]["id"].as_str().unwrap().to_string();
+    assert_ne!(id, common::BACKEND_REQUEST_ID);
+    for event in &events {
+        assert_eq!(event["id"], id.as_str(), "an id changed mid-stream");
+        assert_eq!(event["model"], "manukmiberai/creative-writer");
+    }
+    assert_eq!(stream_text(&events), "one two three");
+
+    // The closing usage: our own prompt count, not the backend's 34, with the
+    // reasoning total kept and the cache-miss bookkeeping pruned.
+    let usage = events
+        .iter()
+        .rev()
+        .find_map(|e| e.get("usage").filter(|u| !u.is_null()))
+        .expect("a usage chunk");
+    let row = h.last_row().await;
+    assert_eq!(usage["prompt_tokens"], row["user_prompt_tokens"]);
+    assert_ne!(usage["prompt_tokens"], 34);
+    assert_eq!(usage["completion_tokens"], 909);
+    assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 629);
+    assert!(usage.get("prompt_cache_miss_tokens").is_none());
+
+    // Requirement 18: what it cost, inline, so the caller need not guess.
+    let cost = usage["usage"].as_f64().expect("a cost in the usage block");
+    assert!(cost > 0.0, "{usage}");
+    // The caller's figure is rounded for display; the row keeps the precision
+    // that summing a month of them needs.
+    assert!(
+        (cost - row["proxy_usd"].as_f64().unwrap()).abs() < 1e-6,
+        "told {cost}, recorded {}",
+        row["proxy_usd"]
+    );
+
+    // Requirement 16: the backend's totals are on the row, not in the reply.
+    assert_eq!(row["billed_prompt_tokens"], 34);
+    assert_eq!(row["completion_tokens"], 909);
+    assert_eq!(row["reasoning_tokens"], 629);
+}
+
+/* ------------------------------------------------ 17. our own keep-alive -- */
+
+#[tokio::test]
+async fn a_quiet_backend_is_covered_by_our_own_keep_alive_and_not_its_own() {
+    // Requirement 17. While the backend thinks, the connection has to stay
+    // warm through cloudflared and every NAT on the way — but with our words,
+    // not the backend's, whose shape would say which backend it is.
+    let mock = MockConfig {
+        reply: "eventually".into(),
+        quiet_ms: 120,
+        backend_keepalive: Some(": deepseek-internal-ping\n\n".into()),
+        ..Default::default()
+    };
+    let h = harness(mock, |cfg| {
+        cfg.server.sse_keepalive_ms = 40;
+    })
+    .await;
+
+    let mut body = chat("think about it");
+    body["stream"] = json!(true);
+    let (events, raw) = read_sse(h.post("/v1/chat/completions", body).await).await;
+
+    assert!(
+        raw.contains(": Zeiko is still here, Just be patience"),
+        "no keep-alive of ours in:\n{raw}"
+    );
+    assert!(
+        !raw.contains("deepseek-internal-ping"),
+        "the backend's keep-alive was forwarded:\n{raw}"
+    );
+    // And it is a comment, so it changes nothing a client parses.
+    assert_eq!(stream_text(&events), "eventually");
+}
+
+#[tokio::test]
+async fn the_keep_alive_can_be_switched_off() {
+    let mock = MockConfig {
+        reply: "quick".into(),
+        quiet_ms: 60,
+        ..Default::default()
+    };
+    let h = harness(mock, |cfg| {
+        cfg.server.sse_keepalive_ms = 0;
+    })
+    .await;
+
+    let mut body = chat("go");
+    body["stream"] = json!(true);
+    let (_, raw) = read_sse(h.post("/v1/chat/completions", body).await).await;
+    assert!(!raw.contains("Zeiko is still here"), "{raw}");
+}
+
+/* ----------------------------------------------------- 6. the tps ceiling -- */
+
+#[tokio::test]
+async fn a_stream_is_held_to_the_tokens_a_second_the_route_asks_for() {
+    // Requirement 6. The backend answers as fast as it likes; the reply leaves
+    // at the configured pace, so the tunnel is not asked to carry 170 tokens a
+    // second over a phone's uplink.
+    let mock = MockConfig {
+        // 96 characters, so about 24 tokens by the pacer's estimate.
+        reply: "x".repeat(96),
+        ..Default::default()
+    };
+    let h = harness(mock, |cfg| {
+        cfg.models[0].max_tokens_per_second = 12.0;
+    })
+    .await;
+
+    let mut body = chat("go");
+    body["stream"] = json!(true);
+    let started = std::time::Instant::now();
+    let (events, _) = read_sse(h.post("/v1/chat/completions", body).await).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(stream_text(&events).len(), 96, "the reply is still whole");
+    // ~24 tokens at 12/s is about two seconds. A generous floor: the point is
+    // that it was held back at all, not that it was held to the millisecond.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1_200),
+        "the stream was not paced: {elapsed:?}"
+    );
+
+    let row = h.last_row().await;
+    assert_eq!(row["target_tps"], 12.0, "the ceiling is on the record");
+}
+
+#[tokio::test]
+async fn without_a_ceiling_the_stream_goes_out_as_fast_as_it_arrives() {
+    let mock = MockConfig {
+        reply: "x".repeat(96),
+        ..Default::default()
+    };
+    let h = harness(mock, |_| {}).await;
+
+    let mut body = chat("go");
+    body["stream"] = json!(true);
+    let started = std::time::Instant::now();
+    read_sse(h.post("/v1/chat/completions", body).await).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(800),
+        "an unthrottled stream should not wait"
+    );
+}
+
+/* --------------------------------------- 21. a prompt per thinking effort -- */
+
+#[tokio::test]
+async fn a_model_can_carry_one_system_prompt_per_reasoning_effort() {
+    use chtting_relay::config::{SystemPromptRule, SystemPromptSpec};
+
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].system_prompt = SystemPromptSpec {
+            mode: "replace".into(),
+            text: "FALLBACK PROMPT".into(),
+            prompt_id: String::new(),
+        };
+        cfg.models[0].system_prompts = vec![
+            SystemPromptRule {
+                id: "thinker".into(),
+                efforts: vec![],
+                min_effort: "high".into(),
+                prompt: SystemPromptSpec {
+                    mode: "replace".into(),
+                    text: "THINKING PROMPT: take your time.".into(),
+                    prompt_id: String::new(),
+                },
+                ..Default::default()
+            },
+            SystemPromptRule {
+                id: "quick".into(),
+                efforts: vec!["none".into(), "minimal".into(), "low".into()],
+                prompt: SystemPromptSpec {
+                    mode: "replace".into(),
+                    text: "FAST PROMPT: answer directly.".into(),
+                    prompt_id: String::new(),
+                },
+                ..Default::default()
+            },
+        ];
+    })
+    .await;
+
+    let system_sent = |h: &common::Harness| {
+        h.backend.last_request()["messages"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let mut hard = chat("hi");
+    hard["reasoning_effort"] = json!("max");
+    h.post("/v1/chat/completions", hard).await;
+    assert!(
+        system_sent(&h).contains("THINKING PROMPT"),
+        "{}",
+        system_sent(&h)
+    );
+    assert_eq!(h.last_row().await["prompt_id"], "thinker");
+    assert_eq!(h.last_row().await["reasoning_effort"], "max");
+
+    let mut easy = chat("hi");
+    easy["reasoning_effort"] = json!("low");
+    h.post("/v1/chat/completions", easy).await;
+    assert!(
+        system_sent(&h).contains("FAST PROMPT"),
+        "{}",
+        system_sent(&h)
+    );
+    assert_eq!(h.last_row().await["prompt_id"], "quick");
+
+    // A caller who said nothing about thinking matches neither rule and gets
+    // the model's own prompt, which is what it is there for.
+    h.post("/v1/chat/completions", chat("hi")).await;
+    assert!(
+        system_sent(&h).contains("FALLBACK PROMPT"),
+        "{}",
+        system_sent(&h)
+    );
+    assert_eq!(h.last_row().await["prompt_id"], "");
+    assert_eq!(h.last_row().await["reasoning_effort"], "default");
+
+    // An Anthropic-shaped budget is understood as well as a named level.
+    let mut budgeted = chat("hi");
+    budgeted["thinking"] = json!({"type": "enabled", "budget_tokens": 30_000});
+    h.post("/v1/chat/completions", budgeted).await;
+    assert!(
+        system_sent(&h).contains("THINKING PROMPT"),
+        "{}",
+        system_sent(&h)
+    );
+}
+
+/* ------------------------------- 22. the caller's own id, and what they sent -- */
+
+#[tokio::test]
+async fn the_callers_user_id_is_recorded_and_travels_upstream_for_cache_isolation() {
+    let h = harness(MockConfig::default(), |_| {}).await;
+
+    let mut body = chat("remember me");
+    body["user"] = json!("tenant-42");
+    h.post("/v1/chat/completions", body).await;
+
+    assert_eq!(h.last_row().await["user_id"], "tenant-42");
+    assert_eq!(
+        h.backend.last_request()["user"],
+        "tenant-42",
+        "the backend needs it to key its prompt cache"
+    );
+    assert_eq!(
+        h.backend
+            .last_headers()
+            .get("x-user-id")
+            .map(String::as_str),
+        Some("tenant-42"),
+        "and again as a header, for backends that read it there"
+    );
+}
+
+#[tokio::test]
+async fn a_user_id_sent_as_a_header_is_treated_the_same_as_one_in_the_body() {
+    let h = harness(MockConfig::default(), |_| {}).await;
+    h.post_with(
+        "/v1/chat/completions",
+        chat("hi"),
+        &[("x-user-id", "tenant-7")],
+    )
+    .await;
+
+    assert_eq!(h.last_row().await["user_id"], "tenant-7");
+    assert_eq!(h.backend.last_request()["user"], "tenant-7");
+}
+
+#[tokio::test]
+async fn forwarding_the_user_id_can_be_switched_off_per_backend() {
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.backends[0].forward_user_id = false;
+    })
+    .await;
+
+    let mut body = chat("hi");
+    body["user"] = json!("tenant-42");
+    h.post("/v1/chat/completions", body).await;
+
+    // Still recorded here — it is how the operator tells callers apart — but it
+    // does not travel.
+    assert_eq!(h.last_row().await["user_id"], "tenant-42");
+    assert!(h.backend.last_request().get("user").is_none());
+    assert!(!h.backend.last_headers().contains_key("x-user-id"));
+}
+
+#[tokio::test]
+async fn what_is_kept_of_the_prompt_is_what_the_caller_wrote_not_what_we_injected() {
+    // Requirement 22. The stored preview has to answer "what did this person
+    // send", so previewing the injected body would be both wrong and a way to
+    // leak the system prompt into a screen that is meant to show the caller's
+    // words.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].system_prompt = chtting_relay::config::SystemPromptSpec {
+            mode: "prepend".into(),
+            text: "SECRET HOUSE PROMPT, not for anyone's eyes".into(),
+            prompt_id: String::new(),
+        };
+    })
+    .await;
+
+    h.post("/v1/chat/completions", chat("what the caller typed"))
+        .await;
+    let preview = h.last_row().await["req_preview"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(preview.contains("what the caller typed"), "{preview}");
+    assert!(
+        !preview.contains("SECRET HOUSE PROMPT"),
+        "the injected prompt ended up filed as the caller's words: {preview}"
+    );
+}
+
+/* ------------------------------------------------- 10/2. what it all cost -- */
+
+#[tokio::test]
+async fn a_request_records_what_it_cost_what_it_sold_for_and_the_difference() {
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.pricing = chtting_relay::config::Pricing {
+            enabled: true,
+            backend_input_usd_per_m: 1_000_000.0,
+            backend_output_usd_per_m: 1_000_000.0,
+            margin_percent: 50.0,
+            ..Default::default()
+        };
+    })
+    .await;
+
+    h.post("/v1/chat/completions", chat("hello")).await;
+    let row = h.last_row().await;
+
+    let backend = row["backend_usd"].as_f64().unwrap();
+    let proxy = row["proxy_usd"].as_f64().unwrap();
+    let profit = row["profit_usd"].as_f64().unwrap();
+    assert!(backend > 0.0 && proxy > 0.0, "{row}");
+    assert!((profit - (proxy - backend)).abs() < 1e-9, "{row}");
+    assert!(profit > 0.0, "a 50% margin should leave a margin: {row}");
+}
+
+#[tokio::test]
+async fn every_tier_that_describes_a_request_applies_to_its_price() {
+    use chtting_relay::config::{HourRange, Pricing, PricingTier, TierWhen};
+
+    // Two rules that both describe this request: a long prompt, and any hour of
+    // the day. Requirement 10 is that they stack rather than compete.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.pricing = Pricing {
+            enabled: true,
+            backend_input_usd_per_m: 1_000_000.0,
+            backend_output_usd_per_m: 1_000_000.0,
+            margin_percent: 0.0,
+            tiers: vec![
+                PricingTier {
+                    id: "long".into(),
+                    name: "long input".into(),
+                    input_multiplier: 2.0,
+                    when: TierWhen {
+                        min_input_tokens: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                PricingTier {
+                    id: "always".into(),
+                    name: "round the clock".into(),
+                    input_multiplier: 3.0,
+                    when: TierWhen {
+                        hours: vec![HourRange { from: 0, to: 23 }],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+    })
+    .await;
+
+    h.post("/v1/chat/completions", chat("hello")).await;
+    let row = h.last_row().await;
+    let tiers = row["price_tiers"].as_str().unwrap();
+    assert!(tiers.contains("long input"), "{tiers}");
+    assert!(tiers.contains("round the clock"), "{tiers}");
+
+    // Input sold at 6x cost, output at cost, so the proxy price is strictly
+    // above the backend's and the tiers are visibly the reason.
+    assert!(
+        row["proxy_usd"].as_f64().unwrap() > row["backend_usd"].as_f64().unwrap(),
+        "{row}"
+    );
+}
+
+#[tokio::test]
+async fn with_no_prices_set_the_relay_reports_no_money_rather_than_zeroes() {
+    // A relay nobody has priced should not be claiming every request was free;
+    // the usage block simply does not carry a cost.
+    let h = harness(MockConfig::default(), |_| {}).await;
+    let body: serde_json::Value = h
+        .post("/v1/chat/completions", chat("hi"))
+        .await
+        .json()
+        .await
+        .unwrap();
+
+    assert!(body["usage"].get("usage").is_none(), "{body}");
+    assert_eq!(h.last_row().await["proxy_usd"], 0.0);
 }

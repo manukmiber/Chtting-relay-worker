@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -29,37 +30,6 @@ pub enum State {
     Starting,
     Running,
     Failed,
-}
-
-pub async fn ensure_cloudflared_running(config: &TunnelConfig, relay_port: u16) {
-    if !config.auto_start || config.mode == "off" {
-        return;
-    }
-
-    tokio::spawn(async move {
-        loop {
-            tracing::info!("[TUNNEL] Memulai Cloudflare Tunnel...");
-            let mut cmd = tokio::process::Command::new("cloudflared");
-            cmd.arg("tunnel");
-
-            if config.mode == "quick" {
-                cmd.args(["--url", &format!("http://127.0.0.1:{}", relay_port)]);
-            } else if !config.token.is_empty() {
-                cmd.args(["run", "--token", &config.token]);
-            }
-
-            cmd.stdout(std::process::Stdio::piped())
-               .stderr(std::process::Stdio::piped());
-
-            if let Ok(mut child) = cmd.spawn() {
-                let _ = child.wait().await;
-                tracing::warn!("[TUNNEL] Cloudflared terhenti, memulai ulang dalam 3 detik...");
-            } else {
-                tracing::error!("[TUNNEL] Gagal mengeksekusi cloudflared. Pastikan terinstall!");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        }
-    });
 }
 
 impl State {
@@ -79,7 +49,11 @@ struct Inner {
     state_label: Option<State>,
     last_error: String,
     started_at: i64,
+    /// Every restart since the relay started, for the dashboard.
     restarts: u32,
+    /// Restarts since the last time it actually came up, which is what the
+    /// backoff is calculated from.
+    consecutive_failures: u32,
     lines: Vec<String>,
     pid: Option<u32>,
 }
@@ -119,6 +93,7 @@ impl TunnelManager {
                 (crate::util::now_ms() - inner.started_at) / 1000
             } else { 0 },
             "restarts": inner.restarts,
+            "autoStart": cfg.tunnel.auto_start,
             "lastError": inner.last_error,
             "logs": inner.lines.iter().rev().take(200).rev().collect::<Vec<_>>(),
         })
@@ -307,12 +282,13 @@ impl TunnelManager {
                 return;
             }
             // Mobile links drop; back off so a hard failure does not spin.
-            let restarts = {
+            let streak = {
                 let mut inner = manager.inner.lock();
                 inner.restarts += 1;
-                inner.restarts
+                inner.consecutive_failures += 1;
+                inner.consecutive_failures
             };
-            let wait = std::time::Duration::from_millis((1_000u64 << restarts.min(5)).min(60_000));
+            let wait = Duration::from_millis((1_000u64 << streak.min(5)).min(60_000));
             manager.log(&format!("restarting in {}s", wait.as_secs()));
             tokio::time::sleep(wait).await;
             if let Err(err) = manager.start().await {
@@ -338,7 +314,7 @@ impl TunnelManager {
 
     pub async fn restart(self: &Arc<Self>) -> Result<serde_json::Value> {
         self.stop().await?;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         self.start().await
     }
 
@@ -360,6 +336,10 @@ impl TunnelManager {
             if inner.url != url {
                 inner.url = url.clone();
                 inner.state_label = Some(State::Running);
+                // Back up and running: the next failure starts its backoff from
+                // one second again, rather than from wherever the last streak
+                // of failures left it.
+                inner.consecutive_failures = 0;
                 drop(inner);
                 self.logger.info(format!("cloudflared tunnel URL: {url}"));
                 return;
@@ -369,7 +349,46 @@ impl TunnelManager {
             && (text.contains("Registered tunnel connection") || text.contains("registered"))
         {
             inner.state_label = Some(State::Running);
+            inner.consecutive_failures = 0;
         }
+    }
+
+    /// Start the tunnel and keep it started.
+    ///
+    /// Requirement 9: after the phone reboots, or Termux is killed and comes
+    /// back, the tunnel has to be up again without anyone opening a terminal.
+    /// The relay starting is the only event that reliably happens then, so this
+    /// hangs off it: one attempt now, and a watcher that keeps trying if
+    /// cloudflared is not installed yet or the network is not up.
+    ///
+    /// [`supervise`](Self::supervise) covers the process dying later. This
+    /// covers it never having started.
+    pub fn ensure_running(self: &Arc<Self>) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let mut wait = Duration::from_secs(5);
+            loop {
+                let cfg = manager.config.current();
+                if !cfg.tunnel.auto_start || cfg.tunnel.mode == "off" {
+                    return;
+                }
+                if manager.child.lock().await.is_some() {
+                    return; // already up, and supervise() owns it from here
+                }
+                match manager.start().await {
+                    Ok(_) => return,
+                    Err(err) => {
+                        manager
+                            .logger
+                            .warn(format!("tunnel not up yet ({err}); retrying in {wait:?}"));
+                        tokio::time::sleep(wait).await;
+                        // A phone that has just booted may have no network for
+                        // a while; back off, but never stop trying.
+                        wait = (wait * 2).min(Duration::from_secs(120));
+                    }
+                }
+            }
+        });
     }
 }
 

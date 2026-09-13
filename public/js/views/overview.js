@@ -1,5 +1,5 @@
 import { api } from '../api.js';
-import { h, card, stat, table, pill, fmtNum, fmtMs, clear } from '../ui.js';
+import { h, card, stat, table, pill, fmtNum, fmtMs, fmtUsd, live, clear } from '../ui.js';
 import { lineChart, barChart } from '../charts.js';
 
 const RANGES = [['24h', 'Last 24h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['365d', 'All time']];
@@ -35,6 +35,17 @@ export async function overviewView(ctx) {
     stat('Avg latency', fmtMs(w.avg_total_ms), `p95 ${fmtMs(w.p95_total_ms)}`),
     stat('Errors', `${w.error_rate}%`, `${fmtNum(w.errors)} of ${fmtNum(w.requests)}`),
   ));
+
+  // Money, but only once there is a price list to report it from. Three zeroes
+  // would read as free service rather than as "nobody has set a price".
+  if (w.proxy_usd || w.backend_usd) {
+    root.append(h('div.grid.stats', {},
+      stat('Backend cost', fmtUsd(w.backend_usd), 'what we were charged'),
+      stat('Proxy revenue', fmtUsd(w.proxy_usd), 'what callers were charged'),
+      stat('Profit', fmtUsd(w.profit_usd), `${w.margin_percent}% margin`),
+      stat('Callers', fmtNum(w.callers), 'distinct user ids'),
+    ));
+  }
 
   const chartHolder = h('div');
   const metrics = [
@@ -77,10 +88,13 @@ export async function overviewView(ctx) {
   root.append(card('Trend', h('div', {}, buttons, chartHolder), [rangeSelect]));
   drawChart(ctx.store.metric ?? 'requests');
 
+  // Requirement 4: the numbers keep themselves current.
+  live(ctx, 5000, () => ctx.rerender());
+
   root.append(card('Per model', table(
     [{ label: 'Alias' }, { label: 'Requests', num: true }, { label: 'Users', num: true },
       { label: 'In', num: true }, { label: 'Out', num: true }, { label: 'TTFT', num: true },
-      { label: 'TPS', num: true }, { label: 'Errors', num: true }],
+      { label: 'TPS', num: true }, { label: 'Profit', num: true }, { label: 'Errors', num: true }],
     byModel,
     (r) => h('tr', {},
       h('td.mono', { text: r.name || '—' }),
@@ -90,6 +104,7 @@ export async function overviewView(ctx) {
       h('td.num', { text: fmtNum(r.completion_tokens) }),
       h('td.num', { text: fmtMs(r.avg_ttft) }),
       h('td.num', { text: (r.avg_tps ?? 0).toFixed(1) }),
+      h('td.num', { text: r.proxy_usd ? fmtUsd(r.profit_usd) : '—' }),
       h('td.num', {}, r.errors ? pill(String(r.errors), 'err') : h('span.muted', { text: '0' })),
     ),
   )));

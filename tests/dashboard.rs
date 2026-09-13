@@ -217,9 +217,16 @@ async fn a_generated_key_is_shown_once_and_masked_afterwards() {
         .await
         .unwrap();
     let secret = created["item"]["key"].as_str().unwrap().to_string();
+    let tail = secret
+        .strip_prefix("Kunci-Zeiko-")
+        .unwrap_or_else(|| panic!("unexpected key shape: {secret}"));
+    assert_eq!(tail.chars().count(), 32, "{secret}");
+    assert!(tail.chars().any(|c| c.is_ascii_lowercase()), "{secret}");
+    assert!(tail.chars().any(|c| c.is_ascii_uppercase()), "{secret}");
+    assert!(tail.chars().any(|c| c.is_ascii_digit()), "{secret}");
     assert!(
-        secret.starts_with("sk-relay-"),
-        "unexpected key shape: {secret}"
+        tail.chars().any(|c| c.is_ascii_punctuation()),
+        "no symbol in {secret}"
     );
 
     // Listing it afterwards only ever shows the mask.
@@ -712,7 +719,12 @@ async fn setup_lists_what_is_still_missing_before_the_relay_can_serve() {
     assert_eq!(setup["termux"], chtting_relay::system::termux());
     assert!(setup["service"]["installed"].is_boolean());
     assert!(setup["shortcuts"]["files"].as_array().is_some());
-    assert_eq!(setup["packages"].as_array().unwrap().len(), 2);
+    let packages = setup["packages"].as_array().unwrap();
+    assert!(!packages.is_empty());
+    assert!(
+        !packages.iter().any(|p| p["name"] == "termux-services"),
+        "termux-services is gone from Termux and must not be offered: {packages:?}"
+    );
     assert_eq!(setup["version"], env!("CARGO_PKG_VERSION"));
 }
 
@@ -767,8 +779,8 @@ async fn an_unknown_service_action_is_refused_by_name() {
 }
 
 #[tokio::test]
-async fn handing_over_to_a_service_that_was_never_installed_says_so() {
-    // On a phone this would be a real handover; here there is no service, and
+async fn handing_over_to_a_keeper_that_was_never_installed_says_so() {
+    // On a phone this would be a real handover; here there is no keeper, and
     // the point is that the answer explains itself rather than exiting.
     if chtting_relay::system::termux() {
         return;
@@ -778,10 +790,7 @@ async fn handing_over_to_a_service_that_was_never_installed_says_so() {
     assert_eq!(res.status(), 400);
     let body: Value = res.json().await.unwrap();
     let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        message.contains("$PREFIX") || message.contains("service"),
-        "unhelpful refusal: {body}"
-    );
+    assert!(message.contains("keeper"), "unhelpful refusal: {body}");
 }
 
 #[tokio::test]

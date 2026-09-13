@@ -97,6 +97,23 @@ pub fn format_sse_raw(data: &str) -> Bytes {
 
 pub const DONE: &str = "data: [DONE]\n\n";
 
+/// Frame a comment: an SSE event with no data, which every client ignores and
+/// every proxy counts as traffic.
+///
+/// This is the relay's answer to a quiet backend. Whatever a backend sends to
+/// hold its own connection open — a comment, a blank frame, a ping event — is
+/// parsed and dropped here rather than forwarded, because the shape of it says
+/// which backend is on the other end. The caller gets this instead.
+pub fn comment(text: &str) -> Bytes {
+    // A comment ends at the newline, so a text with one in it would end the
+    // frame early and put the rest on the wire as a field.
+    let single_line: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    Bytes::from(format!(": {single_line}\n\n"))
+}
+
 /// Headers every streamed response carries.
 pub const SSE_HEADERS: [(&str, &str); 4] = [
     ("content-type", "text/event-stream; charset=utf-8"),
@@ -238,6 +255,28 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, "one");
         assert_eq!(events[1].data, "two");
+    }
+
+    #[test]
+    fn our_own_keepalive_is_a_comment_and_survives_a_round_trip_as_nothing() {
+        let frame = comment("Zeiko is still here, Just be patience");
+        assert_eq!(
+            frame,
+            Bytes::from(": Zeiko is still here, Just be patience\n\n")
+        );
+        // A client parsing it must see no event at all.
+        let mut parser = SseParser::new();
+        assert!(parser.push(std::str::from_utf8(&frame).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_newline_in_the_keepalive_text_cannot_break_out_of_the_comment() {
+        let frame = comment("hello\n\ndata: {\"injected\":true}");
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(text.starts_with(": "));
+        assert_eq!(text.matches("\n\n").count(), 1, "{text:?}");
+        let mut parser = SseParser::new();
+        assert!(parser.push(&text).is_empty(), "an event got through");
     }
 
     #[test]

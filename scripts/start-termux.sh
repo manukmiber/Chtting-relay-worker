@@ -9,8 +9,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN="./target/release/chtting-relay"
-if [ ! -x "$BIN" ]; then
+# A small device builds with the release-small profile, which lands elsewhere;
+# take whichever of the two was built most recently.
+BIN=""
+for candidate in ./target/release/chtting-relay ./target/release-small/chtting-relay; do
+  [ -x "$candidate" ] || continue
+  if [ -z "$BIN" ] || [ "$candidate" -nt "$BIN" ]; then BIN="$candidate"; fi
+done
+if [ -z "$BIN" ]; then
   echo "not built yet — run: bash scripts/install-termux.sh" >&2
   exit 1
 fi
