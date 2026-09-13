@@ -9,10 +9,18 @@
 //!   every matching tier has had its say.
 //! * **profit** — proxy minus backend.
 //!
-//! Tiers are a list, not a setting. Any number of them may match one request
-//! and every match applies in order, so "input over 256k" and "peak hour" and
-//! "thinking effort high" stack instead of competing for one slot. A tier that
-//! should end the matching says so with `stop`.
+//! The sell side is a rate card of three bands, picked by how hard the caller
+//! asked the model to think: the standard rate, a higher one at maximum effort,
+//! a lower one with thinking off. The band is chosen before any tier is read
+//! and each band carries its own input, output and cache-read rate, so a band
+//! can never be reached through a chain of conditions that happens to stop
+//! early — which is what a rate card has to guarantee to be a rate card.
+//!
+//! Tiers sit on top of the band, for the conditions a rate card cannot express:
+//! the hour, the size of the prompt, a weekend deal. They are a list, not a
+//! setting. Any number of them may match one request and every match applies in
+//! order, so "input over 256k" and "peak hour" stack instead of competing for
+//! one slot. A tier that should end the matching says so with `stop`.
 //!
 //! Rates are quoted per million tokens, which is how every provider publishes
 //! them, and carried as `f64` because these are multiplied and summed rather
@@ -20,7 +28,7 @@
 
 use serde_json::Value;
 
-use crate::config::{Model, Pricing, PricingTier};
+use crate::config::{BandRates, Model, Pricing, PricingTier};
 use crate::util::{glob_match, round};
 
 /// How hard the caller asked the model to think.
@@ -254,6 +262,12 @@ struct Rates {
 pub fn resolve(defaults: &Pricing, model: &Model) -> Pricing {
     let route = &model.pricing;
     let pick = |a: f64, b: f64| if a > 0.0 { a } else { b };
+    let band = |a: BandRates, b: BandRates| BandRates {
+        input_usd_per_m: pick(a.input_usd_per_m, b.input_usd_per_m),
+        cached_input_usd_per_m: pick(a.cached_input_usd_per_m, b.cached_input_usd_per_m),
+        output_usd_per_m: pick(a.output_usd_per_m, b.output_usd_per_m),
+        reasoning_usd_per_m: pick(a.reasoning_usd_per_m, b.reasoning_usd_per_m),
+    };
     let mut tiers = defaults.tiers.clone();
     tiers.extend(route.tiers.iter().cloned());
 
@@ -287,6 +301,11 @@ pub fn resolve(defaults: &Pricing, model: &Model) -> Pricing {
         ),
         output_usd_per_m: pick(route.output_usd_per_m, defaults.output_usd_per_m),
         reasoning_usd_per_m: pick(route.reasoning_usd_per_m, defaults.reasoning_usd_per_m),
+        // A model that prices one band of its own does not lose the others: a
+        // house rate for maximum thinking still stands under a model that only
+        // repriced its non-thinking output.
+        max_thinking: band(route.max_thinking, defaults.max_thinking),
+        non_thinking: band(route.non_thinking, defaults.non_thinking),
         margin_percent: pick(route.margin_percent, defaults.margin_percent),
         request_usd: pick(route.request_usd, defaults.request_usd),
         refusal_usd: pick(route.refusal_usd, defaults.refusal_usd),
@@ -308,7 +327,8 @@ pub fn price(pricing: &Pricing, shape: &Shape) -> Priced {
     }
 
     let backend = base_backend_rates(pricing);
-    let backend_usd = charge(backend, shape) + pricing.request_usd.max(0.0) * 0.0;
+    // Tokens only: a fee of ours is not on somebody else's invoice.
+    let backend_usd = charge(backend, shape);
 
     // A refusal is priced as one thing that happened, not as the tokens it took
     // to say it. The backend's own invoice is left exactly as it is: upstream
@@ -343,6 +363,16 @@ pub fn price(pricing: &Pricing, shape: &Shape) -> Priced {
     };
 
     let mut applied = Vec::new();
+
+    // The band comes before the tiers and is not one of them: which rate card a
+    // request is on is settled by the effort the caller asked for, so no tier
+    // can stop the chain early and leave a maximum-effort request paying the
+    // standard rate.
+    if let Some((name, band)) = band_for(pricing, shape.effort.unwrap_or_default()) {
+        apply_band(band, &mut rates);
+        applied.push(name.to_string());
+    }
+
     let mut surcharge = 0.0;
     for tier in pricing.tiers.iter().filter(|t| t.enabled) {
         if !matches(tier, shape) {
@@ -366,6 +396,50 @@ pub fn price(pricing: &Pricing, shape: &Shape) -> Priced {
         proxy_usd: round(proxy_usd.max(0.0), 9),
         profit_usd: round(proxy_usd.max(0.0) - backend_usd.max(0.0), 9),
         tiers: applied,
+    }
+}
+
+/// The name each band shows up under on the request row.
+pub const MAX_THINKING_BAND: &str = "max thinking";
+pub const NON_THINKING_BAND: &str = "no thinking";
+
+/// Which band of the rate card this request is on.
+///
+/// `None` is the standard band — the one the rates above already describe, and
+/// the one a caller who asked for low, medium or high thinking pays. A band
+/// that was never priced is not a band: it falls back to standard rather than
+/// to zero.
+fn band_for(pricing: &Pricing, effort: Effort) -> Option<(&'static str, &BandRates)> {
+    let (name, band) = match effort {
+        Effort::Max => (MAX_THINKING_BAND, &pricing.max_thinking),
+        // Silence is not a choice to think, so it is billed like thinking off.
+        Effort::None | Effort::Minimal | Effort::Unspecified => {
+            (NON_THINKING_BAND, &pricing.non_thinking)
+        }
+        Effort::Low | Effort::Medium | Effort::High => return None,
+    };
+    (!band.is_empty()).then_some((name, band))
+}
+
+/// Lay a band over the standard rates. A rate the band leaves at 0 keeps the
+/// standard one, which is what lets a band that only moves output say so in one
+/// number — and keeps a repriced input from quietly dragging the cache read up
+/// with it.
+fn apply_band(band: &BandRates, rates: &mut Rates) {
+    if band.input_usd_per_m > 0.0 {
+        rates.input = band.input_usd_per_m;
+    }
+    if band.cached_input_usd_per_m > 0.0 {
+        rates.cached_input = band.cached_input_usd_per_m;
+    }
+    if band.output_usd_per_m > 0.0 {
+        rates.output = band.output_usd_per_m;
+        // Reasoning tokens are output tokens until somebody prices them apart,
+        // so a band that moves output moves them with it.
+        rates.reasoning = band.output_usd_per_m;
+    }
+    if band.reasoning_usd_per_m > 0.0 {
+        rates.reasoning = band.reasoning_usd_per_m;
     }
 }
 
@@ -530,7 +604,7 @@ fn hour_in(from: u32, to: u32, hour: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HourRange, TierWhen};
+    use crate::config::{BandRates, HourRange, TierWhen};
     use serde_json::json;
 
     fn pricing() -> Pricing {
@@ -811,42 +885,27 @@ mod tests {
     }
 
     /// The published price list for one of the three models, as the example
-    /// config writes it: a rate for each of the three thinking bands.
+    /// config writes it: a rate card of three bands, no tiers needed.
     fn wissangeni() -> Pricing {
         Pricing {
             enabled: true,
             input_usd_per_m: 0.80,
             cached_input_usd_per_m: 0.20,
             output_usd_per_m: 4.0,
-            reasoning_usd_per_m: 4.0,
+            max_thinking: BandRates {
+                input_usd_per_m: 0.80,
+                cached_input_usd_per_m: 0.20,
+                output_usd_per_m: 6.0,
+                ..Default::default()
+            },
+            non_thinking: BandRates {
+                input_usd_per_m: 0.80,
+                cached_input_usd_per_m: 0.20,
+                output_usd_per_m: 3.5,
+                ..Default::default()
+            },
             refusal_usd: 0.05,
             refusal_phrases: vec![REFUSAL.into()],
-            tiers: vec![
-                PricingTier {
-                    output_usd_per_m: Some(6.0),
-                    reasoning_usd_per_m: Some(6.0),
-                    stop: true,
-                    ..tier(
-                        "max thinking",
-                        TierWhen {
-                            efforts: vec!["max".into()],
-                            ..Default::default()
-                        },
-                    )
-                },
-                PricingTier {
-                    output_usd_per_m: Some(3.5),
-                    reasoning_usd_per_m: Some(3.5),
-                    stop: true,
-                    ..tier(
-                        "no thinking",
-                        TierWhen {
-                            efforts: vec!["none".into(), "minimal".into(), "default".into()],
-                            ..Default::default()
-                        },
-                    )
-                },
-            ],
             ..Default::default()
         }
     }
@@ -868,11 +927,16 @@ mod tests {
     fn each_thinking_band_has_its_own_output_rate() {
         // input is 0.80/M throughout, so the difference is the output rate:
         // 4.00 by default, 6.00 at maximum effort, 3.50 with thinking off.
-        assert_eq!(priced_at(Effort::Medium), 4.8, "the default band");
+        assert_eq!(priced_at(Effort::Medium), 4.8, "the standard band");
+        assert_eq!(
+            priced_at(Effort::Low),
+            4.8,
+            "low is still the standard band"
+        );
         assert_eq!(
             priced_at(Effort::High),
             4.8,
-            "high is still the default band"
+            "high is still the standard band"
         );
         assert_eq!(priced_at(Effort::Max), 6.8, "max thinking");
         assert_eq!(priced_at(Effort::None), 4.3, "thinking off");
@@ -882,6 +946,141 @@ mod tests {
             4.3,
             "a caller who said nothing about thinking pays the non-thinking rate"
         );
+    }
+
+    #[test]
+    fn the_band_is_named_on_the_row_so_the_price_can_be_read_back() {
+        let band = |effort| {
+            price(
+                &wissangeni(),
+                &Shape {
+                    effort: Some(effort),
+                    ..shape(1_000, 1_000)
+                },
+            )
+            .tiers
+        };
+        assert_eq!(band(Effort::Max), vec!["max thinking"]);
+        assert_eq!(band(Effort::Unspecified), vec!["no thinking"]);
+        assert!(
+            band(Effort::Medium).is_empty(),
+            "the standard band is the rates themselves, not a change to them"
+        );
+    }
+
+    #[test]
+    fn a_band_only_moves_the_rates_it_names() {
+        // The shape every one of these models has: one input rate and one cache
+        // rate across the card, and an output rate per band.
+        let mut p = wissangeni();
+        p.max_thinking = BandRates {
+            output_usd_per_m: 6.0,
+            ..Default::default()
+        };
+        let out = price(
+            &p,
+            &Shape {
+                input_tokens: 1_000_000,
+                cached_input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                effort: Some(Effort::Max),
+                ..shape(0, 0)
+            },
+        );
+        // 0.20 cache read, untouched by the band, and 6.00 of output.
+        assert!((out.proxy_usd - 6.2).abs() < 1e-9, "{out:?}");
+    }
+
+    #[test]
+    fn reasoning_tokens_follow_the_bands_output_rate() {
+        let out = price(
+            &wissangeni(),
+            &Shape {
+                reasoning_tokens: 1_000_000,
+                effort: Some(Effort::Max),
+                ..shape(0, 1_000_000)
+            },
+        );
+        assert_eq!(out.proxy_usd, 6.0, "thought about at the band's own rate");
+    }
+
+    #[test]
+    fn a_band_is_not_a_tier_and_no_tier_can_stop_it() {
+        // The old shape of this: bands written as `stop` tiers, which meant a
+        // maximum-effort request never reached the surcharges below them.
+        let mut p = wissangeni();
+        p.tiers = vec![PricingTier {
+            surcharge_usd: 0.01,
+            ..tier(
+                "peak hour",
+                TierWhen {
+                    hours: vec![HourRange { from: 19, to: 23 }],
+                    ..Default::default()
+                },
+            )
+        }];
+        let out = price(
+            &p,
+            &Shape {
+                effort: Some(Effort::Max),
+                hour: 20,
+                ..shape(1_000_000, 1_000_000)
+            },
+        );
+        assert_eq!(
+            out.tiers,
+            vec!["max thinking", "peak hour"],
+            "the band and the tier both applied"
+        );
+        assert!((out.proxy_usd - 6.81).abs() < 1e-9, "{out:?}");
+    }
+
+    #[test]
+    fn a_band_nobody_priced_falls_back_to_the_standard_rates() {
+        let p = Pricing {
+            enabled: true,
+            input_usd_per_m: 0.35,
+            output_usd_per_m: 1.5,
+            ..Default::default()
+        };
+        let out = price(
+            &p,
+            &Shape {
+                effort: Some(Effort::Max),
+                ..shape(1_000_000, 1_000_000)
+            },
+        );
+        assert_eq!(out.proxy_usd, 1.85, "not zero, and not free");
+        assert!(out.tiers.is_empty());
+    }
+
+    #[test]
+    fn a_model_inherits_the_bands_it_does_not_price_itself() {
+        let defaults = Pricing {
+            enabled: true,
+            max_thinking: BandRates {
+                output_usd_per_m: 9.0,
+                ..Default::default()
+            },
+            non_thinking: BandRates {
+                output_usd_per_m: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let model = Model {
+            pricing: Pricing {
+                non_thinking: BandRates {
+                    output_usd_per_m: 1.2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = resolve(&defaults, &model);
+        assert_eq!(merged.max_thinking.output_usd_per_m, 9.0, "inherited");
+        assert_eq!(merged.non_thinking.output_usd_per_m, 1.2, "overridden");
     }
 
     #[test]

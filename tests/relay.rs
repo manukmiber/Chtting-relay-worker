@@ -67,6 +67,37 @@ async fn the_example_config_is_a_valid_one() {
     }
 }
 
+#[test]
+fn the_bands_survive_the_dashboard_round_trip() {
+    // What the dashboard GETs is this serialisation, and what the rate card
+    // sends back is parsed by the same shape. A band that did not survive it
+    // would silently reprice every model the moment somebody saved one.
+    let raw = std::fs::read_to_string("config/config.example.json").unwrap();
+    let cfg: chtting_relay::config::Config = serde_json::from_str(&raw).unwrap();
+    let cfg = chtting_relay::config::normalize(cfg);
+    let json = serde_json::to_value(&cfg).unwrap();
+
+    let jagad = json["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "Jagad-512B-V1")
+        .unwrap();
+    assert_eq!(jagad["pricing"]["maxThinking"]["outputUsdPerM"], 2.0);
+    assert_eq!(jagad["pricing"]["nonThinking"]["outputUsdPerM"], 1.2);
+    assert_eq!(jagad["pricing"]["nonThinking"]["cachedInputUsdPerM"], 0.1);
+
+    // And back again, unchanged.
+    let again: chtting_relay::config::Config = serde_json::from_value(json).unwrap();
+    let jagad = again
+        .models
+        .iter()
+        .find(|m| m.id == "Jagad-512B-V1")
+        .unwrap();
+    assert_eq!(jagad.pricing.max_thinking.output_usd_per_m, 2.0);
+    assert_eq!(jagad.pricing.non_thinking.output_usd_per_m, 1.2);
+}
+
 /* ------------------------------------------------- 5. name translation -- */
 
 #[tokio::test]
@@ -2115,6 +2146,72 @@ async fn an_answer_that_is_not_a_refusal_is_priced_on_its_tokens() {
         "an answered request is priced on its tokens: {row}"
     );
     assert_eq!(row["price_tiers"].as_str().unwrap(), "");
+}
+
+#[tokio::test]
+async fn the_thinking_band_a_caller_asks_for_is_the_one_they_are_billed_on() {
+    // The whole rate card, end to end: the same prompt sent three ways comes
+    // back at three prices, and the row says which band it was priced on.
+    let priced = |effort: Option<&'static str>| async move {
+        let h = harness(MockConfig::default(), |cfg| {
+            cfg.models[0].tokenizer = "o200k_base".into();
+            // Jagad's card, as the example config publishes it.
+            cfg.pricing = chtting_relay::config::Pricing {
+                enabled: true,
+                input_usd_per_m: 0.35,
+                cached_input_usd_per_m: 0.10,
+                output_usd_per_m: 1.5,
+                max_thinking: chtting_relay::config::BandRates {
+                    input_usd_per_m: 0.35,
+                    cached_input_usd_per_m: 0.10,
+                    output_usd_per_m: 2.0,
+                    ..Default::default()
+                },
+                non_thinking: chtting_relay::config::BandRates {
+                    input_usd_per_m: 0.35,
+                    cached_input_usd_per_m: 0.10,
+                    output_usd_per_m: 1.2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+        })
+        .await;
+
+        let mut body = chat("write me a scene");
+        if let Some(effort) = effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+        assert_eq!(h.post("/v1/chat/completions", body).await.status(), 200);
+        let row = h.last_row().await;
+        (
+            row["proxy_usd"].as_f64().unwrap(),
+            row["price_tiers"].as_str().unwrap().to_string(),
+        )
+    };
+
+    let (standard, standard_band) = priced(Some("medium")).await;
+    let (max, max_band) = priced(Some("max")).await;
+    let (off, off_band) = priced(Some("none")).await;
+    let (silent, silent_band) = priced(None).await;
+
+    assert_eq!(
+        standard_band, "",
+        "the standard band is the rates themselves"
+    );
+    assert_eq!(max_band, "max thinking");
+    assert_eq!(off_band, "no thinking");
+    assert_eq!(
+        silent_band, "no thinking",
+        "a caller who said nothing about thinking is not billed for it"
+    );
+
+    assert!(max > standard, "{max} is not dearer than {standard}");
+    assert!(standard > off, "{standard} is not dearer than {off}");
+    assert_eq!(
+        off, silent,
+        "silence and thinking-off are the same band, so the same price"
+    );
 }
 
 #[tokio::test]

@@ -353,8 +353,8 @@ checks the format on the way in.
 
 ## `pricing`
 
-What a request costs and what it sells for. Two sets of rates and a list of
-rules that move the second one.
+What a request costs and what it sells for: what the provider charges us, a
+rate card for what we charge, and a list of rules that move the card.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -364,9 +364,11 @@ rules that move the second one.
 | `backendOutputUsdPerM` | `0` | …per million output tokens |
 | `backendCachedInputUsdPerM` | `0` | the cache-hit rate; `0` means no discount |
 | `backendReasoningUsdPerM` | `0` | `0` bills reasoning tokens at the output rate |
-| `inputUsdPerM` | `0` | what **we** charge; `0` derives it from the backend rate plus the margin |
+| `inputUsdPerM` | `0` | what **we** charge on the standard band; `0` derives it from the backend rate plus the margin |
 | `outputUsdPerM` | `0` | likewise |
 | `cachedInputUsdPerM`, `reasoningUsdPerM` | `0` | likewise |
+| `maxThinking` | `{}` | the rate card at maximum thinking effort; see below |
+| `nonThinking` | `{}` | the rate card with thinking off |
 | `marginPercent` | `0` | markup over the backend rate, for every rate left at 0 |
 | `requestUsd` | `0` | a flat fee per request |
 | `refusalUsd` | `0` | what a refused answer costs instead of its tokens; `0` bills it like any other reply |
@@ -377,15 +379,50 @@ Off by default on purpose: a relay nobody has priced should report nothing
 rather than a column of zeroes, which reads as free service.
 
 A model's own `pricing` is layered over this one field by field — a non-zero
-rate there wins — and its tiers are appended after the global ones, so a model's
-rules get the last word.
+rate there wins, band by band — and its tiers are appended after the global
+ones, so a model's rules get the last word.
+
+### Thinking bands
+
+These models are sold at three prices, not one: a standard rate, a higher one
+when the caller asks for maximum thinking, a lower one when thinking is off.
+So the sell side is a rate card of three bands, and the band is chosen by the
+effort the caller asked for and nothing else:
+
+| Band | Chosen by | Priced by |
+|---|---|---|
+| standard | `low`, `medium`, `high` | `inputUsdPerM`, `cachedInputUsdPerM`, `outputUsdPerM` |
+| max thinking | `max` (and a thinking budget over 32K) | `maxThinking` |
+| no thinking | `none`, `minimal`, **and a caller who said nothing** | `nonThinking` |
+
+```json
+"inputUsdPerM": 0.35,
+"cachedInputUsdPerM": 0.10,
+"outputUsdPerM": 1.5,
+"maxThinking":  { "inputUsdPerM": 0.35, "cachedInputUsdPerM": 0.10, "outputUsdPerM": 2.0 },
+"nonThinking":  { "inputUsdPerM": 0.35, "cachedInputUsdPerM": 0.10, "outputUsdPerM": 1.2 }
+```
+
+A band takes `inputUsdPerM`, `cachedInputUsdPerM`, `outputUsdPerM` and
+`reasoningUsdPerM`, and a rate it leaves at `0` charges the standard rate rather
+than nothing — so a band that only moves output says so in one number. Reasoning
+tokens are output tokens at the band's own output rate unless the band prices
+them apart.
+
+Silence is billed as no thinking on purpose: a caller who never mentioned
+thinking did not choose to buy it, and should not pay for it.
+
+The band is settled before any tier is read, so a tier can never stop the chain
+early and leave a maximum-effort request paying the standard rate. The band that
+applied is recorded on the request row beside the tiers, as `max thinking` or
+`no thinking`; the standard band is the rates themselves and records nothing.
 
 ### Refusals
 
 A model that will not answer still had to read the prompt to decide that, so the
 request is not free — and it is not worth the price of an answer either. Set
 `refusalUsd` and a refused request costs that flat amount instead of its tokens:
-no tier applies, `price_tiers` reads `refusal`, and the request row still carries
+no band or tier applies, `price_tiers` reads `refusal`, and the request row still carries
 the backend's own charge for the prompt it read, so the cost of saying no is
 visible rather than hidden.
 
@@ -404,10 +441,16 @@ wording, unlike a rate, is all-or-nothing.
 
 ### Tiers
 
-A tier is a condition and a price change. **Every tier that matches applies**, in
-order, which is the whole point: a 300k-token prompt at maximum thinking effort
-during a busy hour pays all three, rather than the relay having to pick one
-reason to charge more. There is no limit on how many you write.
+A tier is a condition and a price change, for what a rate card cannot say: the
+hour, the size of the prompt, a weekend deal. Tiers apply on top of whichever
+band the request is on, and **every tier that matches applies**, in order, which
+is the whole point: a 300k-token prompt during a busy hour pays both, rather
+than the relay having to pick one reason to charge more. There is no limit on
+how many you write.
+
+Thinking effort does not belong here — it is the card. A tier written as a
+`stop` on `efforts: ["max"]` would also hide every tier below it from exactly
+the requests that pay the most, which is why bands are not tiers.
 
 ```json
 "tiers": [
@@ -415,8 +458,6 @@ reason to charge more. There is no limit on how many you write.
     "when": { "hours": [{ "from": 19, "to": 23 }] } },
   { "name": "over 256K",    "inputMultiplier": 2,
     "when": { "minInputTokens": 256000 } },
-  { "name": "hard thinking","reasoningMultiplier": 1.5,
-    "when": { "minEffort": "high" } },
   { "name": "weekend rate", "inputUsdPerM": 0.14,
     "when": { "weekdays": [5, 6] }, "stop": true }
 ]

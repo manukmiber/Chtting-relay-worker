@@ -412,38 +412,37 @@ bukan angka bikinan remnya.
 
 ---
 
-## 5. Harga bertingkat
+## 5. Daftar harga
 
 Tiap request punya tiga angka: **backend** (yang ditagih ke kita), **proxy**
 (yang kita tagih), dan **profit** (selisihnya). Tarifnya per juta token, dan
 tarif jual yang dibiarkan `0` diturunkan dari tarif backend plus margin.
 
-Yang membuatnya tidak terkunci di satu harga: `tiers` itu daftar, dan **semua
-tier yang cocok ikut berlaku**, berurutan. Prompt 300 ribu token, di jam padat,
-dengan thinking effort maksimum membayar ketiganya — bukan relay yang harus
-memilih satu alasan untuk menaikkan harga.
+Sisi jualnya bukan satu baris angka, tapi **kartu tarif tiga pita** — karena
+begitulah model-model ini memang dijual: satu tarif baku, satu lebih mahal saat
+pemanggil minta thinking maksimum, satu lebih murah saat thinking dimatikan.
+Pitanya dipilih dari thinking effort yang diminta pemanggil, dan hanya itu:
+
+| Pita | Dipilih oleh | Ditentukan lewat |
+|---|---|---|
+| baku | `low`, `medium`, `high` | `inputUsdPerM`, `cachedInputUsdPerM`, `outputUsdPerM` |
+| max thinking | `max` (dan budget thinking di atas 32K) | `maxThinking` |
+| tanpa thinking | `none`, `minimal`, **dan pemanggil yang tidak menyebut apa pun** | `nonThinking` |
 
 ```json
-"tiers": [
-  { "name": "jam padat",     "inputMultiplier": 1.25, "outputMultiplier": 1.25,
-    "when": { "hours": [{ "from": 19, "to": 23 }] } },
-  { "name": "di atas 256K",  "inputMultiplier": 2,
-    "when": { "minInputTokens": 256000 } },
-  { "name": "mikir berat",   "reasoningMultiplier": 1.5,
-    "when": { "minEffort": "high" } },
-  { "name": "akhir pekan",   "inputUsdPerM": 0.14,
-    "when": { "weekdays": [5, 6] }, "stop": true }
-]
+"inputUsdPerM": 0.35,
+"cachedInputUsdPerM": 0.10,
+"outputUsdPerM": 1.5,
+"maxThinking":  { "inputUsdPerM": 0.35, "cachedInputUsdPerM": 0.10, "outputUsdPerM": 2.0 },
+"nonThinking":  { "inputUsdPerM": 0.35, "cachedInputUsdPerM": 0.10, "outputUsdPerM": 1.2 }
 ```
 
-Syarat yang bisa dipakai di `when`: model (glob), thinking effort (daftar atau
-batas `minEffort`/`maxEffort`), jam (melingkar lewat tengah malam), hari,
-jumlah token input/output/total, streaming atau tidak, kena cache atau tidak.
-Jumlahnya tidak dibatasi, dan tier boleh ditaruh global atau per model — punya
-model dievaluasi belakangan, jadi dia yang berkata terakhir.
+Tarif yang dibiarkan `0` di sebuah pita menagih tarif baku, bukan menagih nol —
+jadi pita yang cuma menggeser output cukup menyebut satu angka. Token reasoning
+itu token output, dengan tarif output pita yang sedang berlaku.
 
-Tier tidak pernah menyentuh angka backend: markup kita tidak bisa mengubah
-tagihan orang lain. Daftar lengkapnya di [docs/CONFIG.md](docs/CONFIG.md).
+Diam ditagih sebagai tanpa thinking dengan sengaja: pemanggil yang tidak pernah
+menyebut thinking tidak memilih membelinya, jadi tidak membayarnya.
 
 ### Daftar harga ZeikoAI
 
@@ -455,11 +454,42 @@ Tarif jual yang dipasang di `config/config.example.json`, USD per juta token:
 | `Asmarandana-512B-V1` — NSFW | $0,50 | $0,10 | $2,00 | $2,65 | $1,60 |
 | `Wissangeni-512B-V1` — uncensored | $0,80 | $0,20 | $4,00 | $6,00 | $3,50 |
 
-Kolom **Output** itu tarif bakunya: berlaku untuk thinking effort `low`,
-`medium`, dan `high`. Effort `max` pindah ke kolom **Max thinking**. Effort
-`none`, `minimal`, dan pemanggil yang tidak menyebut thinking sama sekali masuk
-kolom **Tanpa thinking** — diam bukan pilihan untuk berpikir. Tarif reasoning
-mengikuti output di tiap kolom, dan tarif input tidak berubah antar kolom.
+Tiga kolom terakhir itu ketiga pitanya. Tarif input dan cache read di sini tidak
+berubah antar pita, tapi tiap pita tetap menyimpannya sendiri — kalau suatu saat
+salah satunya beda, cukup diisi, tanpa perlu aturan tambahan.
+
+### Tier: syarat yang tidak muat di kartu tarif
+
+Jam, ukuran prompt, tarif akhir pekan. `tiers` itu daftar, berlaku **di atas**
+pita mana pun yang sedang dipakai, dan **semua tier yang cocok ikut berlaku**,
+berurutan. Prompt 300 ribu token di jam padat membayar keduanya — bukan relay
+yang harus memilih satu alasan untuk menaikkan harga.
+
+```json
+"tiers": [
+  { "name": "jam padat",     "inputMultiplier": 1.25, "outputMultiplier": 1.25,
+    "when": { "hours": [{ "from": 19, "to": 23 }] } },
+  { "name": "di atas 256K",  "inputMultiplier": 2,
+    "when": { "minInputTokens": 256000 } },
+  { "name": "akhir pekan",   "inputUsdPerM": 0.14,
+    "when": { "weekdays": [5, 6] }, "stop": true }
+]
+```
+
+Thinking effort tidak lagi ditulis di sini — itu kartu tarifnya. Pitanya
+ditetapkan sebelum tier mana pun dibaca, jadi tidak ada tier ber-`stop` yang
+bisa memotong rantai lebih dulu dan membuat request effort maksimum membayar
+tarif baku. Pita yang berlaku tercatat di baris request bersama tier, sebagai
+`max thinking` atau `no thinking`.
+
+Syarat yang bisa dipakai di `when`: model (glob), thinking effort (daftar atau
+batas `minEffort`/`maxEffort`), jam (melingkar lewat tengah malam), hari,
+jumlah token input/output/total, streaming atau tidak, kena cache atau tidak.
+Jumlahnya tidak dibatasi, dan tier boleh ditaruh global atau per model — punya
+model dievaluasi belakangan, jadi dia yang berkata terakhir.
+
+Tier tidak pernah menyentuh angka backend: markup kita tidak bisa mengubah
+tagihan orang lain. Daftar lengkapnya di [docs/CONFIG.md](docs/CONFIG.md).
 
 ### Jawaban yang menolak
 
@@ -803,7 +833,7 @@ src/
   state.rs       yang dibagi semua handler
   logging.rs     log berlevel, file writer di background
   tokenizer/     registry vocabulary, penghitungan chat, estimator
-  pricing.rs     thinking effort, tier bertingkat, harga backend/proxy/profit
+  pricing.rs     thinking effort, kartu tarif tiga pita, tier, backend/proxy/profit
   relay/         upstream + fallback, transform, SSE, pacing, trace, handler
   rotate.rs      ganti instance tiap jam tanpa memutus koneksi
   server/        API publik, dashboard + admin API

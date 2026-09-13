@@ -112,6 +112,86 @@ export function pill(text2, kind = '') {
   return h(`span.pill${kind ? `.${kind}` : ''}`, { text: text2 });
 }
 
+/**
+ * The three thinking bands a model is sold in, as one editable rate card.
+ *
+ * A price list is a table — a rate per band, read down a column — so this is a
+ * table rather than a dozen loose number boxes. The standard row is the whole
+ * card on its own: a band left blank charges the standard rate rather than
+ * nothing, which is why the lower rows read as empty until somebody prices
+ * them.
+ *
+ * `rates` is the pricing object being edited. Returns `{ el, inputs }`, where
+ * `inputs` is keyed `standard|maxThinking|nonThinking` then `input|cached|output`.
+ */
+export function rateCard(rates = {}) {
+  const bands = [
+    ['standard', 'Standard', 'low, medium and high thinking', rates],
+    ['maxThinking', 'Max thinking', 'reasoning_effort "max", or a budget that large', rates.maxThinking ?? {}],
+    ['nonThinking', 'No thinking', 'thinking off, minimal — and callers who said nothing', rates.nonThinking ?? {}],
+  ];
+
+  const inputs = {};
+  const totals = {};
+  const box = (value) => number(value ?? 0, { min: 0, step: 0.01, class: 'rate' });
+
+  // A million in and a million out, so the card can be checked at a glance
+  // against the price list it is meant to reproduce.
+  const retotal = () => {
+    for (const [key] of bands) {
+      const at = (name) => {
+        const own = Number(inputs[key][name].value) || 0;
+        return own > 0 ? own : Number(inputs.standard[name].value) || 0;
+      };
+      totals[key].textContent = `$${(at('input') + at('output')).toFixed(2)}`;
+    }
+  };
+
+  const rows = bands.map(([key, label, hint, src]) => {
+    inputs[key] = {
+      input: box(src.inputUsdPerM),
+      cached: box(src.cachedInputUsdPerM),
+      output: box(src.outputUsdPerM),
+    };
+    for (const el of Object.values(inputs[key])) el.addEventListener('input', retotal);
+    totals[key] = h('span.mono', { text: '$0.00' });
+    return h('tr', {},
+      h('td', {}, h('div', { text: label }), h('div.small.muted', { text: hint })),
+      h('td', {}, inputs[key].input),
+      h('td', {}, inputs[key].cached),
+      h('td', {}, inputs[key].output),
+      h('td.num', {}, totals[key]),
+    );
+  });
+
+  const el = h('div.table-wrap.rate-card', {}, h('table', {},
+    h('thead', {}, h('tr', {},
+      h('th', { text: 'Thinking band' }),
+      h('th', { text: 'Input' }),
+      h('th', { text: 'Cache read' }),
+      h('th', { text: 'Output' }),
+      h('th.num', { text: '1M + 1M' }),
+    )),
+    h('tbody', {}, ...rows),
+  ));
+  retotal();
+  return { el, inputs };
+}
+
+/** Read a rate card back out, in the shape the config stores it in. */
+export function rateCardValues(inputs) {
+  const band = (key) => ({
+    inputUsdPerM: Number(inputs[key].input.value) || 0,
+    cachedInputUsdPerM: Number(inputs[key].cached.value) || 0,
+    outputUsdPerM: Number(inputs[key].output.value) || 0,
+  });
+  return {
+    ...band('standard'),
+    maxThinking: band('maxThinking'),
+    nonThinking: band('nonThinking'),
+  };
+}
+
 /** A right-hand editor panel. `render(close)` returns the body element. */
 export function drawer(title, render, { onSave, saveLabel = 'Save', extra = [] } = {}) {
   const root = document.getElementById('drawer-root');

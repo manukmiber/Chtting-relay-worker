@@ -2,6 +2,7 @@ import { api } from '../api.js';
 import {
   h, card, table, pill, drawer, field, text, number, textarea, select, toggle,
   toast, confirmDialog, parseKeyValues, stringifyKeyValues, parseList, parseLines, copy,
+  rateCard, rateCardValues,
 } from '../ui.js';
 
 /**
@@ -42,7 +43,7 @@ export async function modelsView(ctx) {
           : h('span.muted', { text: '—' }),
         m.systemPrompts?.length ? pill(`+${m.systemPrompts.length} by effort`, 'accent') : null,
         m.maxTokensPerSecond ? pill(`${m.maxTokensPerSecond} tok/s`, 'warn') : null,
-        m.pricing?.enabled ? pill('priced', 'ok') : null,
+        m.pricing?.enabled ? pill(priceLabel(m.pricing), 'ok') : null,
         m.openrouter?.listed ? pill('OpenRouter', 'ok') : null),
       h('td', {}, h('button.ghost.sm', {
         onclick: (e) => { e.stopPropagation(); copy(m.id, `Copied "${m.id}"`); },
@@ -185,24 +186,27 @@ function editModel(ctx, existing) {
     ]));
 
     /* --------------------------------------------------------- pricing */
+    // The price list, written the way the model is actually sold: a rate per
+    // million tokens for each thinking band, and a flat price for a refusal.
+    // Everything that is not that — what the backend charges us, the margin,
+    // the conditional tiers — is real but rarely touched, and sits below.
     const pr = m.pricing ?? {};
     inputs.maxTps = number(m.maxTokensPerSecond ?? 0, { min: 0, step: 1 });
     inputs.prEnabled = h('input', { type: 'checkbox', checked: pr.enabled === true });
+    const priceCard = rateCard(pr);
+    inputs.prCard = priceCard.inputs;
+    inputs.prRefusal = number(pr.refusalUsd ?? 0, { min: 0, step: 0.01 });
+    inputs.prRefusalPhrases = textarea((pr.refusalPhrases ?? []).join('\n'), { rows: 2 });
     inputs.prBackendIn = number(pr.backendInputUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prBackendOut = number(pr.backendOutputUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prBackendCached = number(pr.backendCachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prBackendReasoning = number(pr.backendReasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
-    inputs.prIn = number(pr.inputUsdPerM ?? 0, { min: 0, step: 0.01 });
-    inputs.prOut = number(pr.outputUsdPerM ?? 0, { min: 0, step: 0.01 });
-    inputs.prCached = number(pr.cachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prReasoning = number(pr.reasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prMargin = number(pr.marginPercent ?? 0, { min: 0, step: 1 });
     inputs.prRequest = number(pr.requestUsd ?? 0, { min: 0, step: 0.0001 });
-    inputs.prRefusal = number(pr.refusalUsd ?? 0, { min: 0, step: 0.01 });
-    inputs.prRefusalPhrases = textarea((pr.refusalPhrases ?? []).join('\n'), { rows: 2 });
-    inputs.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 10 });
+    inputs.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 8 });
 
-    body.append(section('Speed and price', [
+    body.append(section('Speed', [
       h('p.small.muted', {
         text: 'A ceiling on how fast the reply leaves the relay. A backend running at '
           + '170 tokens a second pushes 170 a second down the tunnel; holding it to 35 '
@@ -210,10 +214,38 @@ function editModel(ctx, existing) {
           + '0 means full speed.',
       }),
       field('Tokens per second out', inputs.maxTps, '0 = as fast as the backend manages'),
-      h('hr'),
+    ]));
+
+    body.append(section('Price', [
       h('label.switch', { style: { marginBottom: '12px' } }, inputs.prEnabled,
         h('span', { text: 'Price this model (leave off to inherit the global price list)' })),
-      h('p.small.muted', { text: 'Rates are USD per million tokens. Left at 0, each one falls back to the global list.' }),
+      h('p.small.muted', {
+        text: 'USD per million tokens. The band is chosen by the thinking effort the '
+          + 'caller asked for and nothing else — so the whole price list is these nine '
+          + 'numbers, read down a column. A rate left at 0 in the lower two rows charges '
+          + 'the standard rate above it, never nothing.',
+      }),
+      priceCard.el,
+      h('p.small.muted', {
+        text: 'Reasoning tokens are output tokens, at the band\u2019s own output rate. '
+          + 'A caller who never mentioned thinking is on the no-thinking row: silence is '
+          + 'not a choice to think, and should not be billed as one.',
+      }),
+      h('hr'),
+      h('div.grid.form', {},
+        field('Refused answer', inputs.prRefusal, 'flat price instead of tokens; 0 = off'),
+        field('Per-request fee', inputs.prRequest, 'on top of the tokens; 0 = none'),
+      ),
+      field('Refusal wording', inputs.prRefusalPhrases,
+        'one per line; a reply carrying any of them is billed as a refusal. '
+        + 'Blank inherits the global list.'),
+    ], true));
+
+    body.append(section('Cost, margin and conditional tiers', [
+      h('p.small.muted', {
+        text: 'What the upstream provider charges us, which is what turns the price '
+          + 'above into a profit column. It never reaches the caller\u2019s bill.',
+      }),
       h('div.grid.form', {},
         field('Backend input', inputs.prBackendIn, 'what we are charged'),
         field('Backend output', inputs.prBackendOut),
@@ -221,28 +253,19 @@ function editModel(ctx, existing) {
         field('Backend reasoning', inputs.prBackendReasoning, '0 = billed as output'),
       ),
       h('div.grid.form', {},
-        field('Our input', inputs.prIn, '0 = backend rate + margin'),
-        field('Our output', inputs.prOut, '0 = backend rate + margin'),
-        field('Our cached input', inputs.prCached, 'what a cache read costs the caller'),
-        field('Our reasoning', inputs.prReasoning, '0 = billed as output'),
+        field('Margin %', inputs.prMargin, 'used only for a rate left at 0 everywhere'),
+        field('Our reasoning', inputs.prReasoning, 'prices reasoning apart from output; 0 = with it'),
       ),
-      h('div.grid.form', {},
-        field('Margin %', inputs.prMargin),
-        field('Per-request fee', inputs.prRequest),
-        field('Refused answer', inputs.prRefusal, 'flat price instead of tokens; 0 = off'),
-      ),
-      field('Refusal wording', inputs.prRefusalPhrases,
-        'one per line; a reply carrying any of them is billed as a refusal. '
-        + 'Blank inherits the global list.'),
+      h('hr'),
       h('p.small.muted', {
-        text: 'Tiers change the price per request, and every tier that matches applies — '
-          + 'a long prompt during a busy hour at maximum thinking effort pays all three. '
-          + 'There is no limit on how many you add.',
+        text: 'Tiers are for what a rate card cannot say: the hour, the size of the '
+          + 'prompt, a weekend deal. They apply on top of whichever band the request is '
+          + 'on, and every tier that matches applies — a 300K prompt during a busy hour '
+          + 'pays both. Thinking effort does not belong here any more; it is the card.',
       }),
       field('Price tiers', inputs.prTiers,
         'JSON: [{"name":"busy hours","inputMultiplier":1.25,"when":{"hours":[{"from":19,"to":23}]}}, '
-        + '{"name":"over 256K","inputMultiplier":2,"when":{"minInputTokens":256000}}, '
-        + '{"name":"hard thinking","reasoningMultiplier":1.5,"when":{"minEffort":"high"}}]'),
+        + '{"name":"over 256K","inputMultiplier":2,"when":{"minInputTokens":256000}}]'),
     ]));
 
     /* ------------------------------------------------------- tokenizer */
@@ -457,9 +480,7 @@ function editModel(ctx, existing) {
             backendOutputUsdPerM: Number(inputs.prBackendOut.value) || 0,
             backendCachedInputUsdPerM: Number(inputs.prBackendCached.value) || 0,
             backendReasoningUsdPerM: Number(inputs.prBackendReasoning.value) || 0,
-            inputUsdPerM: Number(inputs.prIn.value) || 0,
-            outputUsdPerM: Number(inputs.prOut.value) || 0,
-            cachedInputUsdPerM: Number(inputs.prCached.value) || 0,
+            ...rateCardValues(inputs.prCard),
             reasoningUsdPerM: Number(inputs.prReasoning.value) || 0,
             marginPercent: Number(inputs.prMargin.value) || 0,
             requestUsd: Number(inputs.prRequest.value) || 0,
@@ -544,6 +565,20 @@ function editModel(ctx, existing) {
       return undefined;
     },
   });
+}
+
+/**
+ * What this model costs, short enough for the list: input and output per
+ * million on the standard band, with the spread the other two bands add.
+ */
+function priceLabel(pr) {
+  const rate = (n) => `$${Number(n ?? 0).toFixed(2)}`;
+  const outs = [pr.nonThinking?.outputUsdPerM, pr.outputUsdPerM, pr.maxThinking?.outputUsdPerM]
+    .map((n) => Number(n) || Number(pr.outputUsdPerM) || 0);
+  const span = Math.min(...outs) === Math.max(...outs)
+    ? rate(pr.outputUsdPerM)
+    : `${rate(Math.min(...outs))}–${rate(Math.max(...outs))}`;
+  return `${rate(pr.inputUsdPerM)} in / ${span} out`;
 }
 
 function section(title, children, open = false) {

@@ -144,37 +144,18 @@
         "inputUsdPerM": 0.35,
         "cachedInputUsdPerM": 0.1,
         "outputUsdPerM": 1.5,
-        "reasoningUsdPerM": 1.5,
-        "tiers": [
-          {
-            "id": "tier_jagad_max",
-            "name": "max thinking",
-            "enabled": true,
-            "when": {
-              "efforts": [
-                "max"
-              ]
-            },
-            "outputUsdPerM": 2.0,
-            "reasoningUsdPerM": 2.0,
-            "stop": true
-          },
-          {
-            "id": "tier_jagad_plain",
-            "name": "no thinking",
-            "enabled": true,
-            "when": {
-              "efforts": [
-                "none",
-                "minimal",
-                "default"
-              ]
-            },
-            "outputUsdPerM": 1.2,
-            "reasoningUsdPerM": 1.2,
-            "stop": true
-          }
-        ]
+        "maxThinking": {
+          "inputUsdPerM": 0.35,
+          "cachedInputUsdPerM": 0.1,
+          "outputUsdPerM": 2.0
+        },
+        "nonThinking": {
+          "inputUsdPerM": 0.35,
+          "cachedInputUsdPerM": 0.1,
+          "outputUsdPerM": 1.2
+        },
+        "refusalUsd": 0.05,
+        "tiers": []
       }
     },
     {
@@ -243,37 +224,18 @@
         "inputUsdPerM": 0.5,
         "cachedInputUsdPerM": 0.1,
         "outputUsdPerM": 2.0,
-        "reasoningUsdPerM": 2.0,
-        "tiers": [
-          {
-            "id": "tier_asmarandana_max",
-            "name": "max thinking",
-            "enabled": true,
-            "when": {
-              "efforts": [
-                "max"
-              ]
-            },
-            "outputUsdPerM": 2.65,
-            "reasoningUsdPerM": 2.65,
-            "stop": true
-          },
-          {
-            "id": "tier_asmarandana_plain",
-            "name": "no thinking",
-            "enabled": true,
-            "when": {
-              "efforts": [
-                "none",
-                "minimal",
-                "default"
-              ]
-            },
-            "outputUsdPerM": 1.6,
-            "reasoningUsdPerM": 1.6,
-            "stop": true
-          }
-        ]
+        "maxThinking": {
+          "inputUsdPerM": 0.5,
+          "cachedInputUsdPerM": 0.1,
+          "outputUsdPerM": 2.65
+        },
+        "nonThinking": {
+          "inputUsdPerM": 0.5,
+          "cachedInputUsdPerM": 0.1,
+          "outputUsdPerM": 1.6
+        },
+        "refusalUsd": 0.05,
+        "tiers": []
       }
     },
     {
@@ -342,37 +304,18 @@
         "inputUsdPerM": 0.8,
         "cachedInputUsdPerM": 0.2,
         "outputUsdPerM": 4.0,
-        "reasoningUsdPerM": 4.0,
-        "tiers": [
-          {
-            "id": "tier_wissangeni_max",
-            "name": "max thinking",
-            "enabled": true,
-            "when": {
-              "efforts": [
-                "max"
-              ]
-            },
-            "outputUsdPerM": 6.0,
-            "reasoningUsdPerM": 6.0,
-            "stop": true
-          },
-          {
-            "id": "tier_wissangeni_plain",
-            "name": "no thinking",
-            "enabled": true,
-            "when": {
-              "efforts": [
-                "none",
-                "minimal",
-                "default"
-              ]
-            },
-            "outputUsdPerM": 3.5,
-            "reasoningUsdPerM": 3.5,
-            "stop": true
-          }
-        ]
+        "maxThinking": {
+          "inputUsdPerM": 0.8,
+          "cachedInputUsdPerM": 0.2,
+          "outputUsdPerM": 6.0
+        },
+        "nonThinking": {
+          "inputUsdPerM": 0.8,
+          "cachedInputUsdPerM": 0.2,
+          "outputUsdPerM": 3.5
+        },
+        "refusalUsd": 0.05,
+        "tiers": []
       }
     }
   ],
@@ -482,7 +425,18 @@
     "backendOutputUsdPerM": 0.42,
     "backendReasoningUsdPerM": 0,
     "inputUsdPerM": 0,
+    "cachedInputUsdPerM": 0,
     "outputUsdPerM": 0,
+    "maxThinking": {
+      "inputUsdPerM": 0,
+      "cachedInputUsdPerM": 0,
+      "outputUsdPerM": 0
+    },
+    "nonThinking": {
+      "inputUsdPerM": 0,
+      "cachedInputUsdPerM": 0,
+      "outputUsdPerM": 0
+    },
     "marginPercent": 100,
     "requestUsd": 0,
     "refusalUsd": 0.05,
@@ -513,15 +467,6 @@
           "minInputTokens": 256000
         },
         "inputMultiplier": 2
-      },
-      {
-        "id": "tier_thinking",
-        "name": "high thinking effort",
-        "enabled": false,
-        "when": {
-          "minEffort": "high"
-        },
-        "reasoningMultiplier": 1.5
       },
       {
         "id": "tier_weekend",

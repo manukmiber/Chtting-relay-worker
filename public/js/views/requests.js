@@ -171,7 +171,9 @@ async function showDetail(id) {
           miniStat('Profit', fmtUsd(r.profit_usd),
             r.backend_usd ? `${Math.round((r.profit_usd / r.backend_usd) * 100)}% margin` : ''),
         ),
-        r.price_tiers ? h('p.small.muted', { text: `Tiers applied: ${r.price_tiers}` }) : null,
+        // The band the request was priced on leads this list, and a tier that
+        // moved the price follows it, so "Tiers applied" would misname both.
+        r.price_tiers ? h('p.small.muted', { text: `Priced as: ${r.price_tiers}` }) : null,
       )
       : null,
 

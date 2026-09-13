@@ -162,19 +162,40 @@ function modelSection(models, cfg) {
   ];
 
   if (priced) {
-    blocks.push({ p: 'Rates are USD per million tokens, as charged to the caller.' });
     blocks.push({
-      columns: ['Model', 'Input', 'Cached input', 'Output', 'Reasoning', 'Per request', 'Refused'],
+      p: 'Rates are USD per million tokens, as charged to the caller. Output is priced '
+        + 'by the thinking band the request is on: `reasoning_effort: "max"` (or a '
+        + 'thinking budget that large) pays the max column, thinking turned off or set '
+        + 'to minimal pays the no-thinking column, and so does a request that never '
+        + 'mentioned thinking at all. Everything in between pays the standard column. '
+        + 'Reasoning tokens are billed as output at the band\u2019s own rate.',
+    });
+    blocks.push({
+      columns: ['Model', 'Input', 'Cache read', 'Output', 'Output, max thinking',
+        'Output, no thinking', 'Per request', 'Refused'],
       rows: models.map((m) => {
         const p = resolvePricing(cfg.pricing ?? {}, m.pricing ?? {});
         return [
           `\`${m.id}\``,
-          rate(p.input), rate(p.cachedInput), rate(p.output), rate(p.reasoning),
+          rate(p.input), rate(p.cachedInput), rate(p.output),
+          rate(p.maxThinking.output), rate(p.nonThinking.output),
           p.requestUsd ? `$${p.requestUsd}` : '—',
           p.refusalUsd ? `$${trimZeros(p.refusalUsd)}` : '—',
         ];
       }),
     });
+    // The input and cache rates are one per card in every price list we
+    // publish; when a band moves them too, the table above would be lying by
+    // omission, so it says so rather than showing the standard rate alone.
+    const bandInputs = models.flatMap((m) => {
+      const p = resolvePricing(cfg.pricing ?? {}, m.pricing ?? {});
+      return [['max thinking', p.maxThinking], ['no thinking', p.nonThinking]]
+        .filter(([, b]) => (b.input && b.input !== p.input) || (b.cachedInput && b.cachedInput !== p.cachedInput))
+        .map(([name, b]) => `\`${m.id}\` on ${name}: input ${rate(b.input || p.input)}, cache read ${rate(b.cachedInput || p.cachedInput)}`);
+    });
+    if (bandInputs.length) {
+      blocks.push({ note: `Input and cache read also change by band — ${bandInputs.join('; ')}.` });
+    }
     const refusing = models.some((m) => resolvePricing(cfg.pricing ?? {}, m.pricing ?? {}).refusalUsd > 0);
     if (refusing) {
       blocks.push({
@@ -481,11 +502,29 @@ function resolvePricing(defaults, model) {
   const sell = (explicit, cost) => (explicit > 0 ? explicit : (cost || 0) * margin);
   const backendCached = pick(model.backendCachedInputUsdPerM, defaults.backendCachedInputUsdPerM) || backendInput;
   const backendReasoning = pick(model.backendReasoningUsdPerM, defaults.backendReasoningUsdPerM) || backendOutput;
-  return {
+  const standard = {
     input: sell(pick(model.inputUsdPerM, defaults.inputUsdPerM), backendInput),
     cachedInput: sell(pick(model.cachedInputUsdPerM, defaults.cachedInputUsdPerM), backendCached),
     output: sell(pick(model.outputUsdPerM, defaults.outputUsdPerM), backendOutput),
     reasoning: sell(pick(model.reasoningUsdPerM, defaults.reasoningUsdPerM), backendReasoning),
+  };
+  // A band left unpriced is the standard band, not a free one.
+  const band = (name) => {
+    const own = model[name] ?? {};
+    const house = defaults[name] ?? {};
+    const at = (key) => pick(own[key], house[key]);
+    const output = at('outputUsdPerM') || standard.output;
+    return {
+      input: at('inputUsdPerM') || standard.input,
+      cachedInput: at('cachedInputUsdPerM') || standard.cachedInput,
+      output,
+      reasoning: at('reasoningUsdPerM') || output,
+    };
+  };
+  return {
+    ...standard,
+    maxThinking: band('maxThinking'),
+    nonThinking: band('nonThinking'),
     requestUsd: pick(model.requestUsd, defaults.requestUsd) || 0,
     refusalUsd: pick(model.refusalUsd, defaults.refusalUsd) || 0,
   };

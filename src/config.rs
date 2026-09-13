@@ -379,6 +379,33 @@ impl Default for SystemPromptRule {
 
 /* ------------------------------------------------------------- pricing -- */
 
+/// What the models say when they will not answer. One sentence, fixed wording,
+/// so a refusal can be recognised from the completion alone.
+pub const DEFAULT_REFUSAL_PHRASES: [&str; 1] = ["I cannot do that. I only provide AI roleplay."];
+
+/// One band of a rate card: what a million tokens costs while the model is
+/// thinking that hard.
+///
+/// A field left at 0 is not free — it means "same as the standard band", which
+/// is what lets a model that only charges more for output say so in one number
+/// instead of restating its input and cache rates.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BandRates {
+    pub input_usd_per_m: f64,
+    pub cached_input_usd_per_m: f64,
+    pub output_usd_per_m: f64,
+    /// Unset bills reasoning tokens at this band's output rate.
+    pub reasoning_usd_per_m: f64,
+}
+
+impl BandRates {
+    /// True when this band says nothing at all, and the standard rates stand.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// What a request costs and what it sells for.
 ///
 /// Rates are USD per million tokens, the unit every provider publishes. The
@@ -386,13 +413,16 @@ impl Default for SystemPromptRule {
 /// charges, and when one of those is left at 0 it is derived from the backend
 /// rate plus `marginPercent` instead of being free.
 ///
-/// `tiers` is a list with no ceiling on its length, and every tier that matches
-/// a request applies. That is the point: a price can depend on thinking effort
-/// and the hour and the size of the prompt at the same time, rather than the
-/// relay having to pick one reason to charge more.
-/// What the models say when they will not answer. One sentence, fixed wording,
-/// so a refusal can be recognised from the completion alone.
-pub const DEFAULT_REFUSAL_PHRASES: [&str; 1] = ["I cannot do that. I only provide AI roleplay."];
+/// The sell side is a rate card of three bands rather than one row of numbers,
+/// because that is how these models are actually sold: a standard rate, a
+/// higher one when the caller asks for maximum thinking, a lower one when
+/// thinking is off. The band is chosen by the effort the caller asked for and
+/// nothing else, so it is decided before any tier is read.
+///
+/// `tiers` is what is left for the conditions a rate card cannot express — the
+/// hour, the size of the prompt, a weekend deal. It is a list with no ceiling
+/// on its length, and every tier that matches a request applies on top of the
+/// band, rather than the relay having to pick one reason to charge more.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -407,10 +437,18 @@ pub struct Pricing {
     pub backend_output_usd_per_m: f64,
     /// Unset bills reasoning tokens at the output rate.
     pub backend_reasoning_usd_per_m: f64,
+    /// The standard band: what a caller pays when they asked the model to think
+    /// at low, medium or high effort, and the fallback for every band below.
     pub input_usd_per_m: f64,
     pub cached_input_usd_per_m: f64,
     pub output_usd_per_m: f64,
     pub reasoning_usd_per_m: f64,
+    /// The band for `reasoning_effort: "max"` and the budgets that large.
+    pub max_thinking: BandRates,
+    /// The band for thinking turned off, thinking set to minimal, and for a
+    /// caller who said nothing about thinking at all — silence is not a choice
+    /// to think, and should not be billed as one.
+    pub non_thinking: BandRates,
     /// Markup over the backend rate, in percent, for every sell-side rate left
     /// at 0.
     pub margin_percent: f64,
@@ -1317,6 +1355,30 @@ fn normalize_pricing(pricing: &mut Pricing) {
     }
     if !pricing.refusal_usd.is_finite() || pricing.refusal_usd < 0.0 {
         pricing.refusal_usd = 0.0;
+    }
+    // A rate that is not a number is a typo, and a negative one would pay the
+    // caller to send tokens. Either way the standard band is the safer answer.
+    for rate in [
+        &mut pricing.input_usd_per_m,
+        &mut pricing.cached_input_usd_per_m,
+        &mut pricing.output_usd_per_m,
+        &mut pricing.reasoning_usd_per_m,
+    ] {
+        if !rate.is_finite() || *rate < 0.0 {
+            *rate = 0.0;
+        }
+    }
+    for band in [&mut pricing.max_thinking, &mut pricing.non_thinking] {
+        for rate in [
+            &mut band.input_usd_per_m,
+            &mut band.cached_input_usd_per_m,
+            &mut band.output_usd_per_m,
+            &mut band.reasoning_usd_per_m,
+        ] {
+            if !rate.is_finite() || *rate < 0.0 {
+                *rate = 0.0;
+            }
+        }
     }
     for phrase in &mut pricing.refusal_phrases {
         *phrase = phrase.trim().to_string();

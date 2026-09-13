@@ -220,6 +220,24 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.mono { font-family: var(--mono); font-size: 12px; }
 tr.clickable { cursor: pointer; }
 
+/* A rate card reads as a price list, so the numbers have to line up under
+   their heading rather than sit in a grid of loose boxes. The cells are tight
+   because a rate is four characters wide and the band names carry the width. */
+.rate-card { margin-bottom: 12px; }
+.rate-card table { font-size: 12.5px; }
+.rate-card th, .rate-card td { padding: 6px 8px; vertical-align: middle; }
+.rate-card tbody tr:last-child td { border-bottom: none; }
+.rate-card tbody tr:hover { background: transparent; }
+.rate-card input.rate {
+  width: 100%;
+  min-width: 72px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  text-align: right;
+}
+.rate-card td.num { color: var(--muted); white-space: nowrap; }
+
 .pill {
   display: inline-block;
   padding: 2px 8px;

@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   h, card, field, text, number, textarea, select, toast, parseList, parseLines,
-  fmtNum, fmtMs, fmtBytes, confirmDialog, copy, stat,
+  fmtNum, fmtMs, fmtBytes, confirmDialog, copy, stat, rateCard, rateCardValues,
 } from '../ui.js';
 
 /** Everything else: server, security, logging, tokenizer rules, maintenance. */
@@ -99,46 +99,44 @@ export async function settingsView(ctx) {
   )));
 
   /* ------------------------------------------------------------ pricing */
+  // The house rate card. Every model carries one of these of its own; this is
+  // what a model that prices nothing falls back to, band by band and rate by
+  // rate, so a house price for maximum thinking still stands under a model that
+  // only repriced its own output.
   const pr = cfg.pricing ?? {};
   i.prEnabled = h('input', { type: 'checkbox', checked: pr.enabled === true });
+  const priceCard = rateCard(pr);
+  i.prCard = priceCard.inputs;
   i.prBackendIn = number(pr.backendInputUsdPerM ?? 0, { min: 0, step: 0.01 });
   i.prBackendOut = number(pr.backendOutputUsdPerM ?? 0, { min: 0, step: 0.01 });
   i.prBackendCached = number(pr.backendCachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
   i.prBackendReasoning = number(pr.backendReasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
-  i.prIn = number(pr.inputUsdPerM ?? 0, { min: 0, step: 0.01 });
-  i.prOut = number(pr.outputUsdPerM ?? 0, { min: 0, step: 0.01 });
-  i.prCached = number(pr.cachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
   i.prReasoning = number(pr.reasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
   i.prMargin = number(pr.marginPercent ?? 0, { min: 0, step: 1 });
   i.prRequest = number(pr.requestUsd ?? 0, { min: 0, step: 0.0001 });
   i.prRefusal = number(pr.refusalUsd ?? 0, { min: 0, step: 0.01 });
   i.prRefusalPhrases = textarea((pr.refusalPhrases ?? []).join('\n'), { rows: 2 });
-  i.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 12 });
+  i.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 10 });
 
   root.append(card('Pricing', h('div', {},
     h('label.switch', { style: { marginBottom: '12px' } }, i.prEnabled,
       h('span', { text: 'Price requests (off means no money is reported at all)' })),
     h('p.small.muted', {
-      text: 'Rates are USD per million tokens. The backend rates are what this relay '
-        + 'is charged; ours are what callers are charged, and any of ours left at 0 is '
-        + 'taken as the backend rate plus the margin. A model can override all of it.',
+      text: 'USD per million tokens, per thinking band. The band is chosen by the effort '
+        + 'the caller asked for: maximum effort on its own row, thinking off \u2014 and a '
+        + 'caller who said nothing \u2014 on the row below it, everything else on the '
+        + 'standard row. A rate left at 0 in the lower rows charges the standard rate '
+        + 'above it, never nothing.',
     }),
+    priceCard.el,
+    h('p.small.muted', {
+      text: 'A model prices itself in its own tab and overrides this card rate by rate; '
+        + 'what it leaves at 0 falls back here.',
+    }),
+    h('hr'),
     h('div.grid.form', {},
-      field('Backend input', i.prBackendIn),
-      field('Backend output', i.prBackendOut),
-      field('Backend cached input', i.prBackendCached, '0 = no cache discount'),
-      field('Backend reasoning', i.prBackendReasoning, '0 = billed as output'),
-    ),
-    h('div.grid.form', {},
-      field('Our input', i.prIn, '0 = backend + margin'),
-      field('Our output', i.prOut, '0 = backend + margin'),
-      field('Our cached input', i.prCached),
-      field('Our reasoning', i.prReasoning),
-    ),
-    h('div.grid.form', {},
-      field('Margin %', i.prMargin),
-      field('Per-request fee', i.prRequest),
       field('Refused answer', i.prRefusal, 'flat price instead of tokens; 0 = off'),
+      field('Per-request fee', i.prRequest, 'on top of the tokens; 0 = none'),
     ),
     h('p.small.muted', {
       text: 'A reply that carries one of these sentences is a refusal: the caller pays the '
@@ -148,10 +146,28 @@ export async function settingsView(ctx) {
     field('Refusal wording', i.prRefusalPhrases, 'one per line, matched anywhere in the reply'),
     h('hr'),
     h('p.small.muted', {
-      text: 'Tiers move the price per request, and every tier that matches applies — '
-        + 'so a 300k-token prompt at maximum thinking effort during a busy hour pays all '
-        + 'three multipliers, not whichever one happens to be first. Add as many as you '
-        + 'like; a tier with "stop": true ends the chain where it sits.',
+      text: 'The backend rates are what this relay is charged, which is what turns the '
+        + 'card above into a profit column. They never reach the caller\u2019s bill. A '
+        + 'sell-side rate left at 0 on every band and every model is taken as the backend '
+        + 'rate plus the margin rather than as free.',
+    }),
+    h('div.grid.form', {},
+      field('Backend input', i.prBackendIn),
+      field('Backend output', i.prBackendOut),
+      field('Backend cached input', i.prBackendCached, '0 = no cache discount'),
+      field('Backend reasoning', i.prBackendReasoning, '0 = billed as output'),
+    ),
+    h('div.grid.form', {},
+      field('Margin %', i.prMargin),
+      field('Our reasoning', i.prReasoning, 'prices reasoning apart from output; 0 = with it'),
+    ),
+    h('hr'),
+    h('p.small.muted', {
+      text: 'Tiers are for what a rate card cannot say: the hour, the size of the prompt, '
+        + 'a weekend deal. They apply on top of whichever band a request is on, and every '
+        + 'tier that matches applies \u2014 so a 300k-token prompt during a busy hour pays '
+        + 'both, not whichever one happens to be first. A tier with "stop": true ends the '
+        + 'chain where it sits; it cannot reach back and change the band.',
     }),
     field('Price tiers', i.prTiers,
       'each: {name, enabled, when:{models,efforts,minEffort,maxEffort,hours:[{from,to}],'
@@ -347,9 +363,7 @@ export async function settingsView(ctx) {
               backendOutputUsdPerM: Number(i.prBackendOut.value) || 0,
               backendCachedInputUsdPerM: Number(i.prBackendCached.value) || 0,
               backendReasoningUsdPerM: Number(i.prBackendReasoning.value) || 0,
-              inputUsdPerM: Number(i.prIn.value) || 0,
-              outputUsdPerM: Number(i.prOut.value) || 0,
-              cachedInputUsdPerM: Number(i.prCached.value) || 0,
+              ...rateCardValues(i.prCard),
               reasoningUsdPerM: Number(i.prReasoning.value) || 0,
               marginPercent: Number(i.prMargin.value) || 0,
               requestUsd: Number(i.prRequest.value) || 0,
