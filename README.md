@@ -356,6 +356,29 @@ Sisi request juga bisa dibentuk: `dropParams` untuk backend yang rewel,
 `renameParams` (misal `max_completion_tokens` → `max_tokens`), `injectStop`,
 `params` sebagai default dan `forceParams` yang tidak bisa ditawar pemanggil.
 
+### Kegagalan backend juga dibentuk ulang
+
+Error adalah respons yang paling sering di-copy-paste orang ke tempat lain, jadi
+di situlah kebocoran paling mahal. Dulu kalimat backend diteruskan apa adanya —
+lengkap dengan nama backend, host-nya saat koneksi gagal, dan kata-katanya
+sendiri. Sekarang statusnya dipetakan per kelas dan kalimatnya milik relay:
+
+| Status backend | Yang diterima pemanggil | Alasannya |
+|---|---|---|
+| 400, 422 | 400 `invalid_request` | request-nya sendiri yang ditolak, pemanggil bisa memperbaiki |
+| 413 | 413 `too_large` | body kebesaran |
+| 408, 504 | 504 `timeout` | model kelamaan menjawab |
+| 429 | 429 `rate_limit_exceeded` | model sedang sibuk |
+| 401, 402, 403, 404, 5xx | 502 `upstream_unavailable` | itu kredensial/urusan kita, bukan key pemanggil |
+
+Yang terakhir itu yang paling penting: 401 dari backend berarti **key kita**
+yang ditolak. Meneruskannya sebagai 401 akan memberi tahu pemanggil bahwa key
+*mereka* yang salah — keliru, dan tidak ada yang bisa mereka lakukan.
+
+Jawaban asli backend tetap tercatat utuh di baris request dan di `relay.log`,
+tempat operator memang membutuhkannya dan tidak ada orang luar yang bisa
+membacanya.
+
 ### Keep-alive dengan kalimat sendiri
 
 Selama backend berpikir, tidak ada apa pun yang lewat kabel, dan cloudflared
@@ -563,11 +586,31 @@ ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pu
 | Tokenizer | playground token, biaya satu request chat, pasang vocabulary |
 | Playground | kirim request beneran lewat relay |
 | Tunnel | start/stop cloudflared, URL publik, output mentah |
+| API Docs | dokumentasi integrasi yang ditulis dari config yang sedang jalan — base URL, endpoint, model, parameter, field usage, limit, error; bisa disalin sebagai Markdown |
 | Settings | server, antrean, security, logging, aturan tokenizer, default, OpenRouter |
 | Logs | ekor `relay.log` |
 
 Beri password lewat Settings kalau HP-mu dipakai orang lain. Secret selalu
 tampil termask, dan menyimpan form tidak akan menimpa key asli dengan masknya.
+
+### Dokumentasi API untuk yang mau integrasi
+
+Tab **API Docs** menyusun dokumentasi lengkap dari config yang sedang jalan:
+base URL (pakai URL tunnel kalau tunnel hidup), daftar endpoint, id model
+persis seperti yang dikembalikan `GET /v1/models`, parameter mana yang
+diproses relay dan mana yang diteruskan apa adanya, field `usage` yang dipakai
+buat menagih, limit per key, bentuk error, plus contoh curl, Python, dan
+potongan SSE.
+
+Tidak ada satu pun angka di halaman itu yang diketik tangan — semuanya dibaca
+dari config, jadi begitu harga, kuota, atau limit berubah, dokumennya ikut
+berubah. Tombol **Copy as Markdown** mengeluarkan seluruh halaman sebagai satu
+dokumen Markdown yang tinggal ditempel ke email calon integrator; **Download
+.md** menyimpannya sebagai file.
+
+Nilai key tidak pernah ikut: contohnya memakai placeholder
+`Kunci-Zeiko-XXXX…`, jadi dokumen itu aman dikirim, dan key asli dikirim
+terpisah lewat jalur yang kamu percaya.
 
 ---
 
