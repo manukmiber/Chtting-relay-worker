@@ -114,6 +114,26 @@ pub fn rules_lookbehind(rules: &[TextRule]) -> usize {
 
 /* ------------------------------------------------------------- request -- */
 
+/// The request fields OpenRouter's chat API defines for routing and reporting
+/// rather than for the model: which provider to pick, which models to fall
+/// back through, what to report alongside the answer.
+///
+/// This relay has settled all of that by the time a body is built — it *is* the
+/// routing — so these stop at the door. Forwarding one is how a strict backend
+/// answers 400 to a request that was perfectly valid when it arrived.
+///
+/// Dropped before the model's own `params` and `forceParams` are laid on, so a
+/// route pointed at OpenRouter itself can still set any of them deliberately.
+const ROUTING_ONLY_KEYS: [&str; 7] = [
+    "usage",
+    "transforms",
+    "route",
+    "provider",
+    "models",
+    "plugins",
+    "preset",
+];
+
 /// Build the body actually sent upstream.
 pub fn transform_request(
     body: &Value,
@@ -129,6 +149,10 @@ pub fn transform_request(
 
     // Requirement 5: what the caller asked for becomes what the backend knows.
     map.insert("model".into(), Value::String(route.upstream_model.clone()));
+
+    for key in ROUTING_ONLY_KEYS {
+        map.remove(key);
+    }
 
     // Parameter defaults the caller may override...
     for (k, v) in &route.params {
@@ -368,6 +392,30 @@ pub struct Identity {
     pub id: String,
     pub created: i64,
     pub model: String,
+    /// Who served this, in OpenRouter's vocabulary — the relay's own provider
+    /// slug, never the backend that actually ran the prompt. Empty publishes
+    /// no `provider` field at all.
+    pub provider: String,
+}
+
+impl Identity {
+    /// Start a reply envelope from this identity and nothing else.
+    ///
+    /// Every envelope the relay emits comes from here — the buffered reply, a
+    /// streamed chunk, the closing usage frame, a replayed stream — so there is
+    /// one place where "what a reply looks like" is decided and no path can
+    /// quietly drift from the others.
+    pub fn envelope(&self, object: &str) -> Map<String, Value> {
+        let mut out = Map::with_capacity(5);
+        out.insert("id".into(), Value::String(self.id.clone()));
+        out.insert("object".into(), Value::String(object.to_string()));
+        out.insert("created".into(), Value::from(self.created));
+        out.insert("model".into(), Value::String(self.model.clone()));
+        if !self.provider.is_empty() {
+            out.insert("provider".into(), Value::String(self.provider.clone()));
+        }
+        out
+    }
 }
 
 /// The keys a delta may carry outward. Everything else the backend puts in one
@@ -398,12 +446,7 @@ const MESSAGE_KEYS: [&str; 5] = [
 /// simply not copied. `system_fingerprint`, the backend's request id, its
 /// `created`, its model name and its `service_tier` all stop at this line.
 fn rebuild(identity: &Identity, object: &str) -> Map<String, Value> {
-    let mut out = Map::with_capacity(5);
-    out.insert("id".into(), Value::String(identity.id.clone()));
-    out.insert("object".into(), Value::String(object.to_string()));
-    out.insert("created".into(), Value::from(identity.created));
-    out.insert("model".into(), Value::String(identity.model.clone()));
-    out
+    identity.envelope(object)
 }
 
 /// Copy the allowed keys of `from` into a fresh map.
@@ -470,7 +513,13 @@ pub fn transform_response(
                             Value::String(apply_text(text, transform, &rules)),
                         );
                     }
-                    out.insert("finish_reason".into(), finish_reason_of(choice));
+                    let finish_reason = finish_reason_of(choice);
+                    // OpenRouter's pair: the normalised reason and the one the
+                    // provider itself gave. The relay normalises nothing here,
+                    // so they are the same value — said twice rather than left
+                    // for a client to guess at.
+                    out.insert("native_finish_reason".into(), finish_reason.clone());
+                    out.insert("finish_reason".into(), finish_reason);
                     Value::Object(out)
                 })
                 .collect()
@@ -611,6 +660,7 @@ pub fn transform_chunk(
                             !finish_reason.is_null(),
                         )),
                     );
+                    out.insert("native_finish_reason".into(), finish_reason.clone());
                     out.insert("finish_reason".into(), finish_reason);
                     Value::Object(out)
                 })
@@ -739,6 +789,7 @@ mod tests {
             id: "7f3a11d2-9b0c-4f6e-8a21-5c7d9e0b1a34".into(),
             created: 1_789_263_746,
             model: model.into(),
+            provider: "chtting".into(),
         }
     }
 

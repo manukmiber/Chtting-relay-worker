@@ -42,6 +42,7 @@
       "streamOptions": true,
       "forwardUserId": true,
       "userIdHeader": "x-user-id",
+      "userIdField": "user_id",
       "apiKeys": []
     },
     {
@@ -57,7 +58,8 @@
       },
       "streamOptions": true,
       "forwardUserId": true,
-      "userIdHeader": "x-user-id"
+      "userIdHeader": "x-user-id",
+      "userIdField": "user_id"
     }
   ],
   "systemPrompts": [
@@ -129,13 +131,53 @@
           "cachedPromptUsd": "0.0000001",
           "internalReasoningUsd": "0.0000015",
           "cacheTtlSeconds": 3600,
-          "cacheImplicit": true
+          "cacheImplicit": true,
+          "overrides": [
+            {
+              "utcDays": [
+                "saturday",
+                "sunday"
+              ]
+            },
+            {
+              "utcDays": [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday"
+              ],
+              "utcStart": 100,
+              "utcEnd": 400,
+              "promptUsd": "0.0000007",
+              "completionUsd": "0.000003",
+              "cachedPromptUsd": "0.0000002"
+            }
+          ]
         },
         "capacity": {
           "promptTokensPerMinute": 0,
           "completionTokensPerMinute": 0,
           "requestsPerMinute": 0,
           "concurrency": 0
+        },
+        "canonicalSlug": "zeikoai/jagad-512b-v1-20260101",
+        "outputModalities": [
+          "text"
+        ],
+        "knowledgeCutoff": "",
+        "isModerated": false,
+        "reasoning": {
+          "mandatory": false,
+          "defaultEnabled": true,
+          "supportedEfforts": [
+            "max",
+            "high",
+            "medium",
+            "low",
+            "none"
+          ],
+          "defaultEffort": "high"
         }
       },
       "maxTokensPerSecond": 0,

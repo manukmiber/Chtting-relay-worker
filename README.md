@@ -283,27 +283,43 @@ Prompts) supaya satu persona dipakai beberapa alias sekaligus.
 
 Aturan rewrite request tidak pernah menyentuh system prompt kamu sendiri.
 
-### Satu model, banyak prompt — dipilih dari thinking effort
+### Dua prompt: Default dan No thinking
 
 Panggilan tanpa reasoning dan panggilan dengan effort maksimum butuh instruksi
 yang berbeda: yang pertama perlu jawabannya dibentuk langsung, yang kedua perlu
-ruang untuk berpikir. Jadi satu model boleh punya beberapa prompt, dan yang
-dipakai dipilih dari effort yang diminta pemanggil:
+ruang untuk berpikir. Tapi di praktiknya pembacanya cuma dua — yang minta model
+berpikir, dan yang tidak. Jadi di dashboard isinya dua kotak, bukan editor
+aturan:
+
+* **Default** — `systemPrompt` model itu sendiri. Dipakai untuk pemanggil yang
+  minta model berpikir (`low`, `medium`, `high`, `max`), dan untuk semua orang
+  selama kotak kedua masih di mode `none`.
+* **No thinking** — satu aturan `systemPrompts[]` dengan id khusus
+  `sp-non-thinking` dan `efforts: ["none", "minimal", "default"]`.
 
 ```json
 "systemPrompts": [
-  { "id": "thinking", "minEffort": "high",
-    "prompt": { "mode": "replace", "text": "Pikirkan pelan-pelan, jangan buru-buru." } },
-  { "id": "fast", "efforts": ["none", "minimal", "low"],
-    "prompt": { "mode": "replace", "promptId": "sp_langsung" } }
+  { "id": "sp-non-thinking", "name": "No thinking", "enabled": true,
+    "efforts": ["none", "minimal", "default"],
+    "prompt": { "mode": "replace", "text": "Jawab langsung, tanpa basa-basi." } }
 ]
 ```
 
-Aturan pertama yang cocok yang menang; yang tidak cocok jatuh ke `systemPrompt`
-biasa. Effort-nya dibaca dari body pemanggil apa pun ejaannya —
-`reasoning_effort` ala OpenAI, `reasoning.effort` ala OpenRouter,
-`enable_thinking` ala Qwen, atau `thinking.budget_tokens` ala Anthropic yang
-dipetakan ke level menurut besarnya.
+Tiga effort itu persis yang ditanggung **band harga no-thinking**, dan memang
+harus tetap begitu: diam bukan pilihan untuk berpikir, jadi jangan dijawab
+seperti itu dan jangan ditagih seperti itu. Request yang dibilang satu hal lalu
+ditagih hal lain adalah satu-satunya bug yang tidak kelihatan dari layar mana
+pun. Ada test yang mengunci ini.
+
+Kotak yang dibiarkan di mode `none` tidak menulis aturan sama sekali — jadi
+pemanggilnya jatuh ke Default, yang memang arti dari "belum saya isi".
+
+Di bawah dua kotak itu `systemPrompts` tetap daftar aturan biasa buat hal yang
+lebih sempit: aturan pertama yang cocok yang menang, dan aturan tulisanmu
+sendiri ditaruh **sebelum** aturan No thinking. Effort-nya dibaca dari body
+pemanggil apa pun ejaannya — `reasoning_effort` ala OpenAI, `reasoning.effort`
+ala OpenRouter, `enable_thinking` ala Qwen, atau `thinking.budget_tokens` ala
+Anthropic yang dipetakan ke level menurut besarnya.
 
 ---
 
@@ -331,8 +347,19 @@ backend, plus harga request itu:
 ```json
 "usage": { "prompt_tokens": 1284, "completion_tokens": 909, "total_tokens": 2193,
            "completion_tokens_details": { "reasoning_tokens": 629 },
-           "usage": 0.001291 }
+           "usage": 0.001291238, "cost": 0.001291238 }
 ```
+
+Harganya sembilan angka di belakang koma, bukan enam: request pendek di harga
+sepersepuluh dolar per sejuta token cuma beberapa per sejuta sen, dan dibulatkan
+ke enam angka semua request kecil terbaca gratis. `cost` itu angka yang sama
+dalam ejaan OpenRouter — satu harga, dua nama, bukan dua harga.
+
+Kalau daftar harga relay sendiri dimatikan, harga yang dipakai adalah harga
+per-token yang **diumumkan** model itu di `/v1/models`, jendela jam dan harinya
+ikut. Jadi pemanggil bisa mengalikan sendiri tarif yang mereka baca dengan
+jumlah token yang mereka terima dan sampai di angka yang sama. Yang tidak punya
+harga sama sekali tetap tidak melaporkan uang — bukan nol yang terbaca gratis.
 
 Selebihnya berlaku sama untuk respons utuh maupun streaming — jadi klien
 streaming dan non-streaming menerima bentuk yang identik.
@@ -794,8 +821,16 @@ curl https://xxx.trycloudflare.com/v1/chat/completions \
 ```
 
 Endpoint: `GET /health`, `GET /v1/models`, `GET /v1/models/:id`,
-`POST /v1/chat/completions`, `POST /chat/completions`, `POST /v1/completions`,
-`POST /v1/embeddings`.
+`POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings` —
+semuanya juga tanpa awalan `/v1` (`/models`, `/chat/completions`,
+`/completions`, `/embeddings`), karena sebagian klien menambahkan `/v1` sendiri
+dan sebagian lagi sudah diberi base URL yang berakhir di situ.
+
+`GET /v1/models` memakai amplop OpenAI di luar (`object: "list"`,
+`object: "model"`, `owned_by`) dan dokumen model OpenRouter di dalam:
+`architecture`, `pricing` lengkap dengan `overrides` per jam dan per hari,
+`top_provider`, `supported_parameters`, `reasoning`. Klien OpenAI lama tetap
+jalan; klien yang mau tahu harga tidak perlu bertanya ke siapa pun.
 
 ---
 

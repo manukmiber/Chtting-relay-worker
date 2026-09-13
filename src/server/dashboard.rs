@@ -472,8 +472,12 @@ const SUMMARY_SQL: &str = "
       COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
       COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0),
       COALESCE(SUM(reasoning_tokens),0),
-      SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
-      SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END),
+      -- COALESCE on the conditional sums too, and not only on the plain ones:
+      -- over a window with no rows at all SQLite answers NULL rather than 0,
+      -- and a fresh install is exactly that window. Without it the whole
+      -- Overview screen is a 500 until the first request lands.
+      COALESCE(SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),0),
+      COALESCE(SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END),0),
       AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(total_ms,0)), AVG(NULLIF(tokens_per_sec,0)),
       COALESCE(SUM(backend_usd),0), COALESCE(SUM(proxy_usd),0), COALESCE(SUM(profit_usd),0),
       COUNT(DISTINCT NULLIF(user_id,''))

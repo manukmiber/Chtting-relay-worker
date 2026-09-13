@@ -215,6 +215,11 @@ pub struct Backend {
     /// Header the user id travels in. Empty sends no header; the `user` field
     /// in the body goes either way.
     pub user_id_header: String,
+    /// A second body field the caller's id is copied into, beside OpenAI's
+    /// `user`. Backends disagree on the spelling and several read only this
+    /// one, so it is named rather than assumed. Clear it for a backend that
+    /// rejects body fields it does not recognise.
+    pub user_id_field: String,
     pub note: String,
 }
 
@@ -234,6 +239,7 @@ impl Default for Backend {
             api_keys: Vec::new(),
             forward_user_id: true,
             user_id_header: "x-user-id".into(),
+            user_id_field: "user_id".into(),
             note: String::new(),
         }
     }
@@ -1020,6 +1026,26 @@ pub struct OpenRouterModel {
     pub temperature_max: f64,
     pub pricing: OpenRouterPricing,
     pub capacity: OpenRouterCapacity,
+    /// `canonicalSlug` on the public listing: the dated, never-reused name of
+    /// this exact snapshot, next to the moving `id`. Empty publishes the id.
+    pub canonical_slug: String,
+    /// What the model answers in. Chat models say text; the field exists
+    /// because the listing publishes input and output modalities apart.
+    pub output_modalities: Vec<String>,
+    /// A base model's prompt format — `chatml`, `alpaca`, and so on. Empty is
+    /// published as null, which is what an instruct-tuned model reports.
+    pub instruct_type: String,
+    /// Whether a moderation pass sits in front of this model.
+    pub is_moderated: bool,
+    /// `YYYY-MM-DD`, or empty for none. Published as `knowledge_cutoff`.
+    pub knowledge_cutoff: String,
+    /// The parameter names the listing advertises. Empty derives the list from
+    /// what this model is actually configured to accept, which is the answer
+    /// that stays true when a transform starts dropping one.
+    pub supported_parameters: Vec<String>,
+    /// Parameter values a caller gets without asking. Published verbatim.
+    pub default_parameters: Map<String, Value>,
+    pub reasoning: OpenRouterReasoning,
     pub is_free: bool,
     /// 0 to just under 1. OpenRouter applies it as a discount to the end user.
     pub discount_to_user: f64,
@@ -1046,6 +1072,14 @@ impl Default for OpenRouterModel {
             temperature_max: 2.0,
             pricing: OpenRouterPricing::default(),
             capacity: OpenRouterCapacity::default(),
+            canonical_slug: String::new(),
+            output_modalities: vec!["text".into()],
+            instruct_type: String::new(),
+            is_moderated: false,
+            knowledge_cutoff: String::new(),
+            supported_parameters: Vec::new(),
+            default_parameters: Map::new(),
+            reasoning: OpenRouterReasoning::default(),
             is_free: false,
             discount_to_user: 0.0,
             deprecation_date: String::new(),
@@ -1072,6 +1106,85 @@ pub struct OpenRouterPricing {
     pub cache_ttl_seconds: u32,
     /// True when caching happens without the caller asking for it.
     pub cache_implicit: bool,
+    /// What the price becomes at certain hours of certain days — a peak-hour
+    /// surcharge, a weekend rate. Read in order; the first window that covers
+    /// the moment wins, so the narrow ones belong first.
+    pub overrides: Vec<PricingOverride>,
+}
+
+/// One time-boxed replacement for the prices above.
+///
+/// The window is UTC, because that is the clock the published listing is read
+/// on and the only one a caller on the other side of the world can check the
+/// bill against. Times are `HHMM` integers, the spelling OpenRouter's own
+/// listing uses: `0` is midnight, `100` is 01:00, `1730` is 17:30. The start is
+/// inclusive and the end exclusive; an end below the start wraps past midnight,
+/// and a window of `0` to `0` is the whole day.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PricingOverride {
+    /// Lower-case weekday names — `monday` through `sunday`. Empty is every day.
+    pub utc_days: Vec<String>,
+    pub utc_start: u32,
+    pub utc_end: u32,
+    /// Prices for this window, in USD per single token, as strings. A price
+    /// left empty keeps the one above it rather than becoming free.
+    pub prompt_usd: String,
+    pub completion_usd: String,
+    pub cached_prompt_usd: String,
+    pub cache_write_usd: String,
+    pub internal_reasoning_usd: String,
+    pub request_usd: String,
+}
+
+impl PricingOverride {
+    /// Does this window cover that UTC weekday and `HHMM` time?
+    ///
+    /// `weekday` is Monday = 0, the same scale the request row records.
+    pub fn covers(&self, weekday: u32, hhmm: u32) -> bool {
+        if !self.utc_days.is_empty() {
+            let name = WEEKDAY_NAMES.get(weekday as usize).copied().unwrap_or("");
+            if !self
+                .utc_days
+                .iter()
+                .any(|d| d.trim().eq_ignore_ascii_case(name))
+            {
+                return false;
+            }
+        }
+        match (self.utc_start, self.utc_end) {
+            // No window at all, or one that starts where it ends: all day.
+            (a, b) if a == b => true,
+            (from, to) if from < to => hhmm >= from && hhmm < to,
+            // Wraps midnight: 22:00 to 02:00 is one window, not two.
+            (from, to) => hhmm >= from || hhmm < to,
+        }
+    }
+}
+
+pub const WEEKDAY_NAMES: [&str; 7] = [
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+];
+
+/// How this model handles reasoning, as the public listing describes it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OpenRouterReasoning {
+    /// The model always reasons and cannot be asked not to.
+    pub mandatory: bool,
+    /// Reasoning happens for a caller who never mentioned it.
+    pub default_enabled: bool,
+    /// The effort levels this model answers to, in the order they are
+    /// published. Empty falls back to the levels the relay prices.
+    pub supported_efforts: Vec<String>,
+    /// What a caller who asked for reasoning without naming a level gets.
+    pub default_effort: String,
 }
 
 /// Throughput this model can actually sustain. Publishing an honest number is
@@ -1489,7 +1602,53 @@ pub fn validate(cfg: &Config) -> Vec<String> {
         errors.push("server.maxConcurrentRequests must be at least 1".into());
     }
 
+    errors.extend(validate_catalog(cfg));
     errors.extend(validate_openrouter(cfg));
+    errors
+}
+
+/// The part of a model's OpenRouter block that is published at `/v1/models`
+/// whether or not the relay is listed on OpenRouter at all.
+///
+/// Checked separately from [`validate_openrouter`] for exactly that reason: a
+/// price window nobody can reach, or one whose hours are not hours, is wrong
+/// for every caller reading the listing, not only for OpenRouter.
+fn validate_catalog(cfg: &Config) -> Vec<String> {
+    let mut errors = Vec::new();
+    for m in cfg.models.iter().filter(|m| m.enabled) {
+        let o = &m.openrouter;
+        if !o.knowledge_cutoff.is_empty()
+            && chrono::NaiveDate::parse_from_str(&o.knowledge_cutoff, "%Y-%m-%d").is_err()
+        {
+            errors.push(format!(
+                "model \"{}\" knowledgeCutoff \"{}\" must be YYYY-MM-DD",
+                m.id, o.knowledge_cutoff
+            ));
+        }
+        for (n, window) in o.pricing.overrides.iter().enumerate() {
+            for day in &window.utc_days {
+                if !WEEKDAY_NAMES.contains(&day.trim().to_lowercase().as_str()) {
+                    errors.push(format!(
+                        "model \"{}\" price override {n} names day \"{day}\"; use one of: {}",
+                        m.id,
+                        WEEKDAY_NAMES.join(", ")
+                    ));
+                }
+            }
+            // A window is a clock time written HHMM, so 1360 and 2500 are not
+            // late — they are unreachable, and a price that never applies is
+            // worse than no price at all because it reads like one that does.
+            for (label, value) in [("utcStart", window.utc_start), ("utcEnd", window.utc_end)] {
+                if value > 2359 || value % 100 > 59 {
+                    errors.push(format!(
+                        "model \"{}\" price override {n} has {label} {value}; it is a clock \
+                         time written HHMM, so 0 to 2359 with minutes under 60",
+                        m.id
+                    ));
+                }
+            }
+        }
+    }
     errors
 }
 
@@ -1695,6 +1854,80 @@ mod tests {
         let errors = validate(&cfg);
         assert!(errors.iter().any(|e| e.contains("needs an upstreamModel")));
         assert!(errors.iter().any(|e| e.contains("unknown backend")));
+    }
+
+    #[test]
+    fn a_price_window_nobody_can_reach_is_refused_rather_than_published() {
+        let mut cfg = cfg_with_backend();
+        cfg.models.push(Model {
+            id: "priced".into(),
+            backend: "be1".into(),
+            upstream_model: "upstream".into(),
+            openrouter: OpenRouterModel {
+                knowledge_cutoff: "last tuesday".into(),
+                pricing: OpenRouterPricing {
+                    overrides: vec![PricingOverride {
+                        utc_days: vec!["caturday".into()],
+                        utc_start: 1360,
+                        utc_end: 2500,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let errors = validate(&cfg);
+        assert!(errors.iter().any(|e| e.contains("caturday")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("utcStart 1360")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("utcEnd 2500")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("knowledgeCutoff")),
+            "{errors:?}"
+        );
+
+        // And these are checked whether or not the relay is on OpenRouter at
+        // all: the listing they break is the one every caller reads.
+        assert!(!cfg.openrouter.enabled);
+    }
+
+    #[test]
+    fn a_price_window_is_matched_on_the_utc_clock() {
+        let peak = PricingOverride {
+            utc_days: vec!["Monday".into(), "friday".into()],
+            utc_start: 100,
+            utc_end: 400,
+            ..Default::default()
+        };
+        assert!(peak.covers(0, 100), "the start is inclusive");
+        assert!(peak.covers(0, 359));
+        assert!(!peak.covers(0, 400), "the end is exclusive");
+        assert!(!peak.covers(1, 200), "Tuesday is not in the list");
+
+        let night = PricingOverride {
+            utc_start: 2200,
+            utc_end: 200,
+            ..Default::default()
+        };
+        assert!(night.covers(3, 2300), "a window may wrap past midnight");
+        assert!(night.covers(3, 100));
+        assert!(!night.covers(3, 1200));
+
+        let all_day = PricingOverride {
+            utc_days: vec!["sunday".into()],
+            ..Default::default()
+        };
+        assert!(all_day.covers(6, 0));
+        assert!(all_day.covers(6, 2359));
+        assert!(!all_day.covers(5, 1200));
     }
 
     #[test]

@@ -212,6 +212,41 @@ pub fn round(n: f64, digits: u32) -> f64 {
     (n * f).round() / f
 }
 
+/// The UTC weekday (Monday = 0) and `HHMM` clock time of one instant.
+///
+/// UTC and not the relay's own zone: this answers "which published price
+/// window is this request in", and the published windows are quoted in UTC so
+/// that a caller anywhere can check a bill without knowing where the phone is.
+pub fn utc_parts(ts_ms: i64) -> (u32, u32) {
+    use chrono::{Datelike, Timelike};
+    let at = DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(Utc::now);
+    (
+        at.weekday().num_days_from_monday(),
+        at.hour() * 100 + at.minute(),
+    )
+}
+
+/// A rate quoted per million tokens, written out as the price of one token.
+///
+/// A decimal string rather than a number, and never scientific notation: this
+/// is published in a price list and read back against an invoice, where
+/// `3.5e-7` is not an answer. Empty for a rate of zero, because "unpriced" and
+/// "free" are different claims and only one of them should be publishable by
+/// accident.
+pub fn per_token(usd_per_m: f64) -> String {
+    if !usd_per_m.is_finite() || usd_per_m <= 0.0 {
+        return String::new();
+    }
+    let text = format!("{:.12}", usd_per_m / 1_000_000.0);
+    let trimmed = text.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        // Rounded away to nothing at twelve places: a rate that small is below
+        // anything this can honestly publish.
+        return String::new();
+    }
+    trimmed.to_string()
+}
+
 /// Percentile of an already-sorted slice.
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {

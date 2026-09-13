@@ -128,6 +128,120 @@ async fn the_model_list_shows_aliases_only() {
 }
 
 #[tokio::test]
+async fn the_model_list_answers_at_both_spellings_of_its_path() {
+    let h = harness(MockConfig::default(), |_| {}).await;
+    let with_prefix: serde_json::Value = h.get("/v1/models").await.json().await.unwrap();
+    let without: serde_json::Value = h.get("/models").await.json().await.unwrap();
+    assert_eq!(with_prefix, without);
+
+    let one: serde_json::Value = h
+        .get("/models/manukmiberai/creative-writer")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["id"], "manukmiberai/creative-writer");
+}
+
+#[tokio::test]
+async fn the_listing_says_what_a_model_costs_at_which_hour_of_which_day() {
+    // The models are not sold at one rate; they are sold at a rate that moves
+    // with the clock. A listing that publishes only the off-peak number is one
+    // nobody can reconcile an invoice against.
+    let h = harness(MockConfig::default(), |cfg| {
+        let o = &mut cfg.models[0].openrouter;
+        o.supports_reasoning = true;
+        o.pricing = chtting_relay::config::OpenRouterPricing {
+            prompt_usd: "0.00000015".into(),
+            completion_usd: "0.0000006".into(),
+            cached_prompt_usd: "0.000000003".into(),
+            overrides: vec![
+                chtting_relay::config::PricingOverride {
+                    utc_days: vec!["saturday".into(), "sunday".into()],
+                    ..Default::default()
+                },
+                chtting_relay::config::PricingOverride {
+                    utc_days: vec![
+                        "monday".into(),
+                        "tuesday".into(),
+                        "wednesday".into(),
+                        "thursday".into(),
+                        "friday".into(),
+                    ],
+                    utc_start: 100,
+                    utc_end: 400,
+                    prompt_usd: "0.0000003".into(),
+                    completion_usd: "0.0000012".into(),
+                    cached_prompt_usd: "0.000000006".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+    })
+    .await;
+
+    let body: serde_json::Value = h.get("/v1/models").await.json().await.unwrap();
+    let model = &body["data"][0];
+
+    assert_eq!(body["object"], "list");
+    assert_eq!(
+        model["object"], "model",
+        "an OpenAI client still reads this"
+    );
+    assert_eq!(model["architecture"]["modality"], "text->text");
+    assert_eq!(model["pricing"]["prompt"], "0.00000015");
+    assert_eq!(model["pricing"]["input_cache_read"], "0.000000003");
+    assert_eq!(model["pricing"]["overrides"][1]["utc_start"], 100);
+    assert_eq!(model["pricing"]["overrides"][1]["prompt"], "0.0000003");
+    // An override that moved only the prompt still publishes a whole price.
+    assert_eq!(model["pricing"]["overrides"][0]["completion"], "0.0000006");
+    assert_eq!(model["reasoning"]["default_effort"], "high");
+    assert!(model["supported_parameters"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("reasoning_effort")));
+    assert!(
+        !body.to_string().contains("Deepseek-v4-flash-0731"),
+        "the backend's model name leaked into the listing"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_quotes_the_price_the_listing_quoted() {
+    // The complaint this answers: a usage block with token counts and no money
+    // in it. With nothing but the published per-token prices set, the cost is
+    // still the relay's to work out — and it is the published one, to the
+    // penny a caller can reproduce.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].openrouter.pricing = chtting_relay::config::OpenRouterPricing {
+            prompt_usd: "0.00000015".into(),
+            completion_usd: "0.0000006".into(),
+            ..Default::default()
+        };
+    })
+    .await;
+
+    let body: serde_json::Value = h
+        .post("/v1/chat/completions", chat("hi"))
+        .await
+        .json()
+        .await
+        .unwrap();
+
+    let usage = &body["usage"];
+    let prompt = usage["prompt_tokens"].as_f64().unwrap();
+    let completion = usage["completion_tokens"].as_f64().unwrap();
+    let expected = prompt * 0.00000015 + completion * 0.0000006;
+    let cost = usage["usage"].as_f64().expect("a cost in the usage block");
+
+    assert!(cost > 0.0, "a priced model reported no money: {usage}");
+    assert!((cost - expected).abs() < 1e-9, "{cost} is not {expected}");
+    // Nine places, so a short request is not rounded away to free.
+    assert_eq!(usage["cost"], usage["usage"]);
+}
+
+#[tokio::test]
 async fn every_model_is_published_as_its_owner() {
     let h = harness(MockConfig::default(), |cfg| {
         let mut own = cfg.models[0].clone();
@@ -1458,7 +1572,9 @@ async fn not_one_field_of_the_backends_own_reply_survives_the_relay() {
         common::BACKEND_REQUEST_ID,
         "system_fingerprint",
         "service_tier",
-        "provider",
+        // The mock names itself as the provider; that name is the leak, not
+        // the field — the relay publishes its own name under the same key.
+        "deepseek",
         "matched_stop",
         "logprobs",
         "Deepseek-v4-flash-0731",
@@ -1470,9 +1586,14 @@ async fn not_one_field_of_the_backends_own_reply_survives_the_relay() {
     // What is left is the relay's own envelope, and it is complete.
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["model"], "manukmiberai/creative-writer");
+    assert_eq!(
+        body["provider"], "chtting",
+        "the provider is this relay, whoever actually ran the prompt"
+    );
     assert!(body["created"].as_i64().unwrap() > 1_700_000_000);
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["choices"][0]["native_finish_reason"], "stop");
 }
 
 #[tokio::test]
@@ -1703,6 +1824,71 @@ async fn without_a_ceiling_the_stream_goes_out_as_fast_as_it_arrives() {
 /* --------------------------------------- 21. a prompt per thinking effort -- */
 
 #[tokio::test]
+async fn the_no_thinking_prompt_answers_for_exactly_the_no_thinking_price_band() {
+    // The dashboard offers two prompt boxes, Default and No thinking, and
+    // writes the second as one rule with these three efforts. They are the same
+    // three the no-thinking price band covers, and they have to stay that way:
+    // a request told one thing and billed as another is the one bug nobody
+    // reading either screen can see.
+    use chtting_relay::config::{SystemPromptRule, SystemPromptSpec};
+
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].system_prompt = SystemPromptSpec {
+            mode: "replace".into(),
+            text: "DEFAULT PROMPT".into(),
+            prompt_id: String::new(),
+        };
+        cfg.models[0].system_prompts = vec![SystemPromptRule {
+            id: "sp-non-thinking".into(),
+            name: "No thinking".into(),
+            efforts: vec!["none".into(), "minimal".into(), "default".into()],
+            prompt: SystemPromptSpec {
+                mode: "replace".into(),
+                text: "NO THINKING PROMPT".into(),
+                prompt_id: String::new(),
+            },
+            ..Default::default()
+        }];
+    })
+    .await;
+
+    let system_sent = |h: &common::Harness| {
+        h.backend.last_request()["messages"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // Thinking off, thinking minimal, and never mentioned at all.
+    for asked in [Some("none"), Some("minimal"), None] {
+        let mut body = chat("hi");
+        if let Some(effort) = asked {
+            body["reasoning_effort"] = json!(effort);
+        }
+        h.post("/v1/chat/completions", body).await;
+        assert!(
+            system_sent(&h).contains("NO THINKING PROMPT"),
+            "{asked:?} should be on the no-thinking prompt, got {}",
+            system_sent(&h)
+        );
+        assert_eq!(h.last_row().await["prompt_id"], "sp-non-thinking");
+    }
+
+    // Everyone who did ask it to think is on the default prompt.
+    for effort in ["low", "medium", "high", "max"] {
+        let mut body = chat("hi");
+        body["reasoning_effort"] = json!(effort);
+        h.post("/v1/chat/completions", body).await;
+        assert!(
+            system_sent(&h).contains("DEFAULT PROMPT"),
+            "{effort} should be on the default prompt, got {}",
+            system_sent(&h)
+        );
+        assert_eq!(h.last_row().await["prompt_id"], "");
+    }
+}
+
+#[tokio::test]
 async fn a_model_can_carry_one_system_prompt_per_reasoning_effort() {
     use chtting_relay::config::{SystemPromptRule, SystemPromptSpec};
 
@@ -1826,6 +2012,155 @@ async fn a_user_id_sent_as_a_header_is_treated_the_same_as_one_in_the_body() {
 
     assert_eq!(h.last_row().await["user_id"], "tenant-7");
     assert_eq!(h.backend.last_request()["user"], "tenant-7");
+    assert_eq!(h.backend.last_request()["user_id"], "tenant-7");
+}
+
+#[tokio::test]
+async fn the_user_id_travels_under_both_spellings_the_backends_disagree_on() {
+    // A backend that reads only `user_id` would otherwise pool every caller
+    // behind this relay into one prompt cache, which is the exact leak the id
+    // exists to prevent. So both names carry it.
+    let h = harness(MockConfig::default(), |_| {}).await;
+
+    let mut body = chat("remember me");
+    body["user_id"] = json!("tenant-42");
+    h.post("/v1/chat/completions", body).await;
+
+    let sent = h.backend.last_request();
+    assert_eq!(sent["user"], "tenant-42");
+    assert_eq!(sent["user_id"], "tenant-42");
+}
+
+#[tokio::test]
+async fn the_body_field_the_user_id_travels_in_is_the_operators_to_name() {
+    // A backend that rejects fields it does not recognise needs the extra one
+    // gone, and one with its own spelling needs that spelling.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.backends[0].user_id_field = "end_user".into();
+    })
+    .await;
+
+    let mut body = chat("hi");
+    body["user"] = json!("tenant-9");
+    h.post("/v1/chat/completions", body).await;
+
+    let sent = h.backend.last_request();
+    assert_eq!(sent["user"], "tenant-9");
+    assert_eq!(sent["end_user"], "tenant-9");
+    assert!(sent.get("user_id").is_none());
+
+    let off = harness(MockConfig::default(), |cfg| {
+        cfg.backends[0].user_id_field = String::new();
+    })
+    .await;
+    let mut body = chat("hi");
+    body["user"] = json!("tenant-9");
+    off.post("/v1/chat/completions", body).await;
+    let sent = off.backend.last_request();
+    assert_eq!(sent["user"], "tenant-9");
+    assert!(sent.get("user_id").is_none());
+}
+
+#[tokio::test]
+async fn openrouters_routing_keys_are_answered_here_and_never_forwarded() {
+    // `usage`, `route`, `models` and the rest are OpenRouter's vocabulary for
+    // picking a provider and asking for a report. By the time a request is on
+    // its way upstream the relay has already settled both, and a strict backend
+    // answers 400 to a body carrying fields it does not know.
+    let h = harness(MockConfig::default(), |_| {}).await;
+
+    let mut body = chat("hi");
+    body["usage"] = json!({"include": true});
+    body["route"] = json!("fallback");
+    body["models"] = json!(["something-else"]);
+    body["transforms"] = json!(["middle-out"]);
+    body["provider"] = json!({"order": ["deepseek"]});
+    let out: serde_json::Value = h
+        .post("/v1/chat/completions", body)
+        .await
+        .json()
+        .await
+        .unwrap();
+
+    let sent = h.backend.last_request();
+    for key in ["usage", "route", "models", "transforms", "provider"] {
+        assert!(sent.get(key).is_none(), "\"{key}\" was forwarded: {sent}");
+    }
+    // And the request itself still worked.
+    assert_eq!(out["choices"][0]["message"]["role"], "assistant");
+}
+
+#[tokio::test]
+async fn a_route_pointed_at_openrouter_can_still_set_the_routing_keys_itself() {
+    // The keys are dropped from what the *caller* sent, before the model's own
+    // params are laid on — so a relay whose backend is OpenRouter can still
+    // pin a provider, and the caller still cannot.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].force_params = serde_json::json!({"provider": {"order": ["deepseek"]}})
+            .as_object()
+            .unwrap()
+            .clone();
+    })
+    .await;
+
+    let mut body = chat("hi");
+    body["provider"] = json!({"order": ["somebody-else"]});
+    h.post("/v1/chat/completions", body).await;
+
+    assert_eq!(
+        h.backend.last_request()["provider"]["order"][0],
+        "deepseek",
+        "the operator's choice, not the caller's"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_can_ask_for_the_answer_without_the_working() {
+    // OpenRouter's `reasoning.exclude`, and the older flat spelling. Both only
+    // ever remove the trace; neither can turn one on that the route keeps off.
+    let h = harness(
+        MockConfig {
+            reasoning: Some("thinking about it".into()),
+            ..Default::default()
+        },
+        |cfg| cfg.models[0].response_transform.reasoning = Some("keep".into()),
+    )
+    .await;
+
+    let kept: serde_json::Value = h
+        .post("/v1/chat/completions", chat("hi"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        kept["choices"][0]["message"]["reasoning_content"],
+        "thinking about it"
+    );
+
+    let mut body = chat("hi");
+    body["reasoning"] = json!({"exclude": true});
+    let excluded: serde_json::Value = h
+        .post("/v1/chat/completions", body)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(excluded["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+
+    let mut body = chat("hi");
+    body["include_reasoning"] = json!(false);
+    let flat: serde_json::Value = h
+        .post("/v1/chat/completions", body)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(flat["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
 }
 
 #[tokio::test]

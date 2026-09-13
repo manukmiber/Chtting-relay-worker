@@ -35,7 +35,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::{
     ClientKey, Config, Model, Pricing, RequestTransform, ResolvedResponseTransform,
-    ResponseTransform, DEFAULT_MODEL_OWNER,
+    ResponseTransform,
 };
 use crate::pricing::{self, Effort, Priced, Shape};
 use crate::relay::error_response;
@@ -95,6 +95,23 @@ pub fn authenticate(cfg: &Config, secret: Option<&str>) -> Auth {
     }
 }
 
+/// Did the caller ask for the reasoning trace to be left out of the reply?
+///
+/// Both spellings OpenRouter's chat API accepts: `reasoning.exclude` on the
+/// object, and the older flat `include_reasoning`. Silence is not a request to
+/// exclude — only an explicit `false` is.
+fn reasoning_excluded(body: &Value) -> bool {
+    if body
+        .get("reasoning")
+        .and_then(|r| r.get("exclude"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return true;
+    }
+    body.get("include_reasoning").and_then(|v| v.as_bool()) == Some(false)
+}
+
 /// Who the caller says they are.
 ///
 /// Requirement 22: this is the prompt-cache isolation key. OpenAI clients put
@@ -149,33 +166,6 @@ pub fn check_access(key: &ClientKey, model_id: &str) -> Result<(), String> {
             &key.label
         }
     ))
-}
-
-/// The public model list. The backend's real name is deliberately absent.
-pub fn list_models(cfg: &Config) -> Value {
-    let data: Vec<Value> = cfg
-        .models
-        .iter()
-        .filter(|m| m.enabled)
-        .map(|m| {
-            let mut entry = serde_json::json!({
-                "id": m.id,
-                "object": "model",
-                "created": m.created_at / 1000,
-                "owned_by": if m.owner.is_empty() { DEFAULT_MODEL_OWNER } else { &m.owner },
-                "display_name": if m.display_name.is_empty() { &m.id } else { &m.display_name },
-            });
-            let map = entry.as_object_mut().expect("just built an object");
-            if !m.description.is_empty() {
-                map.insert("description".into(), Value::String(m.description.clone()));
-            }
-            if m.context_length > 0 {
-                map.insert("context_length".into(), Value::from(m.context_length));
-            }
-            entry
-        })
-        .collect();
-    serde_json::json!({ "object": "list", "data": data })
 }
 
 /* ------------------------------------------------------------- context -- */
@@ -248,9 +238,20 @@ impl Ctx {
     }
 
     /// The `usage` block the caller gets, cost included.
+    ///
+    /// The relay's own rate card is the bill when it is switched on. When it is
+    /// not, the price the model is *published* at in `/v1/models` is — because
+    /// a listing that quotes a rate and a reply that quotes no cost leave the
+    /// caller doing arithmetic the relay already did. Only a model nobody has
+    /// priced at all comes back without a cost, which is the honest answer
+    /// rather than a zero that reads like free service.
     fn usage_json(&self, charged: &Usage, answer: &str) -> Value {
-        let priced = self.price(charged, answer);
-        charged.public(self.pricing.enabled.then_some(priced.proxy_usd))
+        let cost = if self.pricing.enabled {
+            Some(self.price(charged, answer).proxy_usd)
+        } else {
+            crate::server::catalog::published_cost(&self.route, &self.cfg, charged, self.record.ts)
+        };
+        charged.public(cost)
     }
 }
 
@@ -592,11 +593,26 @@ pub async fn handle_chat(
         // that keys its prompt cache by user needs it to keep one caller's
         // cache out of another's. It is the one thing about the caller that
         // does travel, and only when the backend is set up to want it.
+        //
+        // Under two names, because the backends disagree on one: OpenAI's
+        // `user`, and whatever `userIdField` says — `user_id` unless an
+        // operator changed it. A backend reading only its own spelling would
+        // otherwise pool every caller behind this relay into one cache, which
+        // is the exact leak the id exists to prevent.
         let forward = backend_cfg.as_ref().is_none_or(|b| b.forward_user_id);
+        let field = backend_cfg
+            .as_ref()
+            .map_or("user_id", |b| b.user_id_field.trim());
         if forward && !user_id.is_empty() {
             map.insert("user".into(), Value::String(user_id.clone()));
+            if !field.is_empty() && field != "user" {
+                map.insert(field.to_string(), Value::String(user_id.clone()));
+            }
         } else if !forward {
             map.remove("user");
+            if !field.is_empty() {
+                map.remove(field);
+            }
         }
         map.insert("stream".into(), Value::Bool(stream_upstream));
         if stream_upstream {
@@ -678,10 +694,17 @@ pub async fn handle_chat(
             crate::relay::upstream_failure(status)
         }
         Sent::Ok { response, .. } => {
-            let transform = ResponseTransform::merged(
+            let mut transform = ResponseTransform::merged(
                 &cfg.defaults.response_transform,
                 &route.response_transform,
             );
+            // OpenRouter's two spellings of "answer, but do not show me the
+            // working". A caller who asked for that gets it for this request
+            // only; the model's own setting is untouched. It can only ever
+            // remove the trace, never turn one on that the route keeps off.
+            if reasoning_excluded(&body) {
+                transform.reasoning = "strip".into();
+            }
             let is_sse = response
                 .headers()
                 .get("content-type")
@@ -698,6 +721,9 @@ pub async fn handle_chat(
                     id: id.clone(),
                     created: started_wall / 1000,
                     model: route.id.clone(),
+                    // The relay's own name. The backend that ran the prompt is
+                    // never what goes in here.
+                    provider: cfg.openrouter.provider_slug.clone(),
                 },
                 record,
                 started,
@@ -1596,24 +1622,24 @@ fn set_delta_content(chunk: &mut Value, content: &str) {
 }
 
 fn delta_chunk(identity: &Identity, content: &str) -> Value {
-    serde_json::json!({
-        "id": identity.id,
-        "object": "chat.completion.chunk",
-        "created": identity.created,
-        "model": identity.model,
-        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}],
-    })
+    let mut out = identity.envelope("chat.completion.chunk");
+    out.insert(
+        "choices".into(),
+        serde_json::json!([{
+            "index": 0,
+            "delta": {"content": content},
+            "finish_reason": null,
+            "native_finish_reason": null,
+        }]),
+    );
+    Value::Object(out)
 }
 
 fn usage_chunk(identity: &Identity, usage: &Value) -> Value {
-    serde_json::json!({
-        "id": identity.id,
-        "object": "chat.completion.chunk",
-        "created": identity.created,
-        "model": identity.model,
-        "choices": [],
-        "usage": usage,
-    })
+    let mut out = identity.envelope("chat.completion.chunk");
+    out.insert("choices".into(), Value::Array(Vec::new()));
+    out.insert("usage".into(), usage.clone());
+    Value::Object(out)
 }
 
 fn assemble_completion(
@@ -1633,43 +1659,60 @@ fn assemble_completion(
             map.insert("tool_calls".into(), Value::Array(tool_calls.to_vec()));
         }
     }
-    serde_json::json!({
-        "id": identity.id,
-        "object": "chat.completion",
-        "created": identity.created,
-        "model": identity.model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": usage,
-    })
+    let mut out = identity.envelope("chat.completion");
+    out.insert(
+        "choices".into(),
+        serde_json::json!([{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+            "native_finish_reason": finish_reason,
+        }]),
+    );
+    out.insert("usage".into(), usage.clone());
+    Value::Object(out)
 }
 
 /// Replay a finished answer as SSE for callers that insisted on streaming.
 fn replay_as_sse(ctx: &Ctx, content: &str, usage: &Value) -> Response {
-    let id = &ctx.identity.id;
-    let model = &ctx.identity.model;
-    let created = ctx.identity.created;
+    let frame = |choices: Value| {
+        let mut out = ctx.identity.envelope("chat.completion.chunk");
+        out.insert("choices".into(), choices);
+        Value::Object(out)
+    };
     let mut body = Vec::new();
 
-    body.extend_from_slice(&sse::format_sse(&serde_json::json!({
-        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}],
-    })));
+    body.extend_from_slice(&sse::format_sse(&frame(serde_json::json!([{
+        "index": 0,
+        "delta": {"role": "assistant", "content": ""},
+        "finish_reason": null,
+        "native_finish_reason": null,
+    }]))));
 
     // Chunk on character boundaries, never bytes, or multi-byte text breaks.
     let chars: Vec<char> = content.chars().collect();
     for piece in chars.chunks(24) {
         let text: String = piece.iter().collect();
-        body.extend_from_slice(&sse::format_sse(&serde_json::json!({
-            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
-        })));
+        body.extend_from_slice(&sse::format_sse(&frame(serde_json::json!([{
+            "index": 0,
+            "delta": {"content": text},
+            "finish_reason": null,
+            "native_finish_reason": null,
+        }]))));
     }
 
-    body.extend_from_slice(&sse::format_sse(&serde_json::json!({
-        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        "usage": usage,
-    })));
+    let mut last = ctx.identity.envelope("chat.completion.chunk");
+    last.insert(
+        "choices".into(),
+        serde_json::json!([{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop",
+            "native_finish_reason": "stop",
+        }]),
+    );
+    last.insert("usage".into(), usage.clone());
+    body.extend_from_slice(&sse::format_sse(&Value::Object(last)));
     body.extend_from_slice(sse::DONE.as_bytes());
 
     let mut headers = HeaderMap::new();
@@ -1789,7 +1832,7 @@ mod tests {
             ..Default::default()
         });
 
-        let listed = list_models(&cfg);
+        let listed = crate::server::catalog::document(&cfg);
         let text = listed.to_string();
         assert!(text.contains("manukmiberai/creative-writer"));
         assert!(

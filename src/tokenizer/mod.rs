@@ -288,9 +288,17 @@ impl Usage {
 
     /// The `usage` object handed back to the caller.
     ///
-    /// `cost` is what this request came to under the relay's own price list,
-    /// which callers otherwise have no way to work out: the rates are the
-    /// relay's, not the backend's, and tiers can move them per request.
+    /// `cost` is what this request came to under the price list the caller is
+    /// actually on, which they otherwise have no way to work out: the rates are
+    /// the relay's, not the backend's, and a band, a tier or a published time
+    /// window can move them per request. It goes out under two names —
+    /// `usage`, and `cost` for clients that read OpenRouter's spelling — and
+    /// they are the same number, never two prices.
+    ///
+    /// Nine decimal places, which is the ledger's own precision. Six is not
+    /// enough: a short request at a tenth of a dollar per million tokens comes
+    /// to a few millionths of a cent, and rounding that to six places reports
+    /// every small request as free.
     pub fn public(&self, cost: Option<f64>) -> Value {
         let mut out = serde_json::json!({
             "prompt_tokens": self.prompt_tokens,
@@ -311,10 +319,9 @@ impl Usage {
             );
         }
         if let Some(cost) = cost {
-            map.insert(
-                "usage".into(),
-                serde_json::json!(crate::util::round(cost, 6)),
-            );
+            let cost = serde_json::json!(crate::util::round(cost, 9));
+            map.insert("usage".into(), cost.clone());
+            map.insert("cost".into(), cost);
         }
         out
     }
@@ -604,6 +611,7 @@ mod usage_tests {
         let plain = usage(10, 5).charged_to_caller(10).public(None);
         assert_eq!(plain["prompt_tokens"], 10);
         assert!(plain.get("usage").is_none(), "no cost, no field");
+        assert!(plain.get("cost").is_none());
         assert!(plain.get("prompt_tokens_details").is_none());
         assert!(plain.get("completion_tokens_details").is_none());
 
@@ -614,8 +622,17 @@ mod usage_tests {
         }
         .charged_to_caller(10)
         .public(Some(0.102_949_9));
-        assert_eq!(priced["usage"], 0.10295);
+        assert_eq!(priced["usage"], 0.102_949_9);
+        // The same number under OpenRouter's spelling, never a second price.
+        assert_eq!(priced["cost"], priced["usage"]);
         assert_eq!(priced["prompt_tokens_details"]["cached_tokens"], 4);
         assert_eq!(priced["completion_tokens_details"]["reasoning_tokens"], 3);
+
+        // A short request at a tenth of a dollar per million tokens: six
+        // decimal places reported this as free, which is the bug.
+        let small = usage(61, 190)
+            .charged_to_caller(61)
+            .public(Some(0.000_009_15));
+        assert_eq!(small["usage"], 0.000_009_15);
     }
 }

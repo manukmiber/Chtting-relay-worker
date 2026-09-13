@@ -161,6 +161,7 @@ The real providers. Their API keys never leave the device.
 | `streamOptions` | `true` | ask for `stream_options.include_usage` while streaming |
 | `forwardUserId` | `true` | pass the caller's id upstream, for prompt-cache isolation |
 | `userIdHeader` | `x-user-id` | the header it travels in; empty sends none |
+| `userIdField` | `user_id` | a second body field it is copied into, beside `user`; empty sends only `user` |
 | `note` | `""` | free text for your own reference |
 | `headers` | `{}` | extra headers, e.g. OpenRouter's `HTTP-Referer` |
 
@@ -175,8 +176,13 @@ difference to matter.
 
 A backend that caches prompts usually keys that cache by user. With one API key
 fronting many callers, that would mean one caller's cached prefix serving
-another's request — so the caller's own id travels upstream, in the body's
-`user` field and in `userIdHeader`.
+another's request — so the caller's own id travels upstream, in `userIdHeader`
+and in the body under **two** names: OpenAI's `user`, and whatever
+`userIdField` says (`user_id` unless you change it). Two names because the
+backends disagree on one, and a backend reading only its own spelling would
+pool every caller behind this relay into a single cache — the exact leak the id
+exists to prevent. Clear `userIdField` for a backend that rejects body fields it
+does not recognise.
 
 The id comes from whichever the caller sent: `user` or `user_id` in the body,
 or an `x-user-id`, `x-user`, `x-openai-user` or `x-kv-user` header. It is
@@ -228,11 +234,43 @@ reshaping are configured.
 
 `promptId` points at a top-level `systemPrompts[]` entry and wins over `text`.
 
-### A prompt per thinking effort
+### Two prompts: Default and No thinking
 
-A model's `systemPrompts` is a list of rules. Each one names the efforts it
-answers for and the prompt to inject when it does; the first match wins, and a
-caller who matches nothing falls through to the model's plain `systemPrompt`.
+A model is written to two audiences and, most of the time, no more: the caller
+who asked it to think, and the caller who did not. So the dashboard offers two
+boxes rather than a rule editor.
+
+**Default** is the model's plain `systemPrompt`. It answers for every caller who
+asked the model to think — `low`, `medium`, `high`, `max` — and for everyone at
+all while the second box is left at `none`.
+
+**No thinking** is one `systemPrompts[]` rule, written under the reserved id
+`sp-non-thinking`, with `efforts: ["none", "minimal", "default"]`:
+
+```json
+"systemPrompts": [
+  { "id": "sp-non-thinking", "name": "No thinking", "enabled": true,
+    "efforts": ["none", "minimal", "default"],
+    "prompt": { "mode": "replace", "text": "Answer directly." } }
+]
+```
+
+Those are the same three efforts the **no-thinking price band** covers, and they
+are meant to stay that way: silence is not a choice to think, so it should
+neither be answered as one nor billed as one. A request told one thing and
+billed as another is the one bug nobody reading either screen can see.
+
+Leave the mode at `none` and the rule is not written at all, rather than written
+as a rule that matches and injects nothing — those callers then fall through to
+Default, which is what "I did not fill this in" should mean.
+
+### A prompt per thinking effort, for anything narrower
+
+The two boxes are the common case; `systemPrompts` underneath them is a general
+list of rules. Each one names the efforts it answers for and the prompt to
+inject when it does; the first match wins, and a caller who matches nothing
+falls through to the model's plain `systemPrompt`. The dashboard keeps your own
+rules **before** the No-thinking rule, so a narrower one can still win.
 
 ```json
 "systemPrompts": [
@@ -698,7 +736,23 @@ family, datacenters and compliance. It never contains `upstreamModel`.
 | `supportsReasoning` | `false` | |
 | `isFree` | `false` | |
 | `discountToUser` | `0` | at least 0 and below 1 |
-| `deprecationDate` | `""` | `YYYY-MM-DD` |
+| `deprecationDate` | `""` | `YYYY-MM-DD`; published as `expiration_date` on the public listing |
+
+The rest of this block is read by the public listing at `/v1/models` as well:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `canonicalSlug` | `""` | the dated, never-reused name of this exact snapshot; empty publishes `id` |
+| `outputModalities` | `["text"]` | what the model answers in |
+| `instructType` | `""` | a base model's prompt format, e.g. `chatml`; empty publishes `null`, which is what an instruct-tuned model reports |
+| `isModerated` | `false` | a moderation pass sits in front of this model |
+| `knowledgeCutoff` | `""` | `YYYY-MM-DD`; empty publishes `null` |
+| `supportedParameters` | `[]` | empty works the list out from what this model actually accepts |
+| `defaultParameters` | `{}` | values a caller gets without asking; empty publishes the model's own `params` |
+| `reasoning.mandatory` | `false` | the model always reasons and cannot be asked not to |
+| `reasoning.defaultEnabled` | `false` | it reasons for a caller who never mentioned it |
+| `reasoning.supportedEfforts` | `[]` | empty publishes the levels the relay prices |
+| `reasoning.defaultEffort` | `high` | what a caller who asked for reasoning without naming a level gets |
 
 Prices are USD for a **single token**, kept as strings:
 
@@ -712,12 +766,54 @@ Prices are USD for a **single token**, kept as strings:
 | `pricing.requestUsd` | a flat fee per request |
 | `pricing.cacheTtlSeconds` | how long a cache entry lives |
 | `pricing.cacheImplicit` | caching happens without the caller asking |
+| `pricing.overrides` | what the price becomes at certain hours of certain days |
+
+### Price by hour and day
+
+These models are not sold at one rate; they are sold at a rate that moves with
+the clock, and a listing that publishes only the off-peak number is one nobody
+can reconcile an invoice against. `pricing.overrides` is that list:
+
+```jsonc
+"overrides": [
+  { "utcDays": ["saturday", "sunday"] },
+  { "utcDays": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+    "utcStart": 100, "utcEnd": 400,
+    "promptUsd": "0.0000003", "completionUsd": "0.0000012",
+    "cachedPromptUsd": "0.000000006" }
+]
+```
+
+| Key | Meaning |
+|---|---|
+| `utcDays` | lower-case weekday names; empty is every day |
+| `utcStart`, `utcEnd` | the window as `HHMM` — `0` is midnight, `100` is 01:00, `1730` is 17:30 |
+| the price keys | the same names as above, for this window only |
+
+UTC and not the relay's timezone, because that is the clock the listing is read
+on and the only one a caller on the other side of the world can check a bill
+against. The start is inclusive and the end exclusive; an end below the start
+wraps past midnight, and a window of `0` to `0` (or no window at all) is the
+whole day. The **first** window that covers a moment wins, so the narrow ones
+go first. A price a window leaves out keeps the standing one rather than
+becoming free — and every window is published complete, so a client reading the
+third override does not have to walk back up the list.
+
+Unlike `pricing.tiers`, which are the relay's own internal rate rules on a
+local clock, these are a published promise: what `usage.usage` charges when the
+relay's own rate card is switched off is exactly what this says.
 
 They are strings and not numbers because `0.0000006` loses its last digits
 through an `f64`, and OpenRouter compares them as decimals. A price left empty
 is **not published at all** rather than published as zero — a wrong price is
 worse than a missing one, so a listed model with no price and no `isFree` is
 rejected by validation.
+
+One exception, and it is arithmetic rather than invention: on the public
+listing at `/v1/models`, a price left empty here is filled in from the sell side
+of this model's own rate card when `pricing.enabled` is on — the same figure
+divided by a million. An operator who priced the model once does not have to
+type it again per token.
 
 Capacity is what the model can actually sustain:
 

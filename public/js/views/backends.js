@@ -89,6 +89,9 @@ function editBackend(ctx, existing) {
     i.maxRetries = number(b.maxRetries ?? 1, { min: 0, max: 5 });
     i.streamOptions = h('input', { type: 'checkbox', checked: b.streamOptions !== false });
     i.headers = textarea(stringifyKeyValues(b.headers), { placeholder: 'HTTP-Referer=https://example.com', rows: 3 });
+    i.forwardUserId = h('input', { type: 'checkbox', checked: b.forwardUserId !== false });
+    i.userIdHeader = text(b.userIdHeader ?? 'x-user-id', { class: 'mono', placeholder: 'x-user-id' });
+    i.userIdField = text(b.userIdField ?? 'user_id', { class: 'mono', placeholder: 'user_id' });
     i.note = text(b.note ?? '');
 
     return h('div', {},
@@ -104,6 +107,21 @@ function editBackend(ctx, existing) {
       h('label.switch', { style: { marginBottom: '14px' } }, i.streamOptions,
         h('span', { text: 'Ask for usage while streaming (stream_options)' })),
       field('Extra headers', i.headers),
+      h('hr'),
+      h('p.small.muted', {
+        text: 'The caller\u2019s own id is the only thing about them that travels. A '
+          + 'backend that keys its prompt cache by user needs it, or every caller '
+          + 'behind this relay shares one cache. It goes as OpenAI\u2019s "user" field '
+          + 'either way; the two boxes below are the other names backends read it '
+          + 'under. Clear the field for a backend that rejects body fields it does '
+          + 'not recognise.',
+      }),
+      h('label.switch', { style: { marginBottom: '14px' } }, i.forwardUserId,
+        h('span', { text: 'Pass the caller\u2019s user id upstream' })),
+      h('div.grid.form', {},
+        field('User id header', i.userIdHeader, 'empty sends no header'),
+        field('User id body field', i.userIdField, 'beside "user"; empty sends only "user"'),
+      ),
       field('Note', i.note),
     );
   }, {
@@ -133,6 +151,12 @@ function editBackend(ctx, existing) {
           maxRetries: Number(i.maxRetries.value) || 0,
           streamOptions: i.streamOptions.checked,
           headers: parseKeyValues(i.headers.value),
+          forwardUserId: i.forwardUserId.checked,
+          userIdHeader: i.userIdHeader.value.trim(),
+          userIdField: i.userIdField.value.trim(),
+          // Not edited here, but a save must not drop it: a field left out of
+          // the payload comes back as its default, not as what was stored.
+          apiKeys: b.apiKeys ?? [],
           note: i.note.value,
         });
         toast('Backend saved', 'ok');

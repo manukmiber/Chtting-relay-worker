@@ -276,6 +276,20 @@ async fn deleting_an_item_removes_it() {
 }
 
 #[tokio::test]
+async fn the_overview_answers_on_a_relay_that_has_served_nothing_yet() {
+    // A fresh install is a window with no rows in it, and SQLite answers a
+    // conditional SUM over no rows with NULL rather than 0. Unwrapped, that is
+    // a 500 on the first screen anybody opens.
+    let dash = Dash::start(|_| {}).await;
+
+    let summary = dash.get_json("/api/stats/summary?range=7d").await;
+    assert_eq!(summary["all"]["requests"], 0);
+    assert_eq!(summary["all"]["error_rate"], 0.0);
+    assert_eq!(summary["all"]["total_tokens"], 0);
+    assert_eq!(summary["today"]["requests"], 0);
+}
+
+#[tokio::test]
 async fn statistics_come_back_shaped_the_way_the_charts_expect() {
     let dash = Dash::start(|_| {}).await;
     dash.relay

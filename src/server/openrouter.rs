@@ -401,7 +401,7 @@ fn slug(model: &Model, cfg: &Config) -> String {
 ///
 /// Falls back to the vocabulary the relay actually counts with, which is the
 /// honest answer even when it is not one of the familiar names.
-fn tokenizer_family(model: &Model, cfg: &Config) -> String {
+pub fn tokenizer_family(model: &Model, cfg: &Config) -> String {
     if !model.openrouter.tokenizer_family.is_empty() {
         return model.openrouter.tokenizer_family.clone();
     }

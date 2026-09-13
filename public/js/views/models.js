@@ -118,55 +118,46 @@ function editModel(ctx, existing) {
     );
 
     /* --------------------------------------------------- system prompt */
-    inputs.spMode = select(m.systemPrompt?.mode ?? 'none', [
-      ['none', 'none — pass through untouched'],
-      ['prepend', 'prepend — ours first, then theirs'],
-      ['append', 'append — theirs first, then ours'],
-      ['replace', 'replace — drop whatever the caller sent'],
-      ['merge', 'merge — one system message, ours on top'],
-    ]);
-    inputs.spPromptId = select(m.systemPrompt?.promptId ?? '', [
-      ['', '— write it inline below —'],
-      ...(cfg.systemPrompts ?? []).map((p) => [p.id, p.name]),
-    ]);
-    inputs.spText = textarea(m.systemPrompt?.text ?? '', {
+    // Two prompts, because a model is written to two audiences and no more: the
+    // caller who asked it to think, and the caller who did not. Anything finer
+    // than that is a rule, and rules live in the advanced box below.
+    const existingRules = m.systemPrompts ?? [];
+    const managed = existingRules.find((r) => r.id === NON_THINKING_RULE);
+    const extraRules = existingRules.filter((r) => r.id !== NON_THINKING_RULE);
+
+    inputs.spDefault = promptEditor(cfg, m.systemPrompt, {
       placeholder: 'You are Creative Writer, a careful and vivid fiction assistant…',
-      rows: 8,
     });
-
-    // Picking a saved prompt makes the inline box inert; showing the library
-    // text (read-only) stops anyone typing into a field that will be ignored.
-    const spTextField = field('Prompt text', inputs.spText);
-    const syncPromptSource = () => {
-      const saved = (cfg.systemPrompts ?? []).find((p) => p.id === inputs.spPromptId.value);
-      inputs.spText.disabled = Boolean(saved);
-      inputs.spText.value = saved ? saved.text : (m.systemPrompt?.text ?? '');
-      spTextField.querySelector('span').textContent = saved
-        ? `Prompt text — from "${saved.name}", edit it in the Prompts tab`
-        : 'Prompt text';
-    };
-    inputs.spPromptId.addEventListener('change', syncPromptSource);
-
-    // One model, several prompts, chosen by how hard the caller asked the model
-    // to think. A non-reasoning call and a maximum-effort call want different
-    // instructions, and the rule that matches first wins.
-    inputs.promptRules = textarea(JSON.stringify(m.systemPrompts ?? [], null, 1), { rows: 8 });
+    inputs.spNonThinking = promptEditor(cfg, managed?.prompt, {
+      placeholder: 'Answer directly. No preamble, no working shown…',
+    });
+    inputs.promptRules = textarea(JSON.stringify(extraRules, null, 1), { rows: 6 });
 
     body.append(section('System prompt injection', [
-      field('Mode', inputs.spMode),
-      field('Use a saved prompt', inputs.spPromptId, 'from the Prompts tab; overrides the text below'),
-      spTextField,
+      h('h3.small', { text: 'Default' }),
+      h('p.small.muted', {
+        text: 'What the model is told when the caller asked it to think \u2014 low, medium, '
+          + 'high or max \u2014 and what everyone gets while the box below is left at none.',
+      }),
+      ...inputs.spDefault.rows,
+      h('hr'),
+      h('h3.small', { text: 'No thinking' }),
+      h('p.small.muted', {
+        text: 'What the model is told when thinking is off, set to minimal, or never '
+          + 'mentioned at all \u2014 the same three the no-thinking price band covers, '
+          + 'because silence is not a choice to think and should not be answered as one. '
+          + 'Leave the mode at none and these callers fall through to Default.',
+      }),
+      ...inputs.spNonThinking.rows,
       h('hr'),
       h('p.small.muted', {
-        text: 'A prompt per thinking effort. The first rule whose effort matches wins; '
-          + 'a caller who named no effort falls through to the prompt above. Efforts are '
-          + 'none, minimal, low, medium, high, max and default.',
+        text: 'Anything narrower than those two is a rule of its own. Rules are tried '
+          + 'before the two boxes above, first match wins; efforts are none, minimal, '
+          + 'low, medium, high, max and default.',
       }),
-      field('Prompts by effort', inputs.promptRules,
-        'JSON: [{"efforts":["none","low"],"prompt":{"mode":"replace","text":"…"}}, '
-        + '{"minEffort":"high","prompt":{"mode":"replace","promptId":"sp_…"}}]'),
+      field('Extra rules by effort', inputs.promptRules,
+        'JSON, and rarely needed: [{"efforts":["max"],"prompt":{"mode":"replace","promptId":"sp_…"}}]'),
     ], true));
-    syncPromptSource();
 
     /* --------------------------------------------------------- params */
     inputs.params = textarea(stringifyKeyValues(m.params), { placeholder: 'temperature=1.1\ntop_p=0.95', rows: 4 });
@@ -363,6 +354,18 @@ function editModel(ctx, existing) {
     inputs.orRequestPrice = price(o.pricing?.requestUsd, 'flat fee per request');
     inputs.orCacheTtl = number(o.pricing?.cacheTtlSeconds ?? 0, { min: 0 });
     inputs.orCacheImplicit = h('input', { type: 'checkbox', checked: o.pricing?.cacheImplicit === true });
+    inputs.orOverrides = textarea(JSON.stringify(o.pricing?.overrides ?? [], null, 1), { rows: 8 });
+    inputs.orCanonical = text(o.canonicalSlug ?? '', { class: 'mono', placeholder: 'defaults to the public name' });
+    inputs.orOutModalities = text((o.outputModalities ?? ['text']).join(', '), { class: 'mono', placeholder: 'text' });
+    inputs.orInstruct = text(o.instructType ?? '', { class: 'mono', placeholder: 'chatml — blank for an instruct model' });
+    inputs.orModerated = h('input', { type: 'checkbox', checked: o.isModerated === true });
+    inputs.orCutoff = text(o.knowledgeCutoff ?? '', { placeholder: 'YYYY-MM-DD' });
+    inputs.orParams = text((o.supportedParameters ?? []).join(', '), { class: 'mono', placeholder: 'blank = worked out from this model' });
+    inputs.orDefaultParams = textarea(stringifyKeyValues(o.defaultParameters ?? {}), { rows: 2, placeholder: 'temperature=1.05' });
+    inputs.orReasonMandatory = h('input', { type: 'checkbox', checked: o.reasoning?.mandatory === true });
+    inputs.orReasonDefault = h('input', { type: 'checkbox', checked: o.reasoning?.defaultEnabled === true });
+    inputs.orEfforts = text((o.reasoning?.supportedEfforts ?? []).join(', '), { class: 'mono', placeholder: 'max, high, medium, low, none' });
+    inputs.orDefaultEffort = text(o.reasoning?.defaultEffort ?? '', { class: 'mono', placeholder: 'high' });
     inputs.orMaxPrompt = number(o.maxPromptTokens ?? 0, { min: 0 });
     inputs.orMaxOutput = number(o.maxOutputTokens ?? 0, { min: 0 });
     inputs.orTempMax = number(o.temperatureMax ?? 2, { min: 0, step: 0.1 });
@@ -400,6 +403,19 @@ function editModel(ctx, existing) {
         field('Discount to user', inputs.orDiscount, '0 to 0.99'),
         field('Deprecation date', inputs.orDeprecation),
       ),
+      h('p.small.muted', {
+        text: 'These models are not sold at one rate — they are sold at a rate that '
+          + 'moves with the hour and the day, so the listing publishes the windows '
+          + 'too. Times are UTC, written HHMM: 0 is midnight, 100 is 01:00, 1730 is '
+          + '17:30. The first window that covers a moment wins, so the narrow ones '
+          + 'go first; a window with no start and end is the whole day, and one whose '
+          + 'end is below its start wraps past midnight. A price a window leaves out '
+          + 'keeps the one above rather than becoming free.',
+      }),
+      field('Price by hour and day', inputs.orOverrides,
+        'JSON: [{"utcDays":["saturday","sunday"]}, '
+        + '{"utcDays":["monday","tuesday","wednesday","thursday","friday"],'
+        + '"utcStart":100,"utcEnd":400,"promptUsd":"0.0000003","completionUsd":"0.0000012"}]'),
       h('div.row', { style: { marginBottom: '12px' } },
         h('label.switch', {}, inputs.orCacheImplicit, h('span', { text: 'Caching is automatic' })),
         h('label.switch', {}, inputs.orFree, h('span', { text: 'Free model' })),
@@ -412,8 +428,19 @@ function editModel(ctx, existing) {
       h('div.grid.form', {},
         field('Tokenizer family', inputs.orTokFamily),
         field('Input modalities', inputs.orModalities, 'text, image, audio, video, file'),
-        field('Max temperature', inputs.orTempMax),
+        field('Output modalities', inputs.orOutModalities, 'what the model answers in'),
       ),
+      h('div.grid.form', {},
+        field('Max temperature', inputs.orTempMax),
+        field('Canonical slug', inputs.orCanonical, 'the dated name of this exact snapshot'),
+        field('Instruct type', inputs.orInstruct, 'a base model\u2019s prompt format; blank = instruct'),
+      ),
+      h('div.grid.form', {},
+        field('Knowledge cutoff', inputs.orCutoff, 'blank publishes none'),
+        field('Supported parameters', inputs.orParams, 'blank works it out from this model'),
+      ),
+      field('Default parameters', inputs.orDefaultParams,
+        'what a caller gets without asking; blank publishes the model\u2019s own params'),
       h('div.grid.form', {},
         field('Max prompt tokens', inputs.orMaxPrompt, '0 = use the limits above'),
         field('Max output tokens', inputs.orMaxOutput, '0 = use the limits above'),
@@ -423,6 +450,19 @@ function editModel(ctx, existing) {
         h('label.switch', {}, inputs.orTools, h('span', { text: 'Tools' })),
         h('label.switch', {}, inputs.orStructured, h('span', { text: 'Structured outputs' })),
         h('label.switch', {}, inputs.orReasoning, h('span', { text: 'Reasoning' })),
+        h('label.switch', {}, inputs.orModerated, h('span', { text: 'Moderated' })),
+      ),
+      h('p.small.muted', {
+        text: 'How the listing describes this model\u2019s reasoning. Published only '
+          + 'when Reasoning is on above.',
+      }),
+      h('div.row', { style: { marginBottom: '12px' } },
+        h('label.switch', {}, inputs.orReasonMandatory, h('span', { text: 'Always reasons' })),
+        h('label.switch', {}, inputs.orReasonDefault, h('span', { text: 'Reasons unless asked not to' })),
+      ),
+      h('div.grid.form', {},
+        field('Supported efforts', inputs.orEfforts, 'blank publishes the levels the relay prices'),
+        field('Default effort', inputs.orDefaultEffort, 'what an unnamed level gets'),
       ),
       h('p.small.muted', {
         text: 'Capacity is what this relay can actually sustain. Publishing an honest '
@@ -465,14 +505,11 @@ function editModel(ctx, existing) {
           description: inputs.description.value.trim(),
           owner: inputs.owner.value.trim(),
           aliases: parseList(inputs.aliases.value),
-          systemPrompt: {
-            mode: inputs.spMode.value,
-            // when a saved prompt is in use the box mirrors it, so keep the
-            // model's own inline text instead of overwriting it with the copy
-            text: inputs.spPromptId.value ? (m.systemPrompt?.text ?? '') : inputs.spText.value,
-            promptId: inputs.spPromptId.value,
-          },
-          systemPrompts: JSON.parse(inputs.promptRules.value || '[]'),
+          systemPrompt: inputs.spDefault.value(),
+          systemPrompts: promptRules(
+            JSON.parse(inputs.promptRules.value || '[]'),
+            inputs.spNonThinking.value(),
+          ),
           maxTokensPerSecond: Number(inputs.maxTps.value) || 0,
           pricing: {
             enabled: inputs.prEnabled.checked,
@@ -522,6 +559,19 @@ function editModel(ctx, existing) {
             isFree: inputs.orFree.checked,
             discountToUser: Number(inputs.orDiscount.value) || 0,
             deprecationDate: inputs.orDeprecation.value.trim(),
+            canonicalSlug: inputs.orCanonical.value.trim(),
+            outputModalities: parseList(inputs.orOutModalities.value),
+            instructType: inputs.orInstruct.value.trim(),
+            isModerated: inputs.orModerated.checked,
+            knowledgeCutoff: inputs.orCutoff.value.trim(),
+            supportedParameters: parseList(inputs.orParams.value),
+            defaultParameters: parseKeyValues(inputs.orDefaultParams.value),
+            reasoning: {
+              mandatory: inputs.orReasonMandatory.checked,
+              defaultEnabled: inputs.orReasonDefault.checked,
+              supportedEfforts: parseList(inputs.orEfforts.value),
+              defaultEffort: inputs.orDefaultEffort.value.trim(),
+            },
             pricing: {
               promptUsd: inputs.orPromptPrice.value.trim(),
               completionUsd: inputs.orCompletionPrice.value.trim(),
@@ -531,6 +581,7 @@ function editModel(ctx, existing) {
               requestUsd: inputs.orRequestPrice.value.trim(),
               cacheTtlSeconds: Number(inputs.orCacheTtl.value) || 0,
               cacheImplicit: inputs.orCacheImplicit.checked,
+              overrides: JSON.parse(inputs.orOverrides.value || '[]'),
             },
             capacity: {
               promptTokensPerMinute: Number(inputs.orTpmIn.value) || 0,
@@ -565,6 +616,93 @@ function editModel(ctx, existing) {
       return undefined;
     },
   });
+}
+
+/**
+ * The id of the rule the "No thinking" box owns. Reserved: a rule carrying it
+ * is that box and nothing else, which is what lets the box be edited as a
+ * prompt while the relay still reads it as one entry in an ordered list.
+ */
+const NON_THINKING_RULE = 'sp-non-thinking';
+
+/**
+ * The efforts that rule answers for — the same three the no-thinking price band
+ * covers, so a request is never told one thing and billed as another.
+ */
+const NON_THINKING_EFFORTS = ['none', 'minimal', 'default'];
+
+/**
+ * One prompt: how to inject it, which saved prompt it is, and the text itself.
+ *
+ * Returns the rows to lay out and a `value()` that reads them back, so the two
+ * prompts a model carries are edited by the same thing rather than by two
+ * copies of it that drift.
+ */
+function promptEditor(cfg, spec, { placeholder }) {
+  const mode = select(spec?.mode ?? 'none', [
+    ['none', 'none — pass through untouched'],
+    ['prepend', 'prepend — ours first, then theirs'],
+    ['append', 'append — theirs first, then ours'],
+    ['replace', 'replace — drop whatever the caller sent'],
+    ['merge', 'merge — one system message, ours on top'],
+  ]);
+  const promptId = select(spec?.promptId ?? '', [
+    ['', '— write it inline below —'],
+    ...(cfg.systemPrompts ?? []).map((p) => [p.id, p.name]),
+  ]);
+  const inline = spec?.text ?? '';
+  const box = textarea(inline, { placeholder, rows: 7 });
+  const boxField = field('Prompt text', box);
+
+  // Picking a saved prompt makes the inline box inert; showing the library
+  // text (read-only) stops anyone typing into a field that will be ignored.
+  const sync = () => {
+    const saved = (cfg.systemPrompts ?? []).find((p) => p.id === promptId.value);
+    box.disabled = Boolean(saved);
+    box.value = saved ? saved.text : inline;
+    boxField.querySelector('span').textContent = saved
+      ? `Prompt text — from "${saved.name}", edit it in the Prompts tab`
+      : 'Prompt text';
+  };
+  promptId.addEventListener('change', sync);
+  sync();
+
+  return {
+    rows: [
+      h('div.grid.form', {},
+        field('Mode', mode),
+        field('Use a saved prompt', promptId, 'from the Prompts tab; overrides the text below'),
+      ),
+      boxField,
+    ],
+    value: () => ({
+      mode: mode.value,
+      // When a saved prompt is in use the box mirrors it, so keep the model's
+      // own inline text rather than overwriting it with the copy.
+      text: promptId.value ? inline : box.value,
+      promptId: promptId.value,
+    }),
+  };
+}
+
+/**
+ * The rule list as the relay reads it: the operator's own rules first, so a
+ * narrower one can still win, then the "No thinking" box as the last word.
+ *
+ * A box left at `none` writes no rule at all rather than one that injects
+ * nothing — the difference matters, because a rule that matches and injects
+ * nothing would stop those callers reaching the Default prompt.
+ */
+function promptRules(extras, nonThinking) {
+  const kept = extras.filter((r) => r?.id !== NON_THINKING_RULE);
+  if (nonThinking.mode === 'none') return kept;
+  return [...kept, {
+    id: NON_THINKING_RULE,
+    name: 'No thinking',
+    enabled: true,
+    efforts: NON_THINKING_EFFORTS,
+    prompt: nonThinking,
+  }];
 }
 
 /**

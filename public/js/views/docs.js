@@ -85,12 +85,16 @@ function buildDoc(state) {
 function endpointSection(baseUrl, origin, localUrl, tunnelUrl, cfg) {
   const rows = [
     ['GET', '/health', 'no', 'Liveness, version, how many models and backends are up.'],
-    ['GET', '/v1/models', 'yes', 'The model list, OpenAI shape.'],
-    ['GET', '/v1/models/{id}', 'yes', 'One model, or 404 with `model_not_found`.'],
+    ['GET', '/v1/models', 'yes', 'The model list: OpenAI\u2019s envelope, OpenRouter\u2019s model document inside it \u2014 `architecture`, `pricing` with its hour-and-day windows, `top_provider`, `supported_parameters`, `reasoning`.'],
+    ['GET', '/models', 'yes', 'The same listing, for clients that omit `/v1`.'],
+    ['GET', '/v1/models/{id}', 'yes', 'One model, or 404 with `model_not_found`. Ids containing a `/` work as written.'],
+    ['GET', '/models/{id}', 'yes', 'The same, without the prefix.'],
     ['POST', '/v1/chat/completions', 'yes', 'Chat, streaming and non-streaming.'],
     ['POST', '/chat/completions', 'yes', 'The same handler, for clients that omit `/v1`.'],
     ['POST', '/v1/completions', 'yes', 'Legacy text completions, same routing and billing.'],
+    ['POST', '/completions', 'yes', 'The same, without the prefix.'],
     ['POST', '/v1/embeddings', 'yes', 'Embeddings, when the routed backend offers them.'],
+    ['POST', '/embeddings', 'yes', 'The same, without the prefix.'],
     ['OPTIONS', 'any of the above', 'no', 'CORS preflight.'],
   ];
   if (cfg.openrouter?.enabled) {
@@ -236,6 +240,8 @@ function chatSection(sample, models) {
         ['`user`', 'relay', 'The prompt-cache isolation key — see below.'],
         ['`reasoning_effort`', 'relay', '`none`, `minimal`, `low`, `medium`, `high`, `max`. Also read from `reasoning.effort`, `thinking.effort`, `thinking.budget_tokens` and `enable_thinking`. Picks the system prompt and can move the price.'],
         ['`stream_options`', 'relay', 'Dropped: usage always arrives on the final chunk, so `include_usage` is not needed.'],
+        ['`reasoning.exclude`, `include_reasoning`', 'relay', 'Leave the reasoning trace out of this reply. Only ever removes one \u2014 neither can turn on a trace the model keeps off.'],
+        ['`usage`, `route`, `models`, `transforms`, `provider`, `plugins`, `preset`', 'relay', 'OpenRouter\u2019s routing vocabulary. Accepted and answered here; never forwarded, since a strict backend rejects a body carrying fields it does not know.'],
         ['`temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed`', 'backend', 'Forwarded as sent.'],
         ['`response_format` (JSON mode), `tools`, `tool_choice`', 'backend', 'Forwarded as sent; whether they work is the backend model’s business.'],
       ],
@@ -279,7 +285,7 @@ function streamSection(server, sample) {
           '',
           `: ${keepalive}`,
           '',
-          `data: {"id":"3f2a…","object":"chat.completion.chunk","created":1789936200,"model":"${sample}","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":256,"total_tokens":274,"usage":0.1029}}`,
+          `data: {"id":"3f2a…","object":"chat.completion.chunk","created":1789936200,"model":"${sample}","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":256,"total_tokens":274,"usage":0.010293,"cost":0.010293}}`,
           '',
           'data: [DONE]',
           '',
@@ -313,7 +319,8 @@ function usageSection(cfg) {
           ['`usage.total_tokens`', 'integer', 'The two above, added.'],
           ['`usage.prompt_tokens_details.cached_tokens`', 'integer', 'Cache-hit portion of the input. Absent when zero, never larger than `prompt_tokens`.'],
           ['`usage.completion_tokens_details.reasoning_tokens`', 'integer', 'Reasoning portion of the output. Absent when zero.'],
-          ['`usage.usage`', 'number', `What this request cost under the relay’s price list, in ${currency}, to six decimal places. Present only when pricing is switched on.`],
+          ['`usage.usage`', 'number', `What this request cost, in ${currency}, to nine decimal places \u2014 the relay’s own price list when it is switched on, otherwise the per-token price the model is published at in \`/v1/models\`, windows included. Absent only for a model nobody has priced at all.`],
+          ['`usage.cost`', 'number', 'The same number under OpenRouter\u2019s spelling. Never a second price.'],
         ],
       },
       { p: 'Non-streaming responses carry the same object on the body. Streaming responses carry it on the final chunk described above.' },
@@ -324,7 +331,8 @@ function usageSection(cfg) {
           total_tokens: 274,
           prompt_tokens_details: { cached_tokens: 12 },
           completion_tokens_details: { reasoning_tokens: 64 },
-          usage: 0.1029,
+          usage: 0.102949871,
+          cost: 0.102949871,
         },
       }, null, 2), lang: 'json' },
     ],
@@ -349,7 +357,7 @@ function identitySection(backends) {
           'The body wins over the headers; the headers are tried in the order above.',
           'A provider-specific pseudonymous id is enough — an opaque, stable string is all that is needed. Do not send an email address, a name or anything else that identifies a person.',
           forwarding.length
-            ? `Forwarded upstream as \`${forwarding[0].userIdHeader}\` so the backend isolates its own cache the same way.`
+            ? `Forwarded upstream as \`${forwarding[0].userIdHeader}\` so the backend isolates its own cache the same way, and in the body as \`user\`${forwarding[0].userIdField ? ` and \`${forwarding[0].userIdField}\`` : ''} \u2014 backends disagree on the spelling, and one reading only its own would pool every caller into a single cache.`
             : 'Not forwarded upstream at present: no backend has `forwardUserId` switched on, so isolation is recorded here but not requested of the backend.',
           'Sending nothing is allowed. The request is then recorded with an empty user, and cache isolation is whatever the backend does by default.',
         ],

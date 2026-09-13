@@ -24,12 +24,21 @@ pub fn router(state: Arc<AppState>) -> Router {
     let limit = cfg.server.max_body_bytes;
     let mut router = Router::new()
         .route("/health", get(health))
+        // Both spellings of every path: some clients prefix `/v1`, some are
+        // pointed at a base URL that already ends in it, and a relay that
+        // answers only one of the two is a support ticket either way.
         .route("/v1/models", get(models).options(preflight))
-        .route("/v1/models/{id}", get(model_by_id).options(preflight))
+        .route("/models", get(models).options(preflight))
+        // A wildcard, not one segment: the ids here are `vendor/name`, and a
+        // single-segment route cannot look one of them up.
+        .route("/v1/models/{*id}", get(model_by_id).options(preflight))
+        .route("/models/{*id}", get(model_by_id).options(preflight))
         .route("/v1/chat/completions", post(chat).options(preflight))
         .route("/chat/completions", post(chat).options(preflight))
         .route("/v1/completions", post(completions).options(preflight))
+        .route("/completions", post(completions).options(preflight))
         .route("/v1/embeddings", post(embeddings).options(preflight))
+        .route("/embeddings", post(embeddings).options(preflight))
         .route(DEFAULT_PROVIDER_PATH, get(provider_models));
 
     let custom = cfg.openrouter.path.trim();
@@ -143,7 +152,7 @@ fn blocked(state: &AppState, ip: &str) -> Option<Response> {
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let response = match require_key(&state, &headers) {
         Err(denied) => *denied,
-        Ok(_) => Json(handler::list_models(&state.config.current())).into_response(),
+        Ok(_) => Json(super::catalog::document(&state.config.current())).into_response(),
     };
     with_cors(&state, &headers, response)
 }
@@ -156,7 +165,7 @@ async fn model_by_id(
     let response = match require_key(&state, &headers) {
         Err(denied) => *denied,
         Ok(_) => {
-            let listed = handler::list_models(&state.config.current());
+            let listed = super::catalog::document(&state.config.current());
             let found = listed["data"]
                 .as_array()
                 .and_then(|a| a.iter().find(|m| m["id"] == id.as_str()))

@@ -4,6 +4,7 @@
 //! [`public`] is what the tunnel exposes, [`dashboard`] binds to loopback and
 //! carries the settings, keys and logs. Nothing routes between them.
 
+pub mod catalog;
 pub mod dashboard;
 pub mod openrouter;
 pub mod public;
