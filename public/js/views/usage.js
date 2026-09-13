@@ -137,7 +137,7 @@ export async function usageView(ctx) {
   root.append(card(`Last ${rows.length} ledger rows`, table(
     ['When', 'Phase', 'Model', 'User', { label: 'In', num: true }, { label: 'Out', num: true },
       { label: 'TTFT', num: true }, { label: 'Tok/s', num: true }, 'Cache',
-      { label: 'Charged', num: true }, 'Hash'],
+      { label: 'Charged', num: true }, 'Billed on', 'Hash'],
     rows,
     (r) => h('tr', {},
       h('td', { text: fmtTime(r.ts) }),
@@ -150,6 +150,13 @@ export async function usageView(ctx) {
       h('td.num', { text: r.tokensPerSec || '—' }),
       h('td', { text: r.cacheHit ? `${fmtNum(r.cachedTokens)}` : '—' }),
       h('td.num', { text: r.proxyUsd ? fmtUsd(r.proxyUsd) : '—' }),
+      // Worked out when this page is read, not written onto the row: an
+      // invoice covers a range of rows, so the row does not have to carry the
+      // answer for it to be knowable.
+      h('td.small', {}, r.invoiceNumber
+        ? h('span', {}, h('span.mono', { text: r.invoiceNumber }), ' ',
+          pill(r.billingStatus, r.billingStatus === 'paid' ? 'ok' : ''))
+        : pill('unbilled', 'warn')),
       h('td.mono.small.muted', { text: r.hash }),
     ),
   )));

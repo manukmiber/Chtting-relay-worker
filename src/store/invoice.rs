@@ -570,19 +570,64 @@ pub fn set_status(conn: &Connection, id: &str, status: &str) -> Result<Invoice> 
         ISSUED => ISSUED,
         other => bail!("\"{other}\" is not an invoice status: paid, void or issued"),
     };
+
+    let current = get(conn, id)?.ok_or_else(|| anyhow::anyhow!("no invoice with id \"{id}\""))?;
+    if status == VOID && current.status != VOID {
+        refuse_a_void_that_would_orphan_a_period(conn, &current)?;
+    }
+
     let settled_at = if status == ISSUED {
         0
     } else {
         crate::util::now_ms()
     };
-    let changed = conn.execute(
+    conn.execute(
         "UPDATE invoices SET status = ?2, settled_at = ?3 WHERE id = ?1",
         rusqlite::params![id, status, settled_at],
     )?;
-    if changed == 0 {
-        bail!("no invoice with id \"{id}\"");
-    }
     get(conn, id)?.ok_or_else(|| anyhow::anyhow!("invoice \"{id}\" vanished while being updated"))
+}
+
+/// Only the newest invoice may be voided, and this is why.
+///
+/// A period is a range of `seq`, and where the next one starts is read off the
+/// newest invoice that still stands. Void one from the middle of the run and
+/// its range belongs to nothing: the cursor still sits at the newest invoice
+/// past it, so those rows are never billed to anyone and never appear as
+/// unbilled either. The money does not come back — it disappears, quietly,
+/// which is the worst way for money to behave.
+///
+/// The alternative to refusing is tracking a set of ranges with holes in it,
+/// per key, and asking every read to work out what is not covered. At the
+/// volumes this relay is built for — millions of ledger rows in a billing
+/// period — that turns the cheapest query in the billing screen into a scan of
+/// the whole history. Voiding out of order is rare; losing a period is not
+/// something to risk to make it convenient.
+///
+/// So: void the newest, then the one before it, and re-issue. That is also
+/// what an accountant would do, and it leaves the run of periods unbroken.
+fn refuse_a_void_that_would_orphan_a_period(conn: &Connection, invoice: &Invoice) -> Result<()> {
+    let (newest_seq, _) = billing_cursor(conn, &invoice.key_id)?;
+    if invoice.to_seq == newest_seq {
+        return Ok(());
+    }
+    let newer: Vec<String> = conn
+        .prepare(
+            "SELECT number FROM invoices
+             WHERE key_id = ?1 AND status != 'void' AND to_seq > ?2
+             ORDER BY to_seq DESC",
+        )?
+        .query_map(rusqlite::params![invoice.key_id, invoice.to_seq], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    bail!(
+        "{} is not the newest invoice for this key, and voiding it would leave the usage it \
+         covers billed to nothing. Void {} first — newest first — then this one.",
+        invoice.number,
+        newer.join(", then "),
+    )
 }
 
 const SELECT_SQL: &str = "SELECT id, number, key_id, key_label, key_kind, bill_to, issued_at,
@@ -866,6 +911,102 @@ mod tests {
         };
         assert_eq!(second.requests, 2);
         assert!((second.subtotal_usd - 5.0).abs() < 1e-9);
+    }
+
+    /// The bug this closes: with three periods billed and the middle invoice
+    /// voided, the cursor still sat at the newest one — so the middle period
+    /// was billed to nothing, appeared as unbilled to nobody, and its money
+    /// simply left the books.
+    #[test]
+    fn a_middle_invoice_cannot_be_voided_because_its_period_would_vanish() {
+        let mut conn = db();
+        let key = key();
+        let billing = BillingConfig::default();
+
+        let mut issued = Vec::new();
+        for usd in [1.0, 2.0, 4.0] {
+            spend(&conn, &key.id, "model-a", usd);
+            let Issued::Invoice(inv) = issue(&mut conn, request(&key, &billing)).unwrap() else {
+                panic!("each period has usage in it");
+            };
+            issued.push(*inv);
+        }
+
+        let refused = set_status(&conn, &issued[1].id, VOID);
+        let message = refused
+            .expect_err("voiding the middle invoice must be refused")
+            .to_string();
+        assert!(
+            message.contains(&issued[2].number),
+            "the refusal should name what to void first, got: {message}"
+        );
+
+        // Nothing moved, and nothing was lost.
+        assert_eq!(get(&conn, &issued[1].id).unwrap().unwrap().status, ISSUED);
+        assert_eq!(current_usage(&conn, &key.id).unwrap().requests, 0);
+
+        // Newest first is allowed, and hands each period back as it goes.
+        set_status(&conn, &issued[2].id, VOID).unwrap();
+        assert!((current_usage(&conn, &key.id).unwrap().subtotal_usd - 4.0).abs() < 1e-9);
+        set_status(&conn, &issued[1].id, VOID).unwrap();
+        let back = current_usage(&conn, &key.id).unwrap();
+        assert_eq!(back.requests, 2);
+        assert!(
+            (back.subtotal_usd - 6.0).abs() < 1e-9,
+            "both voided periods are billable again, not just the last one"
+        );
+
+        // And re-issuing covers exactly what came back.
+        let Issued::Invoice(again) = issue(&mut conn, request(&key, &billing)).unwrap() else {
+            panic!("there is usage to bill");
+        };
+        assert_eq!(again.requests, 2);
+        assert!((again.subtotal_usd - 6.0).abs() < 1e-9);
+    }
+
+    /// Every ledger row a key ever wrote belongs to exactly one standing
+    /// invoice or to the open period — never to neither. This is the invariant
+    /// the rule above exists to hold, checked over a run of issues and voids.
+    #[test]
+    fn no_usage_can_fall_between_two_periods() {
+        let mut conn = db();
+        let key = key();
+        let billing = BillingConfig::default();
+
+        let mut total = 0.0;
+        let mut issued = Vec::new();
+        for n in 1..=4 {
+            spend(&conn, &key.id, "model-a", f64::from(n));
+            total += f64::from(n);
+            if let Issued::Invoice(inv) = issue(&mut conn, request(&key, &billing)).unwrap() {
+                issued.push(*inv);
+            }
+        }
+
+        // Whatever has been voided, billed plus unbilled is always everything.
+        let accounted = |conn: &Connection| -> f64 {
+            let billed: f64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(subtotal_usd),0) FROM invoices
+                     WHERE key_id = ?1 AND status != 'void'",
+                    [&key.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            billed + current_usage(conn, &key.id).unwrap().subtotal_usd
+        };
+
+        assert!((accounted(&conn) - total).abs() < 1e-9);
+        for invoice in issued.iter().rev() {
+            set_status(&conn, &invoice.id, VOID).unwrap();
+            assert!(
+                (accounted(&conn) - total).abs() < 1e-9,
+                "voiding {} lost money",
+                invoice.number
+            );
+        }
+        // Everything is unbilled again once every invoice is void.
+        assert!((current_usage(&conn, &key.id).unwrap().subtotal_usd - total).abs() < 1e-9);
     }
 
     #[test]

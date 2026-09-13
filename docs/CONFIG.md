@@ -497,6 +497,12 @@ Consequences worth knowing:
 
 * An invoice cannot be un-issued. **Voiding** one marks it void and hands its
   period back, so the next invoice covers both.
+* **Only the newest invoice may be voided.** A period is a range of `seq`, and
+  where the next one starts is read off the newest invoice that still stands.
+  Voiding one from the middle would leave its range covered by nothing — never
+  billed, and never showing as unbilled either, so the money would simply leave
+  the books. Void newest first, then the one before it, then re-issue; the
+  refusal names which invoice to void first.
 * A request that was in flight when the invoice was issued lands on the next
   one. Its price is only known when the answer completes, and nothing had been
   charged for it yet.
@@ -504,6 +510,15 @@ Consequences worth knowing:
   usage rolls into the next invoice.
 * An issued invoice's figures are hashed with it and SQLite refuses an update
   that touches one. Only `status`, `settledAt` and the note may change.
+* **No `paid` flag is written onto a request.** Which invoice covers a ledger
+  row is worked out when it is read — an invoice covers a range of `seq`, and a
+  key has dozens of invoices against millions of rows, so the join is small.
+  Writing the answer onto each row instead would mean rewriting every unbilled
+  row of a key on every issue: at a few hundred thousand requests a week, that
+  is millions of rows rewritten while the relay is trying to record live
+  traffic, and the writer queue is what would give first. The Usage screen
+  shows each row's invoice number and whether it is `unbilled`, `issued` or
+  `paid` all the same.
 
 Automatic issue only touches keys with `billing.autoInvoice`, and only on
 `cycleDay`. Everything else waits for someone to press the button on the
