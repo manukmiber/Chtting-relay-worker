@@ -2022,6 +2022,40 @@ async fn a_rewrite_of_ours_can_neither_hide_a_refusal_nor_invent_one() {
 }
 
 #[tokio::test]
+async fn only_the_model_can_refuse_for_the_refusal_price() {
+    // A request the relay turns away itself never reached a model, so nothing
+    // refused it in the sense the price list means: the flat price is what a
+    // model charges for reading a prompt and declining it, and this prompt was
+    // never read.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.models[0].limits.max_input_tokens = 5;
+        cfg.pricing = chtting_relay::config::Pricing {
+            enabled: true,
+            input_usd_per_m: 1_000_000.0,
+            output_usd_per_m: 1_000_000.0,
+            refusal_usd: 0.05,
+            refusal_phrases: vec!["I cannot do that. I only provide AI roleplay.".into()],
+            ..Default::default()
+        };
+    })
+    .await;
+
+    let response = h
+        .post(
+            "/v1/chat/completions",
+            chat("this prompt is comfortably longer than five tokens by any measure"),
+        )
+        .await;
+
+    assert_eq!(response.status(), 413);
+    assert_eq!(h.backend.request_count(), 0, "the backend was never asked");
+    let row = h.last_row().await;
+    assert_eq!(row["proxy_usd"], 0.0, "nothing to charge for: {row}");
+    assert_eq!(row["price_tiers"].as_str().unwrap(), "");
+}
+
+#[tokio::test]
 async fn a_streamed_refusal_carries_the_refusal_price_on_its_closing_frame() {
     const REFUSAL: &str = "I cannot do that. I only provide AI roleplay.";
 
