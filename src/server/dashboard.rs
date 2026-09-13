@@ -1765,6 +1765,36 @@ mod tests {
         assert!(ASSETS.get_file("css/app.css").is_some());
     }
 
+    /// A view that is not imported by the shell is a file nobody can reach,
+    /// and the bundle is assembled at compile time, so a missing one would
+    /// only show up as an empty tab on somebody's phone.
+    #[test]
+    fn every_view_the_shell_imports_is_compiled_in() {
+        let shell = ASSETS
+            .get_file("js/app.js")
+            .expect("the shell")
+            .contents_utf8()
+            .expect("text");
+        let mut found = 0;
+        for line in shell.lines().filter(|l| l.contains("./views/")) {
+            let path = line
+                .split("./views/")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("an import path");
+            assert!(
+                ASSETS.get_file(format!("js/views/{path}")).is_some(),
+                "js/views/{path} is imported but not embedded"
+            );
+            found += 1;
+        }
+        assert!(found >= 10, "only {found} views found — parsing went wrong");
+        assert!(
+            shell.contains("'docs', 'API Docs'"),
+            "the API documentation tab must be registered"
+        );
+    }
+
     #[test]
     fn a_cookie_header_is_parsed_without_a_library() {
         let mut headers = HeaderMap::new();

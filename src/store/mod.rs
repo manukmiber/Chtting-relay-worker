@@ -52,7 +52,11 @@ impl Store {
             let conn = Connection::open(&setup)?;
             conn.execute_batch(schema::CREATE_SQL)?;
             conn.execute_batch(ledger::CREATE_SQL)?;
+            // Before the indexes, never after: an older database still has an
+            // older table, and indexing a column it has not got yet fails the
+            // whole start-up.
             migrate(&conn)?;
+            conn.execute_batch(schema::INDEX_SQL)?;
             Ok(last_ledger_hash(&conn)?)
         })
         .await??;
@@ -424,6 +428,7 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::Logger;
 
     #[test]
     fn the_rate_limiter_admits_up_to_the_limit_then_asks_for_a_wait() {
@@ -465,5 +470,62 @@ mod tests {
 
         let tomorrow = tracker.get("key1", "2026-09-08");
         assert_eq!((tomorrow.requests, tomorrow.tokens), (0, 0));
+    }
+
+    /// The bug this guards against: a phone that had been running an older
+    /// build came back with "no such column: user_id" and refused to start,
+    /// because the index over that column was created before the migration
+    /// that adds it.
+    #[tokio::test]
+    async fn a_database_from_an_older_build_is_migrated_before_it_is_indexed() {
+        let dir = std::env::temp_dir().join(crate::util::new_id("store"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("relay.db");
+
+        // The shape the first release wrote: none of the columns added since.
+        let old = Connection::open(&file).unwrap();
+        old.execute_batch(
+            "CREATE TABLE requests (
+               id TEXT PRIMARY KEY, ts INTEGER NOT NULL,
+               day TEXT NOT NULL, hour TEXT NOT NULL,
+               key_id TEXT, public_model TEXT
+             );
+             INSERT INTO requests (id, ts, day, hour) VALUES ('old', 1, '2026-09-01', '00');",
+        )
+        .unwrap();
+        drop(old);
+
+        let store = Store::open(&file, Logger::console(crate::logging::Level::Silent))
+            .await
+            .expect("an older database must open, not refuse to start");
+        drop(store);
+
+        let conn = Connection::open(&file).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(requests)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (name, _) in schema::ADDED_COLUMNS {
+            assert!(columns.iter().any(|c| c == name), "{name} was not added");
+        }
+
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_requests_user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "the index over a migrated column must exist");
+
+        // And the rows that were already there survived.
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

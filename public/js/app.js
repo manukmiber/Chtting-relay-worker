@@ -13,6 +13,7 @@ import { playgroundView } from './views/playground.js';
 import { settingsView } from './views/settings.js';
 import { setupView } from './views/setup.js';
 import { logsView } from './views/logs.js';
+import { docsView } from './views/docs.js';
 
 const TABS = [
   ['setup', 'Setup', setupView],
@@ -26,6 +27,7 @@ const TABS = [
   ['tokenizer', 'Tokenizer', tokenizerView],
   ['playground', 'Playground', playgroundView],
   ['tunnel', 'Tunnel', tunnelView],
+  ['docs', 'API Docs', docsView],
   ['settings', 'Settings', settingsView],
   ['logs', 'Logs', logsView],
 ];
