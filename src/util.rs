@@ -34,35 +34,86 @@ fn to_base36(mut n: u64) -> String {
     String::from_utf8(out).expect("base36 alphabet is ascii")
 }
 
-/// A relay client key: long enough that guessing is hopeless.
+/// A version-4 UUID, the plain hyphenated form.
+///
+/// Hand-rolled rather than pulled in as a dependency: it is twelve lines over
+/// the same RNG the rest of this module already uses, and every crate left out
+/// of the tree is a crate that cannot fail to cross-compile for Android.
+pub fn new_uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    rand::rng().fill(&mut b);
+    // Version 4, variant 1 — the two fields RFC 9562 pins.
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex = |range: std::ops::Range<usize>| -> String {
+        b[range].iter().map(|x| format!("{x:02x}")).collect()
+    };
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    )
+}
+
+/// The symbols a client key may contain.
+///
+/// Printable ASCII minus the characters that make a key painful to move
+/// around: no space, no quote, no backslash or backtick (shells and JSON), no
+/// comma or semicolon (header and cookie separators), no slash (URLs). What is
+/// left is still wide enough that the alphabet is 84 characters.
+const KEY_SYMBOLS: &[u8] = b"!#$%&()*+-.:<=>?@[]^_{|}~";
+
+/// A relay client key: `Kunci-Zeiko-` and 32 characters mixing digits,
+/// lower case, upper case and symbols.
+///
+/// The mix is guaranteed rather than hoped for: one character of each class is
+/// placed first and then the whole tail is shuffled, so a key can never come
+/// out as 32 digits by chance.
 pub fn new_client_key() -> String {
-    let mut bytes = [0u8; 24];
-    rand::rng().fill(&mut bytes);
-    format!("sk-relay-{}", base64_url(&bytes))
+    const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const DIGIT: &[u8] = b"0123456789";
+    const LEN: usize = 32;
+
+    let mut rng = rand::rng();
+    let pick = |rng: &mut rand::rngs::ThreadRng, set: &[u8]| -> u8 {
+        set[rng.random_range(0..set.len())]
+    };
+
+    let mut out = vec![
+        pick(&mut rng, LOWER),
+        pick(&mut rng, UPPER),
+        pick(&mut rng, DIGIT),
+        pick(&mut rng, KEY_SYMBOLS),
+    ];
+    let all: Vec<u8> = LOWER
+        .iter()
+        .chain(UPPER)
+        .chain(DIGIT)
+        .chain(KEY_SYMBOLS)
+        .copied()
+        .collect();
+    while out.len() < LEN {
+        out.push(pick(&mut rng, &all));
+    }
+    // Fisher-Yates, so the guaranteed four are not always in the same places.
+    for i in (1..out.len()).rev() {
+        out.swap(i, rng.random_range(0..=i));
+    }
+
+    format!(
+        "Kunci-Zeiko-{}",
+        String::from_utf8(out).expect("every alphabet above is ascii")
+    )
 }
 
 pub fn random_hex(len: usize) -> String {
     let mut bytes = vec![0u8; len];
     rand::rng().fill(&mut bytes[..]);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn base64_url(bytes: &[u8]) -> String {
-    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-        let take = chunk.len() + 1;
-        for i in 0..take {
-            out.push(A[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
-        }
-    }
-    out
 }
 
 /// Constant-time compare that does not leak length through early return.
@@ -111,6 +162,28 @@ fn local(ts_ms: i64, tz: &Tz) -> DateTime<Tz> {
         .single()
         .unwrap_or_else(Utc::now);
     utc.with_timezone(tz)
+}
+
+/// The pieces of a wall-clock time a price rule and a log line both need.
+#[derive(Debug, Clone)]
+pub struct LocalParts {
+    /// 0-23 in the configured zone, never UTC — a peak-hour rule written for
+    /// Jakarta evenings must not fire at Jakarta lunchtime.
+    pub hour: u32,
+    /// Monday is 0, Sunday is 6.
+    pub weekday: u32,
+    /// The same instant as text, zone offset included.
+    pub stamp: String,
+}
+
+pub fn local_parts(ts_ms: i64, tz: &Tz) -> LocalParts {
+    use chrono::{Datelike, Timelike};
+    let at = local(ts_ms, tz);
+    LocalParts {
+        hour: at.hour(),
+        weekday: at.weekday().num_days_from_monday(),
+        stamp: at.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
+    }
 }
 
 /// Epoch millis of local midnight today, for "today" statistics.
@@ -270,6 +343,57 @@ mod tests {
     }
 
     #[test]
+    fn a_client_key_is_kunci_zeiko_and_thirty_two_mixed_characters() {
+        for _ in 0..200 {
+            let key = new_client_key();
+            let tail = key
+                .strip_prefix("Kunci-Zeiko-")
+                .expect("every key carries the prefix");
+            assert_eq!(tail.chars().count(), 32, "{key}");
+            assert!(tail.chars().any(|c| c.is_ascii_lowercase()), "{key}");
+            assert!(tail.chars().any(|c| c.is_ascii_uppercase()), "{key}");
+            assert!(tail.chars().any(|c| c.is_ascii_digit()), "{key}");
+            assert!(
+                tail.bytes().any(|b| KEY_SYMBOLS.contains(&b)),
+                "no symbol in {key}"
+            );
+            // It travels in an Authorization header, so nothing in it may be a
+            // character that header cannot carry.
+            assert!(
+                axum::http::HeaderValue::from_str(&format!("Bearer {key}")).is_ok(),
+                "{key} cannot go in a header"
+            );
+        }
+    }
+
+    #[test]
+    fn two_keys_are_never_the_same() {
+        let keys: std::collections::HashSet<String> =
+            (0..500).map(|_| new_client_key()).collect();
+        assert_eq!(keys.len(), 500);
+    }
+
+    #[test]
+    fn a_uuid_is_version_four_and_shaped_like_one() {
+        for _ in 0..200 {
+            let id = new_uuid_v4();
+            let parts: Vec<&str> = id.split('-').collect();
+            assert_eq!(
+                parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12],
+                "{id}"
+            );
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{id}");
+            assert!(parts[2].starts_with('4'), "not version 4: {id}");
+            assert!(
+                matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+                "not variant 1: {id}"
+            );
+        }
+        assert_ne!(new_uuid_v4(), new_uuid_v4());
+    }
+
+    #[test]
     fn masking_keeps_enough_to_recognise_but_not_to_use() {
         assert_eq!(mask_secret("sk-relay-abcdefghijklmnop"), "sk-rel…mnop");
         assert_eq!(mask_secret("short"), "•••••");
@@ -282,6 +406,20 @@ mod tests {
         let out = truncate(s, 3);
         assert!(out.starts_with("日本語"));
         assert!(out.contains("+7 chars"));
+    }
+
+    #[test]
+    fn local_parts_are_read_in_the_configured_zone_not_utc() {
+        // 2026-09-20T20:30:00Z is 2026-09-21, 03:30, in Jakarta: a different
+        // hour, a different day and a different weekday. A peak-hour price rule
+        // written for Jakarta evenings must not fire on this request.
+        let ts = 1_789_936_200_000;
+        let utc = local_parts(ts, &chrono_tz::UTC);
+        let jakarta = local_parts(ts, &"Asia/Jakarta".parse().unwrap());
+        assert_eq!(utc.hour, 20);
+        assert_eq!(jakarta.hour, 3);
+        assert_ne!(utc.weekday, jakarta.weekday);
+        assert!(jakarta.stamp.ends_with("+07:00"), "{}", jakarta.stamp);
     }
 
     #[test]

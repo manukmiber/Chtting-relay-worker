@@ -7,9 +7,13 @@
 //!
 //! One thing cannot move into the dashboard, and it is worth being plain about
 //! it: nothing can *start* a relay that is not running, because the dashboard
-//! is served by the relay. That is what the service, the boot hook and the
+//! is served by the relay. That is what the keeper, the boot hook and the
 //! home-screen shortcuts are for — between them, starting it needs no typing
 //! either.
+//!
+//! The keeper is a shell loop this module writes, not `termux-services`: that
+//! package is no longer in Termux's repositories, so anything built on `sv`
+//! supervises nothing. See [`Host::install_service`].
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -26,15 +30,11 @@ pub const SERVICE: &str = "chtting-relay";
 
 /// What the dashboard may install, and why anyone would want it.
 ///
-/// A short list on purpose: this hands a web page the package manager, so it
-/// is limited to the two packages the relay actually asks for.
-pub const PACKAGES: [(&str, &str); 2] = [
-    ("cloudflared", "the public tunnel"),
-    (
-        "termux-services",
-        "supervises the relay and brings it back if it dies",
-    ),
-];
+/// A short list on purpose: this hands a web page the package manager, so it is
+/// limited to what the relay actually asks for. `termux-services` used to be on
+/// it; it is gone from Termux's repositories, which is why the relay supervises
+/// itself now — see [`Host::install_service`].
+pub const PACKAGES: [(&str, &str); 1] = [("cloudflared", "the public tunnel")];
 
 /* ----------------------------------------------------------- the device -- */
 
@@ -145,162 +145,179 @@ impl Host {
 
     /* ----------------------------------------------------------- service -- */
 
-    fn service_dir(&self) -> Option<PathBuf> {
-        prefix().map(|p| p.join("var/service").join(SERVICE))
+    /// Where the keeper script and its pidfile live.
+    ///
+    /// Beside the relay's own state rather than in `$PREFIX/var/service`: there
+    /// is no runit to read that directory any more, and a script the user can
+    /// find and read beats one hidden inside the package tree. Keying it to the
+    /// state home rather than `$HOME` also means two installs run by `--home`
+    /// get a keeper each instead of fighting over one.
+    fn keeper_dir(&self) -> PathBuf {
+        self.paths.home.join(format!(".{SERVICE}"))
     }
 
-    /// What runit makes of the service, if runit is even here.
+    fn keeper_script(&self) -> PathBuf {
+        self.keeper_dir().join("keeper.sh")
+    }
+
+    /// Written by the keeper while it is running; removed when it exits.
+    fn keeper_pidfile(&self) -> PathBuf {
+        self.keeper_dir().join("keeper.pid")
+    }
+
+    /// Created to tell a running keeper not to start the relay again.
+    fn keeper_stopfile(&self) -> PathBuf {
+        self.keeper_dir().join("stopped")
+    }
+
+    /// Is a pid in a file still a process?
+    fn pid_alive(path: &Path) -> Option<u32> {
+        let pid: u32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+        Path::new(&format!("/proc/{pid}")).exists().then_some(pid)
+    }
+
+    /// What is keeping the relay alive, if anything.
     pub async fn service_status(&self) -> Value {
-        let dir = self.service_dir();
-        let installed = dir.as_ref().is_some_and(|d| d.join("run").is_file());
-        let wanted_down = dir.as_ref().is_some_and(|d| d.join("down").is_file());
-        let sv = on_path("sv").is_some();
+        let script = self.keeper_script();
+        let installed = script.is_file();
+        let pid = Self::pid_alive(&self.keeper_pidfile());
+        let stopped = self.keeper_stopfile().is_file();
 
-        let mut state = if !installed {
-            "not installed".to_string()
-        } else if wanted_down {
-            "installed, not started".to_string()
-        } else {
-            "installed".to_string()
+        let state = match (installed, pid, stopped) {
+            (false, _, _) => "not installed".to_string(),
+            (true, Some(pid), _) => format!("run: keeper (pid {pid})"),
+            (true, None, true) => "installed, told to stay down".to_string(),
+            (true, None, false) => "installed, not running".to_string(),
         };
-        let mut supervised = false;
-
-        if installed && sv {
-            if let Ok(out) = Command::new("sv").args(["status", SERVICE]).output().await {
-                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !line.is_empty() {
-                    supervised = line.starts_with("run:");
-                    state = line;
-                }
-            }
-        }
 
         json!({
             "installed": installed,
-            "supervised": supervised,
-            "svAvailable": sv,
+            // What the Setup screen asks: will this come back on its own?
+            "supervised": pid.is_some(),
+            "kind": "keeper",
+            "pid": pid,
+            "stopped": stopped,
             "state": state,
-            "path": dir.map(|d| d.to_string_lossy().into_owned()),
+            "path": script.to_string_lossy(),
         })
     }
 
-    /// Write the runit service, left stopped so it cannot race the copy that
-    /// is answering this very request for the port.
+    /// Write the keeper: a small shell loop that restarts the relay if it ever
+    /// exits.
+    ///
+    /// Termux used to ship `termux-services`, a runit setup that did this job,
+    /// and the relay used to install a `$PREFIX/var/service` directory for it.
+    /// That package is gone from the repositories, so a service directory now
+    /// supervises nothing — it just sits there looking installed. This replaces
+    /// it with something that depends on nothing but `sh`, which Termux cannot
+    /// stop shipping.
+    ///
+    /// The script is written but not started, so it cannot race the copy of the
+    /// relay that is answering this very request. `hand_over` starts it.
     pub async fn install_service(&self) -> Result<Value> {
-        let Some(dir) = self.service_dir() else {
-            bail!("no $PREFIX — a runit service only means something inside Termux");
-        };
+        let dir = self.keeper_dir();
+        let script = self.keeper_script();
+        tokio::fs::create_dir_all(&dir).await?;
+        let pidfile = self.keeper_pidfile();
+        let stopfile = self.keeper_stopfile();
 
-        let run = format!(
+        let body = format!(
             "#!{shell}\n\
              # Generated by chtting-relay. The dashboard rewrites this file.\n\
-             exec 2>&1\n\
-             cd {root} || exit 1\n\
+             # Keeps the relay running: if it exits for any reason, start it again.\n\
+             PIDFILE={pidfile}\n\
+             STOPFILE={stopfile}\n\
+             \n\
+             # One keeper at a time. A second one would fight the first over\n\
+             # restarts and end up with two relays racing for the same port.\n\
+             if [ -f \"$PIDFILE\" ] && kill -0 \"$(cat \"$PIDFILE\")\" 2>/dev/null; then\n\
+             \texit 0\n\
+             fi\n\
+             rm -f \"$STOPFILE\"\n\
+             echo $$ > \"$PIDFILE\"\n\
+             trap 'rm -f \"$PIDFILE\"' EXIT INT TERM\n\
+             \n\
              termux-wake-lock 2>/dev/null || true\n\
-             exec {binary} start --home {home}\n",
+             cd {root} || exit 1\n\
+             \n\
+             while :; do\n\
+             \t[ -f \"$STOPFILE\" ] && break\n\
+             \t{binary} start --home {home}\n\
+             \t[ -f \"$STOPFILE\" ] && break\n\
+             \t# A crash loop should not become a busy loop.\n\
+             \tsleep 3\n\
+             done\n\
+             rm -f \"$PIDFILE\"\n",
             shell = shell().display(),
+            pidfile = sh_quote(&pidfile.to_string_lossy()),
+            stopfile = sh_quote(&stopfile.to_string_lossy()),
             root = sh_quote(&self.paths.root.to_string_lossy()),
             binary = sh_quote(&self.binary().to_string_lossy()),
             home = sh_quote(&self.paths.home.to_string_lossy()),
         );
-        write_script(&dir.join("run"), &run).await?;
-
-        // termux-services ships a log runner; use it when it is there so the
-        // service's output lands somewhere readable instead of nowhere.
-        if let Some(svlogger) = prefix().map(|p| p.join("share/termux-services/svlogger")) {
-            if svlogger.is_file() {
-                let log = format!(
-                    "#!{shell}\nexec {svlogger} \"$@\"\n",
-                    shell = shell().display(),
-                    svlogger = sh_quote(&svlogger.to_string_lossy()),
-                );
-                write_script(&dir.join("log/run"), &log).await?;
-            }
-        }
-
-        // The relay is already running and holding the port. Until the handover
-        // this service must stay down, or runsv would spend the next hour
-        // restarting a copy that cannot bind.
-        tokio::fs::write(dir.join("down"), b"").await?;
+        write_script(&script, &body).await?;
         self.logger
-            .info(format!("service installed at {}", dir.display()));
+            .info(format!("keeper installed at {}", script.display()));
 
         let mut status = self.service_status().await;
         if let Some(map) = status.as_object_mut() {
             map.insert(
                 "note".into(),
-                Value::String(if on_path("sv").is_some() {
-                    "Installed and left stopped. \"Hand over\" restarts the relay under it.".into()
-                } else {
-                    "Installed. Install the termux-services package to supervise it.".into()
-                }),
+                Value::String(
+                    "Installed and not started yet. \"Hand over\" starts it, and from then \
+                     on the relay comes back on its own if it dies."
+                        .into(),
+                ),
             );
         }
         Ok(status)
     }
 
     pub async fn uninstall_service(&self) -> Result<Value> {
-        let Some(dir) = self.service_dir() else {
-            bail!("no $PREFIX — nothing to remove");
-        };
-        if dir.exists() {
-            // Ask runit to let go first; a supervised directory that vanishes
-            // underneath runsv leaves a stray supervisor behind.
-            if on_path("sv").is_some() {
-                let _ = Command::new("sv").args(["down", SERVICE]).output().await;
-            }
-            // A symlink from the older install script points at the repo, and
-            // removing the directory it points at would be the wrong thing.
-            let meta = tokio::fs::symlink_metadata(&dir).await?;
-            if meta.file_type().is_symlink() {
-                tokio::fs::remove_file(&dir).await?;
-            } else {
-                tokio::fs::remove_dir_all(&dir).await?;
-            }
-        }
+        // Tell a running keeper to stop before taking its script away, or it
+        // would keep restarting a relay from a file that no longer exists.
+        self.supervisor_down().await;
+        let _ = tokio::fs::remove_file(self.keeper_script()).await;
+        let _ = tokio::fs::remove_file(self.keeper_pidfile()).await;
         Ok(self.service_status().await)
     }
 
-    /// Tell runit we are meant to stay down.
+    /// Tell the keeper we are meant to stay down.
     ///
     /// Without this, stopping a supervised relay does nothing at all: the
-    /// process exits, runsv notices within the second and starts another one.
-    /// "Stop" has to mean stopped.
+    /// process exits, the keeper notices within three seconds and starts
+    /// another one. "Stop" has to mean stopped.
     pub async fn supervisor_down(&self) {
-        if on_path("sv").is_none() {
-            return;
+        let stopfile = self.keeper_stopfile();
+        if let Some(dir) = stopfile.parent() {
+            let _ = tokio::fs::create_dir_all(dir).await;
         }
-        // Bounded, because this runs on the way out and a hung `sv` must not be
-        // what keeps the relay alive.
-        let down = Command::new("sv")
-            .args(["-w", "1", "down", SERVICE])
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), down).await {
-            Ok(Ok(_)) => self.logger.info("runit asked to keep the service down"),
-            Ok(Err(err)) => self.logger.warn(format!("`sv down` failed: {err}")),
-            Err(_) => self.logger.warn("`sv down` timed out"),
+        if tokio::fs::write(&stopfile, b"stopped from the dashboard\n")
+            .await
+            .is_ok()
+        {
+            self.logger.info("keeper asked to stay down");
         }
+        // The keeper only reads the flag between relay runs, so a keeper that
+        // is idle in its `sleep 3` is left to notice on its own.
     }
 
-    /// Let the service take over: clear the stop flag, arrange for `sv up` to
-    /// run a moment after this process lets go of the port, and go.
+    /// Start the keeper, so it takes over supervising this relay.
+    ///
+    /// It does not have to wait for this process to let go of the port: both
+    /// relays bind with `SO_REUSEPORT`, so the new one is listening before the
+    /// old one stops, and nothing is refused in between.
     pub async fn hand_over(&self) -> Result<()> {
-        let Some(dir) = self.service_dir() else {
-            bail!("no $PREFIX — nothing to hand over to");
-        };
-        if !dir.join("run").is_file() {
-            bail!("no service installed yet");
+        let script = self.keeper_script();
+        if !script.is_file() {
+            bail!("no keeper installed yet");
         }
-        if on_path("sv").is_none() {
-            bail!("`sv` not found — install the termux-services package first");
-        }
-        let _ = tokio::fs::remove_file(dir.join("down")).await;
+        let _ = tokio::fs::remove_file(self.keeper_stopfile()).await;
 
-        // Detached on purpose: it has to outlive us, because what it waits for
-        // is us releasing the port.
+        // Detached on purpose: it has to outlive us, because supervising us is
+        // the whole job.
         Command::new(shell())
-            .arg("-c")
-            .arg(format!("sleep 2; sv up {SERVICE}"))
+            .arg(&script)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -328,14 +345,18 @@ impl Host {
         let Some(path) = self.boot_script() else {
             bail!("no $HOME — cannot place a boot script");
         };
-        // Under a service, booting means starting runit and letting it do the
-        // rest; without one, run the relay directly.
-        let body = if self.service_dir().is_some_and(|d| d.join("run").is_file()) {
+        // With a keeper installed, booting means starting the keeper and
+        // letting it start the relay — and keep starting it. Without one, run
+        // the relay directly, which at least gets it up.
+        let keeper = Some(self.keeper_script())
+            .filter(|p| p.is_file())
+            .map(|p| sh_quote(&p.to_string_lossy()));
+        let body = if let Some(keeper) = keeper {
             format!(
                 "#!{shell}\n\
                  # Generated by chtting-relay.\n\
                  termux-wake-lock 2>/dev/null || true\n\
-                 . $PREFIX/etc/profile.d/start-services.sh\n",
+                 exec {keeper}\n",
                 shell = shell().display(),
             )
         } else {
@@ -408,36 +429,57 @@ impl Host {
         let root = sh_quote(&self.paths.root.to_string_lossy());
         let binary = sh_quote(&self.binary().to_string_lossy());
         let home = sh_quote(&self.paths.home.to_string_lossy());
-        let supervised = self.service_dir().is_some_and(|d| d.join("run").is_file());
+        let keeper = Some(self.keeper_script())
+            .filter(|p| p.is_file())
+            .map(|p| sh_quote(&p.to_string_lossy()));
+        let stopfile = sh_quote(&self.keeper_stopfile().to_string_lossy());
 
-        let start = if supervised {
-            format!("#!{}\nsv up {SERVICE}\n", shell.display())
-        } else {
-            format!(
+        let start = match &keeper {
+            // The keeper starts the relay and keeps starting it; running it
+            // twice is harmless, because it checks its own pidfile first.
+            Some(keeper) => format!(
+                "#!{shell}\nrm -f {stopfile}\nexec {keeper}\n",
+                shell = shell.display()
+            ),
+            None => format!(
                 "#!{shell}\n\
                  termux-wake-lock 2>/dev/null || true\n\
                  cd {root} || exit 1\n\
                  exec {binary} start --home {home}\n",
                 shell = shell.display(),
-            )
+            ),
         };
         // `pkill -x`, never `-f`: matching the whole command line would match
         // this very script, whose name contains the relay's, and the shortcut
         // would kill itself before reaching the relay.
-        let stop = if supervised {
-            format!("#!{}\nsv down {SERVICE}\n", shell.display())
-        } else {
-            format!(
+        // `pkill -x`, never `-f`: matching the whole command line would match
+        // this very script, whose name contains the relay's, and the shortcut
+        // would kill itself before reaching the relay.
+        //
+        // The stop flag goes down before the relay does, or the keeper would
+        // have another one up within three seconds. "Stop" has to mean stopped.
+        let stop = match &keeper {
+            Some(_) => format!(
+                "#!{shell}\n\
+                 : > {stopfile}\n\
+                 pkill -x {SERVICE} || true\n\
+                 termux-wake-unlock 2>/dev/null || true\n",
+                shell = shell.display(),
+            ),
+            None => format!(
                 "#!{shell}\n\
                  pkill -x {SERVICE} || true\n\
                  termux-wake-unlock 2>/dev/null || true\n",
                 shell = shell.display(),
-            )
+            ),
         };
-        let restart = if supervised {
-            format!("#!{}\nsv restart {SERVICE}\n", shell.display())
-        } else {
-            format!(
+        let restart = match &keeper {
+            // Killing it is the restart: the keeper starts the next one.
+            Some(_) => format!(
+                "#!{shell}\nrm -f {stopfile}\npkill -x {SERVICE} || true\n",
+                shell = shell.display()
+            ),
+            None => format!(
                 "#!{shell}\n\
                  pkill -x {SERVICE} || true\n\
                  sleep 2\n\
@@ -445,7 +487,7 @@ impl Host {
                  cd {root} || exit 1\n\
                  exec {binary} start --home {home}\n",
                 shell = shell.display(),
-            )
+            ),
         };
         let open = format!(
             "#!{}\ntermux-open-url {}\n",
@@ -640,17 +682,66 @@ mod tests {
         assert_eq!(report["termux"], termux());
         assert_eq!(report["service"]["installed"], false);
         assert_eq!(report["wakeLock"]["held"], false);
-        assert!(report["packages"].as_array().is_some_and(|p| p.len() == 2));
+        assert!(report["packages"].as_array().is_some_and(|p| !p.is_empty()));
+        assert!(
+            !report.to_string().contains("termux-services"),
+            "termux-services is gone from Termux and must not be offered"
+        );
     }
 
     #[tokio::test]
-    async fn a_service_cannot_be_installed_without_a_termux_prefix() {
-        // The desktop test machine has no $PREFIX, which is exactly the case
-        // that has to fail with an explanation rather than a panic.
-        if prefix().is_some() {
-            return;
-        }
-        let err = host().install_service().await.unwrap_err().to_string();
-        assert!(err.contains("$PREFIX"), "{err}");
+    async fn the_keeper_restarts_the_relay_and_stops_when_told_to() {
+        let host = host();
+        assert_eq!(host.service_status().await["installed"], false);
+
+        let status = host.install_service().await.unwrap();
+        assert_eq!(status["installed"], true);
+        // Written but not started: it must not race the relay that is already
+        // holding the port.
+        assert_eq!(status["supervised"], false);
+
+        let script = std::fs::read_to_string(host.keeper_script()).unwrap();
+        assert!(script.contains("while :;"), "no restart loop:\n{script}");
+        assert!(script.contains("start --home"), "{script}");
+        assert!(script.contains("STOPFILE"), "no way to stop it:\n{script}");
+        assert!(
+            !script.contains("sv up") && !script.contains("termux-services"),
+            "the keeper must not depend on a package Termux no longer ships"
+        );
+
+        // "Stop" has to mean stopped, or the keeper starts another one.
+        host.supervisor_down().await;
+        assert!(host.keeper_stopfile().is_file());
+        assert_eq!(host.service_status().await["stopped"], true);
+
+        host.uninstall_service().await.unwrap();
+        assert_eq!(host.service_status().await["installed"], false);
+    }
+
+    #[tokio::test]
+    async fn the_keeper_is_a_shell_script_a_shell_will_accept() {
+        let host = host();
+        host.install_service().await.unwrap();
+        // Reading it and deciding it looks right is not the test; asking a
+        // shell to parse it is.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-n")
+            .arg(host.keeper_script())
+            .output()
+            .expect("a shell to check the script with");
+        assert!(
+            out.status.success(),
+            "the generated keeper is not valid shell: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn two_installs_under_different_homes_get_a_keeper_each() {
+        let a = host();
+        let b = host();
+        a.install_service().await.unwrap();
+        assert_ne!(a.keeper_script(), b.keeper_script());
+        assert_eq!(b.service_status().await["installed"], false);
     }
 }

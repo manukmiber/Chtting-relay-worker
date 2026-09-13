@@ -133,13 +133,13 @@ else
 fi
 
 say "3/4  wiring it into the phone"
-# The runit service, the home-screen shortcuts and the boot hook. All three are
-# also buttons on the dashboard's Setup screen, so nothing here is a one-way
-# door.
+# The keeper, the home-screen shortcuts and the boot hook. All three are also
+# buttons on the dashboard's Setup screen, so nothing here is a one-way door.
+#
+# There is no `pkg install termux-services` any more: that package is gone from
+# Termux's repositories, so the relay supervises itself with a small shell loop
+# the Setup screen writes.
 "$BIN" setup || echo "  (setup skipped — do it from the dashboard's Setup tab)"
-pkg install -y termux-services >/dev/null 2>&1 \
-  && echo "  termux-services installed" \
-  || echo "  termux-services not installed — the Setup tab can do it later"
 
 # The default; if you have moved the dashboard you already know where it is.
 DASH="http://127.0.0.1:8788"

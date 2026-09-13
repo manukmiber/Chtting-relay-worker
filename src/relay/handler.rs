@@ -14,9 +14,13 @@
 //!
 //! * **billed** — the body as sent upstream, system prompt included. What the
 //!   backend charges the relay.
-//! * **charged** — the caller's own share of that, with the system prompt the
-//!   relay injected taken back out. What they are shown and accounted for,
-//!   because they did not write that prompt and cannot see it.
+//! * **charged** — the relay's own count of the caller's own body, measured
+//!   before anything was injected. What they are shown and accounted for,
+//!   because they did not write the rest and cannot see it.
+//!
+//! Nothing the backend says about itself reaches the caller. Every reply is
+//! rebuilt from an envelope the relay owns — its own uuid, its own timestamp,
+//! its own model name — and only a named handful of fields are copied across.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
@@ -25,130 +29,30 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::{
-    ClientKey, Config, Model, RequestTransform, ResolvedResponseTransform, ResponseTransform,
+    ClientKey, Config, Model, Pricing, RequestTransform, ResolvedResponseTransform,
+    ResponseTransform,
 };
+use crate::pricing::{self, Effort, Priced, Shape};
 use crate::relay::error_response;
 use crate::relay::gate::{Admission, Ticket};
+use crate::relay::pace::Pacer;
 use crate::relay::sse::{self, SseParser, StreamRewriter};
+use crate::relay::trace::Trace;
 use crate::relay::transform::{
-    collect_tool_calls, compile_text_rules, rules_lookbehind, transform_chunk, transform_request,
-    transform_response, ReasoningState,
+    collect_tool_calls, compile_text_rules, rules_lookbehind, select_system_prompt,
+    transform_chunk, transform_request, transform_response, Identity, ReasoningState,
 };
 use crate::relay::upstream::Sent;
 use crate::state::AppState;
 use crate::store::{LedgerEntry, Phase, RequestRecord};
 use crate::tokenizer::chat::flatten_content;
 use crate::tokenizer::{reconcile_usage, LocalCount, Resolved, Usage};
-use crate::util::{day_key, hour_key, new_id, now_ms, round, truncate};
-
-use std::time::Instant;
-use chrono::Utc;
-use uuid::Uuid;
-
-// Fungsi membaca RAM process di Android/Linux (Zero Dependency, ~2µs)
-fn get_current_rss_mb() -> f64 {
-    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(rss_pages) = statm.split_whitespace().nth(1) {
-            if let Ok(pages) = rss_pages.parse::<u64>() {
-                return (pages * 4096) as f64 / (1024.0 * 1024.0);
-            }
-        }
-    }
-    0.0
-}
-
-pub async fn handle_chat_completion(...) {
-    // 5.a Request masuk: Generate UID v4 & Timestamp
-    let req_uid = Uuid::new_v4().to_string();
-    let req_start = Instant::now();
-    let start_timestamp = Utc::now().to_rfc3339();
-    
-    eprintln!("\n===================[ REQUEST START ]===================");
-    eprintln!("UID        : {}", req_uid);
-    eprintln!("Timestamp  : {}", start_timestamp);
-    eprintln!("Model      : {}", requested_model);
-
-    // 5.b Tokenizer Execution Duration
-    let tok_start = Instant::now();
-    let user_token_count = tokenizer.count_chat(&request_body.messages);
-    let tok_duration = tok_start.elapsed();
-    eprintln!("⏱️ Tokenizer Time   : {:.4}s ({} ms)", tok_duration.as_secs_f64(), tok_duration.as_millis());
-
-    // 5.c Inject System Prompt Duration
-    let inj_start = Instant::now();
-    let transformed_body = inject_system_prompt(&model_config, request_body);
-    let inj_duration = inj_start.elapsed();
-    eprintln!("⏱️ Prompt Injection : {:.4}s ({} ms)", inj_duration.as_secs_f64(), inj_duration.as_millis());
-
-    // Network metrics counter
-    let net_rx_bytes = raw_request_body.len();
-    let mut net_tx_bytes = 0usize;
-
-    // Upstream Request (Multi-key round robin)
-    let upstream_api_key = backend_config.get_active_api_key();
-    let send_start = Instant::now();
-    let mut first_token_time: Option<Instant> = None;
-
-    // 6. Token Per Second (TPS) Limiter Pacing Setup
-    let target_tps = model_config.target_tps.unwrap_or(0.0);
-    let token_interval = if target_tps > 0.0 {
-        std::time::Duration::from_secs_f64(1.0 / target_tps)
-    } else {
-        std::time::Duration::ZERO
-    };
-
-    // Saat menerima stream chunk:
-    // Pada chunk pertama:
-    if first_token_time.is_none() {
-        first_token_time = Some(Instant::now());
-        let ttft_dur = first_token_time.unwrap().duration_since(send_start);
-        eprintln!("⏱️ First Token (TTFT): {:.4}s ({} ms)", ttft_dur.as_secs_f64(), ttft_dur.as_millis());
-    }
-
-    // Pacing stream token jika target_tps disetel:
-    if target_tps > 0.0 {
-        tokio::time::sleep(token_interval).await;
-    }
-
-    // 5.e Selesai Request
-    let total_duration = req_start.elapsed();
-    eprintln!("⏱️ Total Request   : {:.4}s ({} ms)", total_duration.as_secs_f64(), total_duration.as_millis());
-
-    // Hitung Tiered Pricing
-    let current_hour = chrono::Local::now().hour();
-    let pricing_res = calculate_pricing(
-        &model_config.pricing,
-        final_prompt_tokens,
-        final_completion_tokens,
-        final_reasoning_tokens,
-        current_hour,
-    );
-
-    let ram_mb = get_current_rss_mb();
-    let ttft_ms = first_token_time.map(|t| t.duration_since(send_start).as_millis() as u64).unwrap_or(0);
-    let gen_dur = total_duration.as_secs_f64() - (ttft_ms as f64 / 1000.0);
-    let tps = if gen_dur > 0.0 { final_completion_tokens as f64 / gen_dur } else { 0.0 };
-
-    // 5.f UNIFIED SUMMARY LOG BLOCK
-    eprintln!("-------------------[ UNIFIED SUMMARY ]-------------------");
-    eprintln!("UID          : {}", req_uid);
-    eprintln!("RAM Usage    : {:.2} MB", ram_mb);
-    eprintln!("Network      : RX {} B | TX {} B", net_rx_bytes, net_tx_bytes);
-    eprintln!("Tokens       : In {} | Out {} (Reasoning: {}) | Cache: {}", 
-        final_prompt_tokens, final_completion_tokens, final_reasoning_tokens, cached_tokens);
-    eprintln!("Pricing      : Backend: ${:.6} | Proxy: ${:.6} | Profit: ${:.6}", 
-        pricing_res.backend_cost, pricing_res.proxy_price, pricing_res.profit);
-    eprintln!("Performance  : Latency: {} ms | TTFT: {} ms | TPS: {:.2}", 
-        total_duration.as_millis(), ttft_ms, tps);
-    eprintln!("=========================================================\n");
-
-    // Catat ke DB & logger memori
-}
+use crate::util::{day_key, hour_key, new_uuid_v4, now_ms, round, truncate};
 
 /// The outcome of an authentication attempt.
 pub enum Auth {
@@ -189,6 +93,48 @@ pub fn authenticate(cfg: &Config, secret: Option<&str>) -> Auth {
         },
         Some(key) => Auth::Ok(key.clone()),
     }
+}
+
+/// Who the caller says they are.
+///
+/// Requirement 22: this is the prompt-cache isolation key. OpenAI clients put
+/// it in the body's `user` field; everything else sends a header. Whichever
+/// arrives, the same string is recorded, logged and passed upstream, so two
+/// callers behind one API key never share a cache entry.
+pub fn user_id_of(body: &Value, headers: &HeaderMap) -> String {
+    let from_body = body
+        .get("user")
+        .or_else(|| body.get("user_id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(id) = from_body {
+        return id.to_string();
+    }
+    for name in ["x-user-id", "x-user", "x-openai-user", "x-kv-user"] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return value.to_string();
+        }
+    }
+    String::new()
+}
+
+/// The request body's size on the wire.
+///
+/// Taken from the header rather than by re-serialising the parsed body: the
+/// bytes are already gone by the time a handler runs, and re-encoding a 20 MB
+/// conversation to measure it would cost more than everything else here.
+fn body_bytes(headers: &HeaderMap) -> u64 {
+    headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 pub fn check_access(key: &ClientKey, model_id: &str) -> Result<(), String> {
@@ -240,16 +186,66 @@ struct Ctx {
     route: Model,
     resolved: Resolved,
     transform: ResolvedResponseTransform,
+    /// The envelope every reply is rebuilt into: the relay's own uuid, its own
+    /// timestamp, its own model name.
+    identity: Identity,
     record: RequestRecord,
     started: Instant,
     client_wants_stream: bool,
-    /// The locally measured prompt split: what the caller wrote, and the whole
-    /// body as sent. Their ratio is what the caller is charged.
+    /// The relay's own count of the caller's own body. What they are charged.
     user_local: u64,
-    billed_local: u64,
+    /// This route's price list, global and per-model already merged.
+    pricing: Pricing,
+    effort: Effort,
+    trace: Trace,
     /// What this request's input row already put in the ledger, if one was
     /// written.
     ledgered: Option<Ledgered>,
+}
+
+impl Ctx {
+    /// Price the request as it stands. Called once the token counts are final.
+    fn price(&self, usage: &Usage) -> Priced {
+        pricing::price(
+            &self.pricing,
+            &Shape {
+                model_id: self.route.id.clone(),
+                input_tokens: self.user_local,
+                cached_input_tokens: usage.cached_tokens,
+                output_tokens: usage.completion_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                effort: Some(self.effort),
+                hour: self.record.local_hour,
+                weekday: self.record.local_weekday,
+                streamed: self.client_wants_stream,
+            },
+        )
+    }
+
+    /// What the relay pays for the same request, at the backend's own rates
+    /// over the body the backend actually received.
+    fn backend_price(&self, billed: &Usage) -> Priced {
+        pricing::price(
+            &self.pricing,
+            &Shape {
+                model_id: self.route.id.clone(),
+                input_tokens: billed.prompt_tokens,
+                cached_input_tokens: billed.cached_tokens,
+                output_tokens: billed.completion_tokens,
+                reasoning_tokens: billed.reasoning_tokens,
+                effort: Some(self.effort),
+                hour: self.record.local_hour,
+                weekday: self.record.local_weekday,
+                streamed: self.client_wants_stream,
+            },
+        )
+    }
+
+    /// The `usage` block the caller gets, cost included.
+    fn usage_json(&self, charged: &Usage) -> Value {
+        let priced = self.price(charged);
+        charged.public(self.pricing.enabled.then_some(priced.proxy_usd))
+    }
 }
 
 /// The input figures already on the books, so the closing row can settle
@@ -282,6 +278,16 @@ struct Outcome<'a> {
     /// closing row settles against it instead of counting the same tokens a
     /// second time.
     ledgered: Option<Ledgered>,
+    /// What this request cost and what it sold for. Absent when the relay never
+    /// got far enough to know.
+    priced: Option<Priced>,
+    /// The backend's half of the same sum.
+    backend_priced: Option<Priced>,
+    /// Bytes written back to the caller.
+    bytes_out: u64,
+    /// Bytes read from the backend.
+    bytes_upstream: u64,
+    trace: Option<&'a Trace>,
 }
 
 /* ------------------------------------------------------------ dispatch -- */
@@ -298,13 +304,28 @@ pub async fn handle_chat(
     let started = Instant::now();
     let started_wall = now_ms();
     let tz = cfg.tz();
-    let id = new_id("req");
+    // Requirement 5a: a uuid, minted here, carried by every log line this
+    // request writes and by every byte of the reply it produces.
+    let id = new_uuid_v4();
+    let local = crate::util::local_parts(started_wall, &tz);
+    let trace = Trace::new(
+        state.logger.clone(),
+        &id,
+        cfg.logging.verbose_requests,
+    );
+    let effort = pricing::effort_of(&body);
+    let user_id = user_id_of(&body, headers);
 
     let mut record = RequestRecord {
         id: id.clone(),
         ts: started_wall,
         day: day_key(started_wall, &tz),
         hour: hour_key(started_wall, &tz),
+        local_hour: local.hour,
+        local_weekday: local.weekday,
+        user_id: truncate(&user_id, 120),
+        reasoning_effort: effort.as_str().to_string(),
+        bytes_in: body_bytes(headers),
         key_id: key.id.clone(),
         key_label: if key.label.is_empty() {
             key.id.clone()
@@ -330,6 +351,24 @@ pub async fn handle_chat(
     };
 
     let asked_for = record.public_model.clone();
+    trace.phase(
+        "in",
+        format!(
+            "{} model={asked_for} key={} user={} effort={} stream={} bytes={} ip={}",
+            local.stamp,
+            record.key_label,
+            if record.user_id.is_empty() {
+                "-"
+            } else {
+                &record.user_id
+            },
+            effort.as_str(),
+            body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+            record.bytes_in,
+            record.ip,
+        ),
+    );
+
     let Some(route) = cfg.find_model(&asked_for).filter(|m| m.enabled).cloned() else {
         let message = format!("model \"{asked_for}\" is not available on this relay");
         finish(
@@ -338,6 +377,7 @@ pub async fn handle_chat(
             Outcome {
                 status: 404,
                 error: &message,
+                trace: Some(&trace),
                 ..Default::default()
             },
         );
@@ -356,6 +396,7 @@ pub async fn handle_chat(
             Outcome {
                 status: 403,
                 error: &message,
+                trace: Some(&trace),
                 ..Default::default()
             },
         );
@@ -369,6 +410,7 @@ pub async fn handle_chat(
 
     record.backend_id = route.backend.clone();
     record.upstream_model = route.upstream_model.clone();
+    record.target_tps = route.max_tokens_per_second;
 
     // Take a slot before doing any real work. Tokenizing a long conversation
     // is the most expensive thing this relay does, so letting an unbounded
@@ -396,6 +438,7 @@ pub async fn handle_chat(
                 Outcome {
                     status: 503,
                     error: &message,
+                    trace: Some(&trace),
                     ..Default::default()
                 },
             );
@@ -413,6 +456,7 @@ pub async fn handle_chat(
                 Outcome {
                     status: 503,
                     error: &message,
+                    trace: Some(&trace),
                     ..Default::default()
                 },
             );
@@ -427,14 +471,38 @@ pub async fn handle_chat(
     // out. Both bodies go to the counter together because the figures come out
     // of one pass over the thread pool, not two. The tokenizer is the
     // *backend* model's, because that is the one that bills.
+    //
+    // Requirement 21: which system prompt goes in depends on how hard the
+    // caller asked the model to think, so the choice is made from their own
+    // body before anything is written into it.
     let rt = RequestTransform::merged(&cfg.defaults.request_transform, &route.request_transform);
-    let mut upstream_body = transform_request(&body, &route, &cfg, &rt);
+    let (prompt_spec, prompt_rule_id) = select_system_prompt(&route, effort);
+    record.prompt_id = prompt_rule_id.clone();
+
+    let injecting = Instant::now();
+    let mut upstream_body = transform_request(&body, &route, &cfg, &rt, prompt_spec);
+    record.inject_ms = round(injecting.elapsed().as_secs_f64() * 1000.0, 3);
+    trace.timed(
+        "inj",
+        record.inject_ms,
+        format!(
+            "rule={} mode={}",
+            if prompt_rule_id.is_empty() {
+                "default"
+            } else {
+                &prompt_rule_id
+            },
+            prompt_spec.mode,
+        ),
+    );
+
     let resolved = state.counter.resolve(
         &cfg,
         &route.upstream_model,
         &route.tokenizer,
         &route.chat_profile,
     );
+    let tokenizing = Instant::now();
     let input = state
         .counter
         .count_prompt(
@@ -444,15 +512,26 @@ pub async fn handle_chat(
             &cfg.tokenizer.image_defaults,
         )
         .await;
+    record.tokenize_ms = round(tokenizing.elapsed().as_secs_f64() * 1000.0, 3);
 
     // Charging for the injected prompt means treating the whole body as the
-    // caller's: same number on both sides of the ratio.
+    // caller's.
     let user_local = if cfg.tokenizer.bill_system_prompt_to_user {
         input.billed as u64
     } else {
         input.user as u64
     };
-    let billed_local = input.billed as u64;
+    trace.timed(
+        "tok",
+        record.tokenize_ms,
+        format!(
+            "{} caller / {} upstream  {} {}",
+            crate::relay::trace::grouped(user_local as i64),
+            crate::relay::trace::grouped(input.billed as i64),
+            input.tokenizer,
+            if input.exact { "exact" } else { "estimated" },
+        ),
+    );
     record.local_prompt = input.billed as i64;
     record.billed_prompt_tokens = input.billed as i64;
     record.user_prompt_tokens = user_local as i64;
@@ -474,6 +553,7 @@ pub async fn handle_chat(
             Outcome {
                 status: 413,
                 error: &message,
+                trace: Some(&trace),
                 ..Default::default()
             },
         );
@@ -485,8 +565,11 @@ pub async fn handle_chat(
         );
     }
 
+    // Requirement 22: what is kept is what the *caller* sent. Previewing the
+    // upstream body instead would file the relay's own system prompt under the
+    // caller's words, which is both misleading and a way to leak it.
     if cfg.logging.store_bodies != "none" {
-        record.req_preview = preview_request(&upstream_body, &cfg);
+        record.req_preview = preview_request(&body, &cfg);
     }
 
     let client_wants_stream = body
@@ -498,13 +581,22 @@ pub async fn handle_chat(
     let stream_upstream = rt.force_stream.unwrap_or(client_wants_stream);
     record.stream = i64::from(client_wants_stream);
 
+    let backend_cfg = cfg.find_backend(&route.backend).cloned();
+
     if let Some(map) = upstream_body.as_object_mut() {
+        // Requirement 22: the caller's own id goes upstream, because a backend
+        // that keys its prompt cache by user needs it to keep one caller's
+        // cache out of another's. It is the one thing about the caller that
+        // does travel, and only when the backend is set up to want it.
+        let forward = backend_cfg.as_ref().is_none_or(|b| b.forward_user_id);
+        if forward && !user_id.is_empty() {
+            map.insert("user".into(), Value::String(user_id.clone()));
+        } else if !forward {
+            map.remove("user");
+        }
         map.insert("stream".into(), Value::Bool(stream_upstream));
         if stream_upstream {
-            let wants_usage = cfg
-                .find_backend(&route.backend)
-                .map(|b| b.stream_options)
-                .unwrap_or(true);
+            let wants_usage = backend_cfg.as_ref().map(|b| b.stream_options).unwrap_or(true);
             if wants_usage {
                 map.insert(
                     "stream_options".into(),
@@ -519,7 +611,14 @@ pub async fn handle_chat(
     // Requirement 4: the request goes to the backend.
     let sent = state
         .upstream
-        .send_with_fallback(&cfg, &route, endpoint, &upstream_body, stream_upstream)
+        .send_with_fallback(
+            &cfg,
+            &route,
+            endpoint,
+            &upstream_body,
+            stream_upstream,
+            &user_id,
+        )
         .await;
 
     let sent = match sent {
@@ -535,6 +634,7 @@ pub async fn handle_chat(
                     status: err.status as i64,
                     error: &err.message,
                     started: Some(started),
+                    trace: Some(&trace),
                     ..Default::default()
                 },
             );
@@ -563,6 +663,7 @@ pub async fn handle_chat(
                     error: &truncate(&body, 500),
                     started: Some(started),
                     ledgered,
+                    trace: Some(&trace),
                     ..Default::default()
                 },
             );
@@ -585,11 +686,18 @@ pub async fn handle_chat(
                 route: route.clone(),
                 resolved,
                 transform,
+                identity: Identity {
+                    id: id.clone(),
+                    created: started_wall / 1000,
+                    model: route.id.clone(),
+                },
                 record,
                 started,
                 client_wants_stream,
                 user_local,
-                billed_local,
+                pricing: pricing::resolve(&cfg.pricing, &route),
+                effort,
+                trace: trace.clone(),
                 ledgered,
             };
 
@@ -633,6 +741,23 @@ struct Pumped {
     /// Set when the caller hung up, so the row is recorded as 499 rather than
     /// as an upstream failure.
     disconnected: bool,
+    /// Bytes read off the backend's socket, and bytes written to the caller's.
+    bytes_upstream: u64,
+    bytes_out: u64,
+}
+
+/// Send one frame, counting what went out.
+async fn emit_frame(
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    out: &mut Pumped,
+    frame: Bytes,
+) -> bool {
+    out.bytes_out += frame.len() as u64;
+    if tx.send(Ok(frame)).await.is_err() {
+        out.disconnected = true;
+        return false;
+    }
+    true
 }
 
 /// Consume the upstream SSE stream, optionally forwarding reshaped events.
@@ -649,12 +774,41 @@ async fn pump(
     let mut tool_calls: Map<String, Value> = Map::new();
     let mut prefix_sent = false;
 
+    // Requirement 6: the reply leaves at the speed the route asks for, not at
+    // whatever speed the backend managed. Reading is what gets held back, so
+    // the pause travels back up the TCP window instead of piling tokens up in
+    // this process's memory.
+    let mut pacer = Pacer::new(ctx.route.max_tokens_per_second);
+
+    // Requirement 17: the relay's own keep-alive, never the backend's. An SSE
+    // comment holds the connection open through cloudflared and every NAT on
+    // the way without saying anything about what is generating the answer.
+    let keepalive = Duration::from_millis(ctx.cfg.server.sse_keepalive_ms);
+    let keepalive_frame = sse::comment(&ctx.cfg.server.sse_keepalive_text);
+
     let mut stream = response.bytes_stream();
     // A streaming decoder, so a multi-byte character split across two network
     // chunks is reassembled rather than turning into replacement characters.
     let mut decoder = Utf8Decoder::default();
 
-    'outer: while let Some(chunk) = stream.next().await {
+    'outer: loop {
+        let next = match (emit, keepalive.is_zero()) {
+            // Nothing to hold open, or nothing to hold it open with.
+            (None, _) | (_, true) => stream.next().await,
+            (Some(tx), false) => loop {
+                match tokio::time::timeout(keepalive, stream.next()).await {
+                    Ok(item) => break item,
+                    Err(_) => {
+                        // The backend has gone quiet — a long reasoning pass,
+                        // usually. Say so in our own words and keep waiting.
+                        if !emit_frame(tx, &mut out, keepalive_frame.clone()).await {
+                            break 'outer;
+                        }
+                    }
+                }
+            },
+        };
+        let Some(chunk) = next else { break };
         let chunk = match chunk {
             Ok(c) => c,
             Err(err) => {
@@ -662,6 +816,7 @@ async fn pump(
                 break;
             }
         };
+        out.bytes_upstream += chunk.len() as u64;
 
         let text = decoder.push(&chunk);
         for event in parser.push(&text) {
@@ -714,7 +869,7 @@ async fn pump(
             out.reasoning.push_str(reasoning_delta);
 
             let mut shaped =
-                transform_chunk(&parsed, &ctx.route.id, &ctx.transform, &mut reasoning_state);
+                transform_chunk(&parsed, &ctx.identity, &ctx.transform, &mut reasoning_state);
 
             let Some(tx) = emit else { continue };
 
@@ -741,11 +896,11 @@ async fn pump(
                 if safe.is_empty() {
                     continue; // held back; it will be flushed later
                 }
+                pacer.hold(&safe).await;
                 set_delta_content(&mut shaped, &safe);
             }
 
-            if tx.send(Ok(sse::format_sse(&shaped))).await.is_err() {
-                out.disconnected = true;
+            if !emit_frame(tx, &mut out, sse::format_sse(&shaped)).await {
                 break 'outer;
             }
         }
@@ -768,10 +923,8 @@ async fn pump(
         if !out.disconnected {
             let tail = format!("{}{}", rewriter.flush(), ctx.transform.suffix);
             if !tail.is_empty() {
-                let chunk = delta_chunk(&ctx.record.id, &ctx.route.id, &tail);
-                if tx.send(Ok(sse::format_sse(&chunk))).await.is_err() {
-                    out.disconnected = true;
-                }
+                let chunk = delta_chunk(&ctx.identity, &tail);
+                emit_frame(tx, &mut out, sse::format_sse(&chunk)).await;
             }
         }
     }
@@ -792,22 +945,26 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
     let request_id = ctx.record.id.clone();
 
     tokio::spawn(async move {
-        let pumped = pump(response, &ctx, Some(&tx)).await;
+        let mut pumped = pump(response, &ctx, Some(&tx)).await;
         let billed = finalise_usage(&ctx, &pumped, true).await;
-        let charged = billed.charged_to_caller(ctx.user_local, ctx.billed_local);
+        let charged = billed.charged_to_caller(ctx.user_local);
 
         if !pumped.disconnected {
+            // Requirements 16 and 18: the closing frame carries the relay's own
+            // input count and what the request came to under the relay's own
+            // price list — never the backend's usage block, which stopped at
+            // the parser.
             if charged.prompt_tokens > 0 || charged.completion_tokens > 0 {
-                let chunk = usage_chunk(&ctx.record.id, &ctx.route.id, &charged);
-                let _ = tx.send(Ok(sse::format_sse(&chunk))).await;
+                let chunk = usage_chunk(&ctx.identity, &ctx.usage_json(&charged));
+                emit_frame(&tx, &mut pumped, sse::format_sse(&chunk)).await;
             }
             if let Some(err) = &pumped.error {
                 let chunk = serde_json::json!({
                     "error": {"message": err, "type": "upstream_error"}
                 });
-                let _ = tx.send(Ok(sse::format_sse(&chunk))).await;
+                emit_frame(&tx, &mut pumped, sse::format_sse(&chunk)).await;
             }
-            let _ = tx.send(Ok(Bytes::from_static(sse::DONE.as_bytes()))).await;
+            emit_frame(&tx, &mut pumped, Bytes::from_static(sse::DONE.as_bytes())).await;
         }
 
         record_stream_outcome(&ctx, &pumped, &billed, &charged);
@@ -837,9 +994,9 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
 
 /// Rebuild a normal chat completion from a stream we consumed ourselves.
 async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Response {
-    let pumped = pump(response, &ctx, None).await;
+    let mut pumped = pump(response, &ctx, None).await;
     let billed = finalise_usage(&ctx, &pumped, false).await;
-    let charged = billed.charged_to_caller(ctx.user_local, ctx.billed_local);
+    let charged = billed.charged_to_caller(ctx.user_local);
 
     let rules = compile_text_rules(&ctx.transform.replace);
     let body_text = match &rules {
@@ -852,8 +1009,7 @@ async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Respo
     );
 
     let assembled = assemble_completion(
-        &ctx.record.id,
-        &ctx.route.id,
+        &ctx.identity,
         &content,
         if ctx.transform.reasoning == "strip" {
             ""
@@ -866,16 +1022,38 @@ async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Respo
         } else {
             &pumped.finish_reason
         },
-        &charged,
+        &ctx.usage_json(&charged),
     );
 
+    let body = serde_json::to_vec(&assembled).unwrap_or_default();
+    pumped.bytes_out = body.len() as u64;
     record_stream_outcome(&ctx, &pumped, &billed, &charged);
-    json_with_id(&ctx.record.id, assembled)
+    json_with_id(&ctx.identity.id, assembled)
 }
 
 /// The path where the backend answered in one piece.
 async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
-    let payload: Value = match response.json().await {
+    let raw = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let message = format!("backend closed the connection: {err}");
+            finish(
+                &ctx.state,
+                ctx.record.clone(),
+                Outcome {
+                    status: 502,
+                    error: &message,
+                    started: Some(ctx.started),
+                    ledgered: ctx.ledgered,
+                    trace: Some(&ctx.trace),
+                    ..Default::default()
+                },
+            );
+            return error_response(502, &message, "upstream_error", None);
+        }
+    };
+    let bytes_upstream = raw.len() as u64;
+    let payload: Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(err) => {
             let message = format!("backend sent a response the relay could not parse: {err}");
@@ -887,6 +1065,8 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
                     error: &message,
                     started: Some(ctx.started),
                     ledgered: ctx.ledgered,
+                    bytes_upstream,
+                    trace: Some(&ctx.trace),
                     ..Default::default()
                 },
             );
@@ -894,7 +1074,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
         }
     };
 
-    let mut shaped = transform_response(&payload, &ctx.route.id, &ctx.transform);
+    let mut shaped = transform_response(&payload, &ctx.identity, &ctx.transform);
     let choice = shaped
         .get("choices")
         .and_then(|c| c.as_array())
@@ -946,10 +1126,10 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
         payload.get("usage"),
         ctx.cfg.tokenizer.prefer_upstream_usage,
     );
-    let charged = billed.charged_to_caller(ctx.user_local, ctx.billed_local);
+    let charged = billed.charged_to_caller(ctx.user_local);
 
     if let Some(map) = shaped.as_object_mut() {
-        map.insert("usage".into(), charged.public());
+        map.insert("usage".into(), ctx.usage_json(&charged));
     }
 
     let finish_reason = choice
@@ -964,11 +1144,21 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
     };
 
     let finished = Instant::now();
+    let usage_json = ctx.usage_json(&charged);
+    let out = if ctx.client_wants_stream {
+        // The backend could not stream, so replay the finished answer as SSE.
+        replay_as_sse(&ctx, &content, &usage_json)
+    } else {
+        json_with_id(&ctx.identity.id, shaped.clone())
+    };
+
     finish(
         &ctx.state,
         ctx.record.clone(),
         Outcome {
             status: 200,
+            error: "",
+            first_token_at: None,
             started: Some(ctx.started),
             last_token_at: Some(finished),
             billed: Some(&billed),
@@ -976,15 +1166,14 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
             finish_reason: &finish_reason,
             response_preview: &preview,
             ledgered: ctx.ledgered,
-            ..Default::default()
+            priced: Some(ctx.price(&charged)),
+            backend_priced: Some(ctx.backend_price(&billed)),
+            bytes_out: serde_json::to_vec(&shaped).map(|b| b.len() as u64).unwrap_or(0),
+            bytes_upstream,
+            trace: Some(&ctx.trace),
         },
     );
-
-    if ctx.client_wants_stream {
-        // The backend could not stream, so replay the finished answer as SSE.
-        return replay_as_sse(&ctx, &content, &charged);
-    }
-    json_with_id(&ctx.record.id, shaped)
+    out
 }
 
 /* ------------------------------------------------------------ helpers -- */
@@ -1056,6 +1245,11 @@ fn record_stream_outcome(ctx: &Ctx, pumped: &Pumped, billed: &Usage, charged: &U
             finish_reason: &pumped.finish_reason,
             response_preview: &preview,
             ledgered: ctx.ledgered,
+            priced: Some(ctx.price(charged)),
+            backend_priced: Some(ctx.backend_price(billed)),
+            bytes_out: pumped.bytes_out,
+            bytes_upstream: pumped.bytes_upstream,
+            trace: Some(&ctx.trace),
         },
     );
 }
@@ -1121,28 +1315,72 @@ fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
         0.0
     };
     record.res_preview = out.response_preview.to_string();
+    record.bytes_out = out.bytes_out;
+    record.bytes_upstream = out.bytes_upstream;
+    record.rss_mb = crate::relay::trace::rss_mb();
+    if let Some(priced) = &out.priced {
+        record.proxy_usd = priced.proxy_usd;
+        record.price_tiers = priced.tiers.join(", ");
+    }
+    // The relay's own cost is the backend's rates over the body the backend
+    // actually saw, which is a different token count to the one the caller is
+    // charged on — that gap is exactly what profit measures.
+    if let Some(backend) = &out.backend_priced {
+        record.backend_usd = backend.backend_usd;
+    }
+    record.profit_usd = round(record.proxy_usd - record.backend_usd, 9);
 
     let tag = if out.status >= 400 || out.status == 0 {
         "error"
     } else {
         "ok"
     };
-    state.logger.info(format!(
-        "{tag} {} -> {} {}in/{}out ttft={}ms total={}ms tps={} key={}{}",
-        record.public_model,
-        record.upstream_model,
-        record.prompt_tokens,
-        record.completion_tokens,
-        record.ttft_ms,
-        record.total_ms,
-        record.tokens_per_sec,
-        record.key_label,
-        if out.error.is_empty() {
-            String::new()
-        } else {
-            format!(" err={}", truncate(out.error, 160))
-        },
-    ));
+
+    // Requirement 5f: one line per request with everything on it, so a phone
+    // screen scrolling past shows what a request cost without anyone having to
+    // join two logs together.
+    match out.trace.filter(|t| t.enabled()) {
+        Some(trace) => {
+            if out.first_token_at.is_some() {
+                trace.timed("ttft", record.ttft_ms, "");
+            }
+            trace.timed(
+                "done",
+                record.total_ms,
+                format!(
+                    "status={} {}{}",
+                    record.status,
+                    if record.finish_reason.is_empty() {
+                        "-"
+                    } else {
+                        &record.finish_reason
+                    },
+                    if out.error.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" err={}", truncate(out.error, 160))
+                    },
+                ),
+            );
+            trace.phase("sum", summary_line(&record));
+        }
+        None => state.logger.info(format!(
+            "{tag} {} -> {} {}in/{}out ttft={}ms total={}ms tps={} key={}{}",
+            record.public_model,
+            record.upstream_model,
+            record.prompt_tokens,
+            record.completion_tokens,
+            record.ttft_ms,
+            record.total_ms,
+            record.tokens_per_sec,
+            record.key_label,
+            if out.error.is_empty() {
+                String::new()
+            } else {
+                format!(" err={}", truncate(out.error, 160))
+            },
+        )),
+    }
 
     state.quotas.record(
         &record.key_id,
@@ -1157,6 +1395,59 @@ fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
             .logger
             .warn("metrics queue is full; dropped a request row rather than blocking the relay");
     }
+}
+
+/// Everything one request did, on one line.
+///
+/// Written in the order the questions get asked: who, how much memory and
+/// network it took, what it counted, what it cost, and how fast it went.
+fn summary_line(r: &RequestRecord) -> String {
+    use crate::relay::trace::grouped;
+    let cache_rate = if r.prompt_tokens > 0 {
+        r.cached_tokens as f64 / r.prompt_tokens as f64 * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "uid={} model={} key={} user={} effort={} | ram={:.1}MB net={}B in/{}B out/{}B up | \
+         tok={} in ({} cached, {:.0}% hit) {} out ({} reasoning) | \
+         backend=${:.6} proxy=${:.6} profit=${:.6}{} | \
+         latency={}ms ttft={}ms tps={}{}",
+        r.id,
+        r.public_model,
+        if r.key_label.is_empty() { "-" } else { &r.key_label },
+        if r.user_id.is_empty() { "-" } else { &r.user_id },
+        if r.reasoning_effort.is_empty() {
+            "-"
+        } else {
+            &r.reasoning_effort
+        },
+        r.rss_mb,
+        grouped(r.bytes_in as i64),
+        grouped(r.bytes_out as i64),
+        grouped(r.bytes_upstream as i64),
+        grouped(r.prompt_tokens),
+        grouped(r.cached_tokens),
+        cache_rate,
+        grouped(r.completion_tokens),
+        grouped(r.reasoning_tokens),
+        r.backend_usd,
+        r.proxy_usd,
+        r.profit_usd,
+        if r.price_tiers.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", r.price_tiers)
+        },
+        r.total_ms,
+        r.ttft_ms,
+        r.tokens_per_sec,
+        if r.target_tps > 0.0 {
+            format!(" (held to {})", r.target_tps)
+        } else {
+            String::new()
+        },
+    )
 }
 
 /* -------------------------------------------------------------- ledger -- */
@@ -1269,35 +1560,34 @@ fn set_delta_content(chunk: &mut Value, content: &str) {
     }
 }
 
-fn delta_chunk(id: &str, model: &str, content: &str) -> Value {
+fn delta_chunk(identity: &Identity, content: &str) -> Value {
     serde_json::json!({
-        "id": id,
+        "id": identity.id,
         "object": "chat.completion.chunk",
-        "created": now_ms() / 1000,
-        "model": model,
+        "created": identity.created,
+        "model": identity.model,
         "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}],
     })
 }
 
-fn usage_chunk(id: &str, model: &str, usage: &Usage) -> Value {
+fn usage_chunk(identity: &Identity, usage: &Value) -> Value {
     serde_json::json!({
-        "id": id,
+        "id": identity.id,
         "object": "chat.completion.chunk",
-        "created": now_ms() / 1000,
-        "model": model,
+        "created": identity.created,
+        "model": identity.model,
         "choices": [],
-        "usage": usage.public(),
+        "usage": usage,
     })
 }
 
 fn assemble_completion(
-    id: &str,
-    model: &str,
+    identity: &Identity,
     content: &str,
     reasoning: &str,
     tool_calls: &[Value],
     finish_reason: &str,
-    usage: &Usage,
+    usage: &Value,
 ) -> Value {
     let mut message = serde_json::json!({"role": "assistant", "content": content});
     if let Some(map) = message.as_object_mut() {
@@ -1309,20 +1599,20 @@ fn assemble_completion(
         }
     }
     serde_json::json!({
-        "id": id,
+        "id": identity.id,
         "object": "chat.completion",
-        "created": now_ms() / 1000,
-        "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason, "logprobs": null}],
-        "usage": usage.public(),
+        "created": identity.created,
+        "model": identity.model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": usage,
     })
 }
 
 /// Replay a finished answer as SSE for callers that insisted on streaming.
-fn replay_as_sse(ctx: &Ctx, content: &str, usage: &Usage) -> Response {
-    let id = &ctx.record.id;
-    let model = &ctx.route.id;
-    let created = now_ms() / 1000;
+fn replay_as_sse(ctx: &Ctx, content: &str, usage: &Value) -> Response {
+    let id = &ctx.identity.id;
+    let model = &ctx.identity.model;
+    let created = ctx.identity.created;
     let mut body = Vec::new();
 
     body.extend_from_slice(&sse::format_sse(&serde_json::json!({
@@ -1343,7 +1633,7 @@ fn replay_as_sse(ctx: &Ctx, content: &str, usage: &Usage) -> Response {
     body.extend_from_slice(&sse::format_sse(&serde_json::json!({
         "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        "usage": usage.public(),
+        "usage": usage,
     })));
     body.extend_from_slice(sse::DONE.as_bytes());
 

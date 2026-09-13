@@ -271,19 +271,34 @@ async fn an_uninstalled_vocabulary_still_counts_but_says_it_is_an_estimate() {
 }
 
 #[tokio::test]
-async fn the_backends_own_usage_wins_and_the_difference_is_recorded_as_drift() {
+async fn the_backends_prompt_count_is_recorded_but_never_shown_to_the_caller() {
+    // Requirement 16: what the caller is told they sent is what this relay
+    // measured, not what the backend decided to bill for. The backend's figure
+    // still goes on the row — that is the operator's margin — and the gap
+    // between the two is recorded as drift.
     let mock = MockConfig {
         usage: Some(json!({"prompt_tokens": 111, "completion_tokens": 222})),
         ..Default::default()
     };
     let h = harness(mock, |_| {}).await;
-    h.post("/v1/chat/completions", chat("hello")).await;
+    let body: serde_json::Value = h
+        .post("/v1/chat/completions", chat("hello"))
+        .await
+        .json()
+        .await
+        .unwrap();
 
     let row = h.last_row().await;
-    assert_eq!(row["prompt_tokens"], 111);
+    let ours = row["user_prompt_tokens"].as_i64().unwrap();
+    assert!(ours > 0 && ours < 111, "the relay counted {ours}");
+    assert_eq!(row["prompt_tokens"], ours, "the row reports our own count");
+    assert_eq!(body["usage"]["prompt_tokens"], ours, "and so does the caller");
+    assert_eq!(
+        row["billed_prompt_tokens"], 111,
+        "what the backend charged is still on the books"
+    );
     assert_eq!(row["completion_tokens"], 222);
     assert_eq!(row["usage_source"], "upstream");
-    // The local count is kept beside it so the gap is visible.
     assert!(row["local_prompt"].as_i64().unwrap() > 0);
     assert_ne!(row["drift_prompt"], 0);
 }
@@ -397,14 +412,14 @@ async fn a_per_minute_rate_limit_refuses_with_retry_after() {
 
 #[tokio::test]
 async fn a_daily_token_quota_is_enforced_from_memory() {
-    // The backend reports a large usage, so one call is enough to blow a
-    // small daily budget regardless of how the prompt itself counts.
+    // One call is enough to blow a budget this small, and what it spends is
+    // what the caller is accounted for: their own prompt plus the reply.
     let mock = MockConfig {
         usage: Some(json!({"prompt_tokens": 40, "completion_tokens": 10})),
         ..Default::default()
     };
     let h = harness(mock, |cfg| {
-        cfg.keys[0].quota.tokens_per_day = 20;
+        cfg.keys[0].quota.tokens_per_day = 5;
     })
     .await;
 
@@ -417,7 +432,13 @@ async fn a_daily_token_quota_is_enforced_from_memory() {
     );
     // Wait for the row, which is also when the quota counter is updated.
     let row = h.last_row().await;
-    assert_eq!(row["total_tokens"], 50);
+    let spent = row["total_tokens"].as_i64().unwrap();
+    assert_eq!(
+        spent,
+        row["prompt_tokens"].as_i64().unwrap() + 10,
+        "the quota is spent on the caller's own count plus the reply"
+    );
+    assert!(spent > 5, "one call should already be over budget");
 
     let refused = h.post("/v1/chat/completions", chat("hello again")).await;
     assert_eq!(refused.status(), 429);

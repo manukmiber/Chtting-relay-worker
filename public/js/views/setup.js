@@ -101,7 +101,7 @@ export async function setupView(ctx) {
             toast(res.message, 'ok');
             body.prepend(card('Stopped', h('p.muted', {
               text: 'The relay has shut down. Start it from the chtting-relay-start '
-                + 'shortcut, or run: sv up chtting-relay',
+                + 'shortcut, or run: bash ~/.chtting-relay/keeper.sh',
             })));
           }),
         }, 'Stop relay'),
@@ -112,37 +112,38 @@ export async function setupView(ctx) {
           + 'relay can start the relay.',
       }),
 
-      /* ---- the supervisor ---- */
+      /* ---- the keeper ---- */
       h('hr'),
-      h('h3.small', { text: 'Supervisor' }),
+      h('h3.small', { text: 'Keeper' }),
       h('p.small.muted', {
-        text: 'With termux-services the relay is restarted whenever it dies and starts '
-          + 'again with Termux, so a closed session no longer takes it down.',
+        text: 'A small shell loop that starts the relay again whenever it exits, so a '
+          + 'closed Termux session or a crash no longer takes it down. It needs no '
+          + 'extra package: termux-services is gone from Termux, and this replaces it.',
       }),
       h('div.row', {},
         svc.installed
-          ? action('Remove service', async () => {
-            if (!confirmDialog('Remove the runit service?')) return;
+          ? action('Remove keeper', async () => {
+            if (!confirmDialog('Remove the keeper? The relay will no longer restart itself.')) return;
             await api.serviceAction('uninstall');
-            toast('Service removed', 'ok');
+            toast('Keeper removed', 'ok');
           })
-          : action('Install service', async () => {
+          : action('Install keeper', async () => {
             const res = await api.serviceAction('install');
-            toast(res.note ?? 'Service installed', 'ok');
+            toast(res.note ?? 'Keeper installed', 'ok');
           }, 'sm primary'),
-        svc.installed && !svc.supervised && svc.svAvailable
+        svc.installed && !svc.supervised
           ? h('button.sm.primary', {
             onclick: (ev) => busy(ev.currentTarget, async () => {
               const res = await api.serviceAction('hand-over');
               toast(res.message, 'ok');
               await waitForRelay();
             }),
-          }, 'Hand over to the service')
+          }, 'Hand over to the keeper')
           : null,
       ),
       svc.path ? h('p.small.muted.mono.path', { text: svc.path }) : null,
-      !svc.svAvailable
-        ? h('p.small.muted', { text: 'The termux-services package is not installed yet — see Packages below.' })
+      svc.supervised
+        ? h('p.small.muted', { text: `Running as pid ${svc.pid}. The relay comes back on its own if it dies.` })
         : null,
     )));
 

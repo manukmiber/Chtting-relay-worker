@@ -4,10 +4,12 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chtting_relay::config::{Backend, ConfigStore, Model};
 use chtting_relay::logging::{Level, Logger};
 use chtting_relay::server;
+use chtting_relay::rotate;
 use chtting_relay::state::{AppState, Paths};
 use chtting_relay::system::Host;
 use chtting_relay::tokenizer::registry::{BUILTIN_TIKTOKEN, HF_PRESETS};
@@ -41,11 +43,11 @@ enum Command {
     },
     /// Check the install and print what is and is not ready.
     Doctor,
-    /// Wire the relay into the phone: runit service, home-screen shortcuts,
-    /// start-on-boot. The installer runs this; afterwards the dashboard's
-    /// Setup screen does the same job with buttons.
+    /// Wire the relay into the phone: the keeper that restarts it, home-screen
+    /// shortcuts, start-on-boot. The installer runs this; afterwards the
+    /// dashboard's Setup screen does the same job with buttons.
     Setup {
-        /// Skip the runit service.
+        /// Skip the keeper.
         #[arg(long)]
         no_service: bool,
         /// Skip the Termux:Widget shortcuts.
@@ -241,27 +243,42 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
 
     // The phone suspends Termux the moment the screen goes off, which used to
     // be the start script's job to prevent. Doing it here means it happens
-    // however the relay was started — a shortcut, the boot hook, or runit.
+    // however the relay was started — a shortcut, the boot hook, or the keeper.
     if cfg.server.wake_lock && chtting_relay::system::termux() {
         state.host.acquire_wake_lock().await;
     }
 
-    // The public, tunnel-facing server.
+    // Requirement 19: an instance may be taking over from one that is still
+    // serving, so the ports are bound with SO_REUSEPORT and both are listening
+    // for as long as the handover takes.
+    let generation = rotate::generation();
+    if generation > 0 {
+        logger.info(format!(
+            "generation {generation}: taking over from the instance before it"
+        ));
+    }
+
+    // The public, tunnel-facing server. `retire` is what stops it accepting
+    // without dropping the requests it already has.
     let relay_addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
-    let relay = tokio::net::TcpListener::bind(relay_addr)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("cannot bind {relay_addr}: {err} — is another copy already running?")
-        })?;
+    let relay = listen(relay_addr).map_err(|err| {
+        anyhow::anyhow!("cannot bind {relay_addr}: {err} — is another copy already running?")
+    })?;
     let relay_bound = relay.local_addr()?;
     logger.info(format!("relay listening on http://{relay_bound}"));
 
+    let (retire, mut retire_rx) = tokio::sync::watch::channel(false);
     let relay_app = server::public::router(state.clone());
     let relay_task = tokio::spawn(async move {
         axum::serve(
             relay,
             relay_app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            // Resolves when the rotation says to stop accepting; axum then
+            // finishes the responses already in flight and returns.
+            let _ = retire_rx.changed().await;
+        })
         .await
     });
 
@@ -269,26 +286,50 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
     let mut dashboard_task = None;
     if cfg.dashboard.enabled && !no_dashboard {
         let addr: SocketAddr = format!("{}:{}", cfg.dashboard.host, cfg.dashboard.port).parse()?;
-        match tokio::net::TcpListener::bind(addr).await {
+        match listen(addr) {
             Ok(listener) => {
                 logger.info(format!(
                     "dashboard listening on http://{}",
                     listener.local_addr()?
                 ));
                 let app = server::dashboard::router(state.clone());
-                dashboard_task = Some(tokio::spawn(
-                    async move { axum::serve(listener, app).await },
-                ));
+                let mut retire_rx = retire.subscribe();
+                dashboard_task = Some(tokio::spawn(async move {
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            let _ = retire_rx.changed().await;
+                        })
+                        .await
+                }));
             }
             Err(err) => logger.error(format!("cannot bind the dashboard on {addr}: {err}")),
         }
     }
 
+    // Both ports are open, so anyone waiting on this instance can stand down.
+    rotate::announce_ready(&state).await;
+    rotate::sweep(&state).await;
+
+    // Requirement 9: the tunnel comes up with the relay and stays up. Not a
+    // one-shot attempt that gives up if the phone has no network yet a second
+    // after boot — ensure_running keeps trying, and the supervisor inside the
+    // manager brings cloudflared back if it dies later.
     if cfg.tunnel.auto_start && cfg.tunnel.mode != "off" {
-        match state.tunnel.start().await {
-            Ok(_) => logger.info("cloudflared starting"),
-            Err(err) => logger.warn(format!("tunnel did not start: {err}")),
-        }
+        let tunnel_state = state.clone();
+        let tunnel_logger = logger.clone();
+        tokio::spawn(async move {
+            // One cloudflared per relay: during a rotation the retiring
+            // instance still owns it, and starting a second would hand out a
+            // second quick-tunnel URL.
+            rotate::claim_tunnel(&tunnel_state).await;
+            tunnel_logger.info("cloudflared: bringing the tunnel up");
+            tunnel_state.tunnel.ensure_running();
+        });
+    }
+
+    // Requirement 19: retire on a clock, before Android decides to do it for us.
+    if cfg.server.rotate_hours > 0 {
+        rotate_on_a_clock(state.clone(), retire.clone());
     }
 
     // Housekeeping: expire rate-limit windows so an unbounded set of keys
@@ -311,10 +352,12 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
                 None => std::future::pending().await,
             }
         } => { result??; }
-        // Ctrl-C from a Termux session, SIGTERM from runit's `sv down`. Both
-        // mean the same thing and deserve the same tidy exit.
+        // Ctrl-C from a Termux session, SIGTERM from anything else. Both mean
+        // the same thing and deserve the same tidy exit.
         _ = shutdown_signal() => {
             logger.info("shutting down");
+            let _ = retire.send(true);
+            rotate::release_tunnel(&state).await;
             let _ = state.tunnel.stop().await;
             state.host.release_wake_lock().await;
             // Commit whatever the metrics writer still had queued.
@@ -322,6 +365,96 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Bind a listener that can share its port with the instance being replaced.
+///
+/// `SO_REUSEPORT` is what makes a zero-gap handover possible: the successor
+/// binds while the predecessor is still accepting, and the kernel hands new
+/// connections to whichever sockets are open. Without it the port would be
+/// refused until the old process let go, and every client connecting in that
+/// window would see a failure.
+///
+/// `SO_REUSEADDR` alone does not do this — it only allows binding over a socket
+/// in TIME_WAIT, not over one that is actively listening.
+fn listen(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    // The same backlog tokio's own bind uses.
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))
+}
+
+/// Retire this instance every `rotateHours`, handing over to a fresh one.
+///
+/// Ordering is everything here, and it is deliberately pessimistic: nothing
+/// this process owns is given up until the successor has confirmed it is
+/// listening. If the successor never comes up, this instance carries on and
+/// tries again at the next tick — a missed rotation is invisible, a failed
+/// handover would not be.
+fn rotate_on_a_clock(state: Arc<AppState>, retire: tokio::sync::watch::Sender<bool>) {
+    tokio::spawn(async move {
+        loop {
+            let cfg = state.config.current();
+            let hours = cfg.server.rotate_hours;
+            if hours == 0 {
+                return; // switched off while running
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(hours) * 3_600)).await;
+
+            let generation = rotate::generation();
+            state.logger.info(format!(
+                "rotating: generation {} has served {hours}h, starting generation {}",
+                generation,
+                generation + 1
+            ));
+
+            let pid = match rotate::spawn_successor(&state).await {
+                Ok(pid) => pid,
+                Err(err) => {
+                    state.logger.warn(format!(
+                        "rotation skipped, carrying on as generation {generation}: {err}"
+                    ));
+                    continue;
+                }
+            };
+
+            // The successor is listening on the same ports. From here new
+            // connections can only reach it, because this one stops accepting.
+            state.logger.info(format!(
+                "generation {} is up as pid {pid}; this one is draining",
+                generation + 1
+            ));
+            let _ = retire.send(true);
+
+            let timeout =
+                std::time::Duration::from_millis(state.config.current().server.rotate_drain_timeout_ms);
+            let stranded = rotate::drain(&state, timeout).await;
+            if stranded > 0 {
+                state.logger.warn(format!(
+                    "retiring with {stranded} request(s) still in flight after {timeout:?}"
+                ));
+            }
+
+            // The successor is waiting on this before starting its cloudflared.
+            let _ = state.tunnel.stop().await;
+            rotate::release_tunnel(&state).await;
+            state.store.flush().await;
+            state.logger.info("retired");
+            std::process::exit(0);
+        }
+    });
 }
 
 async fn shutdown_signal() {
@@ -452,7 +585,7 @@ async fn doctor(paths: Paths) -> Result<()> {
 /// to remember to start.
 async fn setup(paths: Paths, service: bool, shortcuts: bool, boot: bool) -> Result<()> {
     if !chtting_relay::system::termux() {
-        println!("not Termux — the service, shortcuts and boot hook are Termux-only.");
+        println!("not Termux — the keeper, shortcuts and boot hook are Termux-only.");
         return Ok(());
     }
 
@@ -465,10 +598,10 @@ async fn setup(paths: Paths, service: bool, shortcuts: bool, boot: bool) -> Resu
     if service {
         match host.install_service().await {
             Ok(status) => println!(
-                "  service     {}",
+                "  keeper      {}",
                 status["path"].as_str().unwrap_or("installed")
             ),
-            Err(err) => println!("  service     skipped: {err}"),
+            Err(err) => println!("  keeper      skipped: {err}"),
         }
     }
     if shortcuts {

@@ -1464,7 +1464,7 @@ async fn setup(State(dash): State<Arc<Dashboard>>) -> Response {
         if supervised {
             "Supervised: it comes back on its own if it dies.".into()
         } else if installed {
-            "Service installed but not started — hand over to it below.".into()
+            "Keeper installed but not started — hand over to it below.".into()
         } else {
             "Not supervised: closing Termux stops the relay.".into()
         },
@@ -1531,12 +1531,12 @@ async fn service_action(
         }
         "hand-over" => match host.hand_over().await {
             Ok(()) => {
-                state.logger.info("handing over to the runit service");
+                state.logger.info("handing over to the keeper");
                 leave(state.clone(), Ending::HandOver);
                 Ok(json!({
                     "ok": true,
                     "action": "hand-over",
-                    "message": "Handing over to the service — this page comes back \
+                    "message": "Handing over to the keeper — this page comes back \
                                 in a few seconds.",
                 }))
             }

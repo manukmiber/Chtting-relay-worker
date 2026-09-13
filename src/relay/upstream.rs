@@ -20,6 +20,8 @@ use crate::logging::Logger;
 pub struct Upstream {
     client: reqwest::Client,
     logger: Arc<Logger>,
+    /// Round-robin position per backend id, for backends with a key pool.
+    turns: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// The outcome of a call, once every backend on the route has had its turn.
@@ -80,7 +82,11 @@ impl Upstream {
             // per-attempt timeout below is what bounds a hung backend.
             .user_agent("chtting-relay/2.0")
             .build()?;
-        Ok(Self { client, logger })
+        Ok(Self {
+            client,
+            logger,
+            turns: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     pub fn client(&self) -> &reqwest::Client {
@@ -113,7 +119,13 @@ impl Upstream {
         }
     }
 
-    fn request(&self, backend: &Backend, endpoint: &str, stream: bool) -> reqwest::RequestBuilder {
+    fn request(
+        &self,
+        backend: &Backend,
+        endpoint: &str,
+        stream: bool,
+        user_id: &str,
+    ) -> reqwest::RequestBuilder {
         let url = Self::endpoint_url(backend, endpoint);
         let mut req = self
             .client
@@ -132,17 +144,54 @@ impl Upstream {
         for (k, v) in &backend.headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        if !backend.api_key.is_empty() {
+        let api_key = self.api_key_for(backend);
+        if !api_key.is_empty() {
             if backend.kind == "anthropic" {
-                req = req.header("x-api-key", &backend.api_key);
+                req = req.header("x-api-key", &api_key);
                 if !backend.headers.contains_key("anthropic-version") {
                     req = req.header("anthropic-version", "2023-06-01");
                 }
             } else {
-                req = req.header("authorization", format!("Bearer {}", backend.api_key));
+                req = req.header("authorization", format!("Bearer {api_key}"));
+            }
+        }
+        // The caller's own id, for a backend that keys its prompt cache by
+        // user. Header values are ASCII only, so an id that cannot be one is
+        // simply not sent rather than failing the request.
+        if backend.forward_user_id && !user_id.is_empty() && !backend.user_id_header.is_empty() {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(user_id) {
+                req = req.header(backend.user_id_header.as_str(), value);
             }
         }
         req
+    }
+
+    /// The next key from this backend's pool, or its single key.
+    ///
+    /// Round-robin over an atomic counter, one per backend id: a pool exists so
+    /// that a provider's per-key rate limit is not the relay's ceiling, and
+    /// spreading evenly is what makes that work. Keys are never picked at
+    /// random, because random is only even on average and a phone's traffic is
+    /// bursty enough for that to matter.
+    fn api_key_for(&self, backend: &Backend) -> String {
+        let pool: Vec<&String> = backend
+            .api_keys
+            .iter()
+            .filter(|k| !k.trim().is_empty())
+            .collect();
+        match pool.len() {
+            0 => backend.api_key.clone(),
+            1 => pool[0].clone(),
+            n => {
+                let turn = {
+                    let mut turns = self.turns.lock();
+                    let counter = turns.entry(backend.id.clone()).or_insert(0);
+                    *counter = counter.wrapping_add(1);
+                    *counter
+                };
+                pool[(turn as usize) % n].clone()
+            }
+        }
     }
 
     /// Send to one backend, retrying transient failures.
@@ -152,13 +201,14 @@ impl Upstream {
         endpoint: &str,
         body: &Value,
         stream: bool,
+        user_id: &str,
     ) -> Result<(reqwest::Response, u32), UpstreamError> {
         let max_attempts = backend.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
 
         for attempt in 1..=max_attempts {
             let result = self
-                .request(backend, endpoint, stream)
+                .request(backend, endpoint, stream, user_id)
                 .json(body)
                 .send()
                 .await;
@@ -219,6 +269,7 @@ impl Upstream {
         endpoint: &str,
         body: &Value,
         stream: bool,
+        user_id: &str,
     ) -> Result<Sent, UpstreamError> {
         let mut ids = vec![route.backend.clone()];
         ids.extend(route.fallbacks.iter().cloned());
@@ -239,7 +290,7 @@ impl Upstream {
                 continue;
             }
 
-            match self.send(backend, endpoint, body, stream).await {
+            match self.send(backend, endpoint, body, stream, user_id).await {
                 Ok((res, used)) => {
                     attempts += used;
                     if res.status().is_success() {

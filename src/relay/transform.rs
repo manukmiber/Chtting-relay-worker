@@ -13,8 +13,10 @@ use fancy_regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::config::{
-    Config, Model, ResolvedRequestTransform, ResolvedResponseTransform, SystemPromptSpec, TextRule,
+    Config, Model, ResolvedRequestTransform, ResolvedResponseTransform, SystemPromptRule,
+    SystemPromptSpec, TextRule,
 };
+use crate::pricing::Effort;
 use crate::tokenizer::chat::flatten_content;
 
 /* ---------------------------------------------------------- text rules -- */
@@ -118,6 +120,7 @@ pub fn transform_request(
     route: &Model,
     cfg: &Config,
     rt: &ResolvedRequestTransform,
+    prompt: &SystemPromptSpec,
 ) -> Value {
     let mut out = body.clone();
     let Some(map) = out.as_object_mut() else {
@@ -146,7 +149,7 @@ pub fn transform_request(
     }
 
     if let Some(messages) = map.get("messages").and_then(|v| v.as_array()).cloned() {
-        let injected = inject_system_prompt(&messages, &route.system_prompt, cfg);
+        let injected = inject_system_prompt(&messages, prompt, cfg);
         let rewritten = match compile_text_rules(&rt.replace) {
             Some(rules) => injected
                 .iter()
@@ -191,6 +194,55 @@ pub fn transform_request(
     }
 
     out
+}
+
+/// Pick the system prompt this request should get.
+///
+/// A model may carry several: one for callers who asked for no reasoning, one
+/// for the ones who asked for all of it, and any number in between. The first
+/// enabled rule that answers for this effort wins; when none does, the model's
+/// plain `systemPrompt` is what gets injected, exactly as before.
+///
+/// Returns the rule's id alongside the spec, so the request row can record
+/// which prompt a given answer was produced under.
+pub fn select_system_prompt<'a>(route: &'a Model, effort: Effort) -> (&'a SystemPromptSpec, String) {
+    for rule in route.system_prompts.iter().filter(|r| r.enabled) {
+        if rule_answers(rule, effort) {
+            return (&rule.prompt, rule.id.clone());
+        }
+    }
+    (&route.system_prompt, String::new())
+}
+
+fn rule_answers(rule: &SystemPromptRule, effort: Effort) -> bool {
+    if !rule.efforts.is_empty() {
+        return rule
+            .efforts
+            .iter()
+            .filter_map(|name| Effort::parse(name))
+            .any(|e| e == effort);
+    }
+    if rule.min_effort.is_empty() && rule.max_effort.is_empty() {
+        // No condition at all: an unconditional override, which is a legitimate
+        // way to say "this model always uses this prompt".
+        return true;
+    }
+    // Ranked bounds are a statement about callers who chose an effort. Silence
+    // is not a choice, so it falls through to the model's default prompt.
+    let Some(rank) = effort.rank() else {
+        return false;
+    };
+    if let Some(min) = Effort::parse(&rule.min_effort).and_then(Effort::rank) {
+        if rank < min {
+            return false;
+        }
+    }
+    if let Some(max) = Effort::parse(&rule.max_effort).and_then(Effort::rank) {
+        if rank > max {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolve the prompt text for a route, allowing a shared library entry.
@@ -306,64 +358,146 @@ fn rewrite_message(msg: &Value, rules: &CompiledRules) -> Value {
 
 /* ------------------------------------------------------------ response -- */
 
-/// Reshape a complete (non-streamed) chat completion.
-pub fn transform_response(
-    body: &Value,
-    public_model: &str,
-    transform: &ResolvedResponseTransform,
-) -> Value {
-    let mut out = body.clone();
-    let Some(map) = out.as_object_mut() else {
-        return out;
-    };
-    let rules = compile_text_rules(&transform.replace);
+/// Who the answer says it is.
+///
+/// Every field here is the relay's own: a uuid it minted, the moment it took
+/// the request, and the public model name. None of it comes from the backend,
+/// which is the whole point — see [`rebuild`].
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub id: String,
+    pub created: i64,
+    pub model: String,
+}
 
-    if transform.rename_model && !public_model.is_empty() {
-        map.insert("model".into(), Value::String(public_model.to_string()));
-    }
-    for field in &transform.strip_fields {
-        map.remove(field);
-    }
+/// The keys a delta may carry outward. Everything else the backend puts in one
+/// is dropped.
+const DELTA_KEYS: [&str; 5] = [
+    "role",
+    "content",
+    "reasoning_content",
+    "reasoning",
+    "tool_calls",
+];
 
-    if let Some(choices) = map.get("choices").and_then(|v| v.as_array()).cloned() {
-        let choices: Vec<Value> = choices
-            .into_iter()
-            .map(|mut choice| {
-                if let Some(c) = choice.as_object_mut() {
-                    if let Some(message) = c.get("message").cloned() {
-                        c.insert(
-                            "message".into(),
-                            transform_message(&message, transform, &rules),
-                        );
-                    }
-                    if let Some(Value::String(text)) = c.get("text").cloned() {
-                        c.insert(
-                            "text".into(),
-                            Value::String(apply_text(&text, transform, &rules)),
-                        );
-                    }
-                }
-                choice
-            })
-            .collect();
-        map.insert("choices".into(), Value::Array(choices));
-    }
+/// The keys an assembled message may carry outward.
+const MESSAGE_KEYS: [&str; 5] = [
+    "role",
+    "content",
+    "reasoning_content",
+    "reasoning",
+    "tool_calls",
+];
 
-    for (k, v) in &transform.set_fields {
-        map.insert(k.clone(), v.clone());
+/// Start a reply envelope from nothing.
+///
+/// Reshaping by deletion is the wrong way round: it only removes what someone
+/// thought to name, so the day a backend adds a field, that field ships. This
+/// builds the envelope from the relay's own values and copies across only the
+/// handful of keys below, so a new field upstream is not a leak here — it is
+/// simply not copied. `system_fingerprint`, the backend's request id, its
+/// `created`, its model name and its `service_tier` all stop at this line.
+fn rebuild(identity: &Identity, object: &str) -> Map<String, Value> {
+    let mut out = Map::with_capacity(5);
+    out.insert("id".into(), Value::String(identity.id.clone()));
+    out.insert("object".into(), Value::String(object.to_string()));
+    out.insert("created".into(), Value::from(identity.created));
+    out.insert("model".into(), Value::String(identity.model.clone()));
+    out
+}
+
+/// Copy the allowed keys of `from` into a fresh map.
+fn only(from: &Map<String, Value>, keys: &[&str]) -> Map<String, Value> {
+    let mut out = Map::with_capacity(keys.len());
+    for key in keys {
+        if let Some(value) = from.get(*key) {
+            if !value.is_null() {
+                out.insert((*key).to_string(), value.clone());
+            }
+        }
     }
     out
 }
 
+fn finish_reason_of(choice: &Value) -> Value {
+    match choice.get("finish_reason") {
+        Some(v) if !v.is_null() => v.clone(),
+        _ => Value::Null,
+    }
+}
+
+fn index_of(choice: &Value) -> u64 {
+    choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+/// Reshape a complete (non-streamed) chat completion.
+pub fn transform_response(
+    body: &Value,
+    identity: &Identity,
+    transform: &ResolvedResponseTransform,
+) -> Value {
+    let rules = compile_text_rules(&transform.replace);
+    let mut map = rebuild(identity, "chat.completion");
+    // A route may opt out of the rename, in which case the backend's own name
+    // is what goes out — a deliberate choice, and the only way its name ever
+    // leaves this process.
+    if !transform.rename_model {
+        if let Some(model) = body.get("model").filter(|v| v.is_string()) {
+            map.insert("model".into(), model.clone());
+        }
+    }
+
+    let choices: Vec<Value> = body
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .map(|choices| {
+            choices
+                .iter()
+                .map(|choice| {
+                    let mut out = Map::with_capacity(4);
+                    out.insert("index".into(), Value::from(index_of(choice)));
+                    if let Some(message) = choice.get("message").and_then(|m| m.as_object()) {
+                        out.insert(
+                            "message".into(),
+                            transform_message(message, transform, &rules),
+                        );
+                    }
+                    // The legacy completions shape, which has text where chat
+                    // has a message.
+                    if let Some(Value::String(text)) = choice.get("text") {
+                        out.insert(
+                            "text".into(),
+                            Value::String(apply_text(text, transform, &rules)),
+                        );
+                    }
+                    out.insert("finish_reason".into(), finish_reason_of(choice));
+                    Value::Object(out)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    map.insert("choices".into(), Value::Array(choices));
+
+    // Applied last so an operator can still strip or add whatever they want on
+    // top of the rebuilt envelope.
+    for field in &transform.strip_fields {
+        map.remove(field);
+    }
+    for (k, v) in &transform.set_fields {
+        map.insert(k.clone(), v.clone());
+    }
+    Value::Object(map)
+}
+
 fn transform_message(
-    message: &Value,
+    message: &Map<String, Value>,
     transform: &ResolvedResponseTransform,
     rules: &Option<CompiledRules>,
 ) -> Value {
-    let mut out = message.clone();
-    let Some(m) = out.as_object_mut() else {
-        return out;
-    };
+    let mut m = only(message, &MESSAGE_KEYS);
+    m.entry("role".to_string())
+        .or_insert_with(|| Value::String("assistant".into()));
+
     let reasoning = m
         .get("reasoning_content")
         .or_else(|| m.get("reasoning"))
@@ -405,7 +539,7 @@ fn transform_message(
             Value::String(apply_text(&content, transform, rules)),
         );
     }
-    out
+    Value::Object(m)
 }
 
 fn apply_text(
@@ -430,102 +564,120 @@ pub struct ReasoningState {
     pub open: bool,
 }
 
-/// Reshape one streamed chunk.
+/// Reshape one streamed chunk, rebuilt from nothing exactly as
+/// [`transform_response`] is.
+///
+/// The backend's `usage` is deliberately not carried over: the relay reports
+/// the input it counted itself, not the one the backend billed, and it sends
+/// that in a closing chunk of its own.
 ///
 /// Text rewriting is *not* done here: the caller runs it through a
 /// [`crate::relay::sse::StreamRewriter`] so a pattern can span chunk
 /// boundaries. This handles the structural parts only.
 pub fn transform_chunk(
     chunk: &Value,
-    public_model: &str,
+    identity: &Identity,
     transform: &ResolvedResponseTransform,
     state: &mut ReasoningState,
 ) -> Value {
-    let mut out = chunk.clone();
-    let Some(map) = out.as_object_mut() else {
-        return out;
-    };
-
-    if transform.rename_model && !public_model.is_empty() {
-        map.insert("model".into(), Value::String(public_model.to_string()));
+    let mut map = rebuild(identity, "chat.completion.chunk");
+    if !transform.rename_model {
+        if let Some(model) = chunk.get("model").filter(|v| v.is_string()) {
+            map.insert("model".into(), model.clone());
+        }
     }
+
+    let choices: Vec<Value> = chunk
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .map(|choices| {
+            choices
+                .iter()
+                .map(|choice| {
+                    let finish_reason = finish_reason_of(choice);
+                    let mut out = Map::with_capacity(3);
+                    out.insert("index".into(), Value::from(index_of(choice)));
+                    let delta = choice
+                        .get("delta")
+                        .and_then(|d| d.as_object())
+                        .map(|d| only(d, &DELTA_KEYS))
+                        .unwrap_or_default();
+                    out.insert(
+                        "delta".into(),
+                        Value::Object(transform_delta(
+                            delta,
+                            transform,
+                            state,
+                            !finish_reason.is_null(),
+                        )),
+                    );
+                    out.insert("finish_reason".into(), finish_reason);
+                    Value::Object(out)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    map.insert("choices".into(), Value::Array(choices));
+
     for field in &transform.strip_fields {
         map.remove(field);
     }
-
-    if let Some(choices) = map.get("choices").and_then(|v| v.as_array()).cloned() {
-        let choices: Vec<Value> = choices
-            .into_iter()
-            .map(|mut choice| {
-                let finish_reason = choice
-                    .get("finish_reason")
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false);
-                let Some(c) = choice.as_object_mut() else {
-                    return choice;
-                };
-                let Some(Value::Object(mut delta)) = c.get("delta").cloned() else {
-                    return choice;
-                };
-
-                let reasoning = delta
-                    .get("reasoning_content")
-                    .or_else(|| delta.get("reasoning"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let content = delta
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                match transform.reasoning.as_str() {
-                    "strip" => {
-                        delta.remove("reasoning_content");
-                        delta.remove("reasoning");
-                    }
-                    "inline" => {
-                        if let Some(r) = &reasoning {
-                            let open = if state.open {
-                                ""
-                            } else {
-                                state.open = true;
-                                transform.reasoning_open.as_str()
-                            };
-                            delta.insert(
-                                "content".into(),
-                                Value::String(format!("{open}{r}{content}")),
-                            );
-                        } else if state.open && (!content.is_empty() || finish_reason) {
-                            state.open = false;
-                            delta.insert(
-                                "content".into(),
-                                Value::String(format!("{}{content}", transform.reasoning_close)),
-                            );
-                        }
-                        delta.remove("reasoning_content");
-                        delta.remove("reasoning");
-                    }
-                    "field" => {
-                        if let Some(r) = &reasoning {
-                            delta.insert("reasoning".into(), Value::String(r.clone()));
-                        }
-                        delta.remove("reasoning_content");
-                    }
-                    _ => {}
-                }
-
-                c.insert("delta".into(), Value::Object(delta));
-                choice
-            })
-            .collect();
-        map.insert("choices".into(), Value::Array(choices));
-    }
-
     for (k, v) in &transform.set_fields {
         map.insert(k.clone(), v.clone());
     }
-    out
+    Value::Object(map)
+}
+
+fn transform_delta(
+    mut delta: Map<String, Value>,
+    transform: &ResolvedResponseTransform,
+    state: &mut ReasoningState,
+    finished: bool,
+) -> Map<String, Value> {
+    let reasoning = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let content = delta
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    match transform.reasoning.as_str() {
+        "strip" => {
+            delta.remove("reasoning_content");
+            delta.remove("reasoning");
+        }
+        "inline" => {
+            if let Some(r) = &reasoning {
+                let open = if state.open {
+                    ""
+                } else {
+                    state.open = true;
+                    transform.reasoning_open.as_str()
+                };
+                delta.insert("content".into(), Value::String(format!("{open}{r}{content}")));
+            } else if state.open && (!content.is_empty() || finished) {
+                state.open = false;
+                delta.insert(
+                    "content".into(),
+                    Value::String(format!("{}{content}", transform.reasoning_close)),
+                );
+            }
+            delta.remove("reasoning_content");
+            delta.remove("reasoning");
+        }
+        "field" => {
+            if let Some(r) = &reasoning {
+                delta.insert("reasoning".into(), Value::String(r.clone()));
+            }
+            delta.remove("reasoning_content");
+        }
+        _ => {}
+    }
+    delta
 }
 
 /// Merge streamed `tool_calls` deltas into whole calls, keyed by index.
@@ -579,6 +731,14 @@ mod tests {
     use super::*;
     use crate::config::{Backend, ResponseTransform, SystemPrompt};
 
+    fn identity(model: &str) -> Identity {
+        Identity {
+            id: "7f3a11d2-9b0c-4f6e-8a21-5c7d9e0b1a34".into(),
+            created: 1_789_263_746,
+            model: model.into(),
+        }
+    }
+
     fn cfg_with_route() -> (Config, Model) {
         let mut cfg = Config::default();
         cfg.backends.push(Backend {
@@ -604,7 +764,7 @@ mod tests {
             "model": "manukmiberai/creative-writer",
             "messages": [{"role": "user", "content": "halo"}],
         });
-        let out = transform_request(&body, &route, &cfg, &ResolvedRequestTransform::default());
+        let out = transform_request(&body, &route, &cfg, &ResolvedRequestTransform::default(), &route.system_prompt);
         assert_eq!(out["model"], "Deepseek-v4-flash-0731");
     }
 
@@ -619,7 +779,7 @@ mod tests {
             .insert("top_p".into(), serde_json::json!(0.9));
 
         let body = serde_json::json!({"temperature": 0.1, "top_p": 0.1, "messages": []});
-        let out = transform_request(&body, &route, &cfg, &ResolvedRequestTransform::default());
+        let out = transform_request(&body, &route, &cfg, &ResolvedRequestTransform::default(), &route.system_prompt);
         assert_eq!(
             out["temperature"], 0.1,
             "a default must not override the caller"
@@ -635,19 +795,19 @@ mod tests {
 
         let asked_more = serde_json::json!({"max_tokens": 4000, "messages": []});
         assert_eq!(
-            transform_request(&asked_more, &route, &cfg, &rt)["max_tokens"],
+            transform_request(&asked_more, &route, &cfg, &rt, &route.system_prompt)["max_tokens"],
             100
         );
 
         let asked_less = serde_json::json!({"max_tokens": 50, "messages": []});
         assert_eq!(
-            transform_request(&asked_less, &route, &cfg, &rt)["max_tokens"],
+            transform_request(&asked_less, &route, &cfg, &rt, &route.system_prompt)["max_tokens"],
             50
         );
 
         let asked_nothing = serde_json::json!({"messages": []});
         assert_eq!(
-            transform_request(&asked_nothing, &route, &cfg, &rt)["max_tokens"],
+            transform_request(&asked_nothing, &route, &cfg, &rt, &route.system_prompt)["max_tokens"],
             100
         );
     }
@@ -732,7 +892,7 @@ mod tests {
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "tell me about DeepSeek"}]
         });
-        let out = transform_request(&body, &route, &cfg, &rt);
+        let out = transform_request(&body, &route, &cfg, &rt, &route.system_prompt);
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(
             messages[0]["content"], "You are DeepSeek",
@@ -749,7 +909,7 @@ mod tests {
             "model": "Deepseek-v4-flash-0731",
             "choices": [{"message": {"role": "assistant", "content": "hello"}}],
         });
-        let out = transform_response(&body, "manukmiberai/creative-writer", &transform);
+        let out = transform_response(&body, &identity("manukmiberai/creative-writer"), &transform);
         assert_eq!(out["model"], "manukmiberai/creative-writer");
         assert!(!out.to_string().contains("Deepseek-v4-flash"));
     }
@@ -769,7 +929,7 @@ mod tests {
                 ..Default::default()
             };
             let t = ResponseTransform::merged(&ResponseTransform::default(), &route);
-            transform_response(&body, "alias", &t)
+            transform_response(&body, &identity("alias"), &t)
         };
 
         assert_eq!(
@@ -798,7 +958,7 @@ mod tests {
         };
         let t = ResponseTransform::merged(&ResponseTransform::default(), &route);
         let body = serde_json::json!({"choices": [{"message": {"content": "hi"}}]});
-        let out = transform_response(&body, "alias", &t);
+        let out = transform_response(&body, &identity("alias"), &t);
         assert_eq!(out["choices"][0]["message"]["content"], ">> hi <<");
     }
 
@@ -816,7 +976,7 @@ mod tests {
         };
         let t = ResponseTransform::merged(&ResponseTransform::default(), &route);
         let body = serde_json::json!({"system_fingerprint": "fp_x", "choices": []});
-        let out = transform_response(&body, "alias", &t);
+        let out = transform_response(&body, &identity("alias"), &t);
         assert!(out.get("system_fingerprint").is_none());
         assert_eq!(out["provider"], "manukmiber");
     }

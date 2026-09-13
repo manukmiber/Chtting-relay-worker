@@ -17,21 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::util::{deep_merge, mask_secret, new_id, write_atomic};
-use rand::Rng;
 
-pub fn generate_client_key() -> String {
-    // 32 karakter kombinasi: Huruf besar, huruf kecil, angka, dan tanda/simbol
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
-    let mut rng = rand::rng();
-    let random_part: String = (0..32)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
-    
-    format!("Kunci-Zeiko-{}", random_part)
-}
 const SECRET_KEYS: [&str; 4] = ["apiKey", "key", "password", "token"];
 
 /* ------------------------------------------------------------- helpers -- */
@@ -50,16 +36,9 @@ mod double_option {
 }
 
 /* -------------------------------------------------------------- schema -- */
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyConfig {
-    pub id: String,
-    pub label: String, // Sekarang bebas diubah namanya
-    pub key: String,
-    pub enabled: bool,
-    pub models: Vec<String>,
-    pub quota: KeyQuota,
-}
+#[serde(rename_all = "camelCase", default)]
 pub struct Config {
     pub version: u32,
     pub timezone: String,
@@ -71,6 +50,7 @@ pub struct Config {
     pub keys: Vec<ClientKey>,
     pub system_prompts: Vec<SystemPrompt>,
     pub defaults: Defaults,
+    pub pricing: Pricing,
     pub tokenizer: TokenizerConfig,
     pub logging: LoggingConfig,
     pub tunnel: TunnelConfig,
@@ -90,6 +70,7 @@ impl Default for Config {
             keys: Vec::new(),
             system_prompts: Vec::new(),
             defaults: Defaults::default(),
+            pricing: Pricing::default(),
             tokenizer: TokenizerConfig::default(),
             logging: LoggingConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -122,6 +103,24 @@ pub struct ServerConfig {
     /// Hold Android's wake lock while the relay runs, so the phone does not
     /// suspend it the moment the screen goes off. Ignored off Termux.
     pub wake_lock: bool,
+    /// How often a streaming response emits a keep-alive comment of its own
+    /// while the backend is quiet. 0 switches it off.
+    ///
+    /// The relay never forwards the backend's keep-alives: whatever shape they
+    /// have is the backend's business, and passing them through would say
+    /// something about it. This is ours.
+    pub sse_keepalive_ms: u64,
+    /// The text of that comment, after the `: ` an SSE comment starts with.
+    pub sse_keepalive_text: String,
+    /// Replace this process with a fresh one every N hours, handing the port
+    /// over without dropping a connection. 0 switches it off.
+    ///
+    /// Android's low-memory killer goes after whatever has been resident
+    /// longest, so a process that never ages never reaches the top of its list.
+    pub rotate_hours: u32,
+    /// How long a retiring instance waits for its in-flight requests before it
+    /// exits anyway.
+    pub rotate_drain_timeout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -136,6 +135,10 @@ impl Default for ServerConfig {
             queue_capacity: 2048,
             queue_timeout_ms: 30_000,
             wake_lock: true,
+            sse_keepalive_ms: 15_000,
+            sse_keepalive_text: "Zeiko is still here, Just be patience".into(),
+            rotate_hours: 1,
+            rotate_drain_timeout_ms: 10 * 60 * 1000,
         }
     }
 }
@@ -198,6 +201,15 @@ pub struct Backend {
     pub max_retries: u32,
     /// Ask for `stream_options.include_usage` when streaming.
     pub stream_options: bool,
+    /// A pool of keys to spread requests over, round-robin. `apiKey` stays the
+    /// single-key form and is used when this is empty.
+    pub api_keys: Vec<String>,
+    /// Pass the caller's user id upstream, so a backend that isolates prompt
+    /// cache per user keeps one caller's cache out of another's.
+    pub forward_user_id: bool,
+    /// Header the user id travels in. Empty sends no header; the `user` field
+    /// in the body goes either way.
+    pub user_id_header: String,
     pub note: String,
 }
 
@@ -214,6 +226,9 @@ impl Default for Backend {
             headers: BTreeMap::new(),
             max_retries: 1,
             stream_options: true,
+            api_keys: Vec::new(),
+            forward_user_id: true,
+            user_id_header: "x-user-id".into(),
             note: String::new(),
         }
     }
@@ -232,6 +247,9 @@ pub struct Model {
     pub upstream_model: String,
     pub fallbacks: Vec<String>,
     pub system_prompt: SystemPromptSpec,
+    /// Extra prompts chosen by how hard the caller asked the model to think.
+    /// The first rule that matches wins; `systemPrompt` is the fallback.
+    pub system_prompts: Vec<SystemPromptRule>,
     pub params: Map<String, Value>,
     pub force_params: Map<String, Value>,
     pub limits: Limits,
@@ -241,6 +259,11 @@ pub struct Model {
     pub response_transform: ResponseTransform,
     pub context_length: u32,
     pub created_at: i64,
+    /// Hold the stream out to the caller at this many tokens a second, however
+    /// fast the backend produced them. 0 means full speed.
+    pub max_tokens_per_second: f64,
+    /// This model's own price list, layered over the global one.
+    pub pricing: Pricing,
     pub openrouter: OpenRouterModel,
 }
 
@@ -256,6 +279,7 @@ impl Default for Model {
             upstream_model: String::new(),
             fallbacks: Vec::new(),
             system_prompt: SystemPromptSpec::default(),
+            system_prompts: Vec::new(),
             params: Map::new(),
             force_params: Map::new(),
             limits: Limits::default(),
@@ -265,6 +289,8 @@ impl Default for Model {
             response_transform: ResponseTransform::default(),
             context_length: 0,
             created_at: 0,
+            max_tokens_per_second: 0.0,
+            pricing: Pricing::default(),
             openrouter: OpenRouterModel::default(),
         }
     }
@@ -295,6 +321,170 @@ impl Default for SystemPromptSpec {
             prompt_id: String::new(),
         }
     }
+}
+
+/// One model, several system prompts, picked by how hard the caller asked the
+/// model to think.
+///
+/// A non-reasoning call and a maximum-effort call want different instructions:
+/// the first needs the answer shaped for it directly, the second needs room to
+/// work. Rules are tried in order and the first match wins, so the narrow ones
+/// belong first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SystemPromptRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// Efforts this rule answers for: `none`, `minimal`, `low`, `medium`,
+    /// `high`, `max`, or `default` for a caller who named none. Empty matches
+    /// every effort, which makes the rule an unconditional override.
+    pub efforts: Vec<String>,
+    /// Inclusive ranked bounds, as an alternative to listing every effort.
+    /// A caller who named no effort matches neither.
+    pub min_effort: String,
+    pub max_effort: String,
+    /// What to inject when this rule wins.
+    #[serde(flatten)]
+    pub prompt: SystemPromptSpec,
+}
+
+impl Default for SystemPromptRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            efforts: Vec::new(),
+            min_effort: String::new(),
+            max_effort: String::new(),
+            prompt: SystemPromptSpec::default(),
+        }
+    }
+}
+
+/* ------------------------------------------------------------- pricing -- */
+
+/// What a request costs and what it sells for.
+///
+/// Rates are USD per million tokens, the unit every provider publishes. The
+/// `backend*` rates are what the relay is charged; the rest are what the relay
+/// charges, and when one of those is left at 0 it is derived from the backend
+/// rate plus `marginPercent` instead of being free.
+///
+/// `tiers` is a list with no ceiling on its length, and every tier that matches
+/// a request applies. That is the point: a price can depend on thinking effort
+/// and the hour and the size of the prompt at the same time, rather than the
+/// relay having to pick one reason to charge more.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Pricing {
+    /// Off by default: a relay with no prices set should report no money rather
+    /// than a column of zeroes that looks like free service.
+    pub enabled: bool,
+    /// Display only. Every figure here is USD; this labels it.
+    pub currency: String,
+    pub backend_input_usd_per_m: f64,
+    pub backend_cached_input_usd_per_m: f64,
+    pub backend_output_usd_per_m: f64,
+    /// Unset bills reasoning tokens at the output rate.
+    pub backend_reasoning_usd_per_m: f64,
+    pub input_usd_per_m: f64,
+    pub cached_input_usd_per_m: f64,
+    pub output_usd_per_m: f64,
+    pub reasoning_usd_per_m: f64,
+    /// Markup over the backend rate, in percent, for every sell-side rate left
+    /// at 0.
+    pub margin_percent: f64,
+    /// A flat fee per request, on top of the token charges.
+    pub request_usd: f64,
+    pub tiers: Vec<PricingTier>,
+}
+
+/// One conditional price change. Unlimited in number, and they stack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PricingTier {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub when: TierWhen,
+    /// Multipliers on the sell-side rates. 0 is read as "leave it alone".
+    pub input_multiplier: f64,
+    pub output_multiplier: f64,
+    /// Stacks on top of `outputMultiplier`, so "thinking costs half again as
+    /// much" is one number.
+    pub reasoning_multiplier: f64,
+    /// Absolute rates, in USD per million tokens. Set, they replace the rate
+    /// outright rather than scaling it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_usd_per_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_usd_per_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_usd_per_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_usd_per_m: Option<f64>,
+    /// A flat amount added to this request when the tier matches.
+    pub surcharge_usd: f64,
+    /// Apply this tier and stop, leaving the rest of the list unread.
+    pub stop: bool,
+    pub note: String,
+}
+
+impl Default for PricingTier {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            when: TierWhen::default(),
+            input_multiplier: 1.0,
+            output_multiplier: 1.0,
+            reasoning_multiplier: 1.0,
+            input_usd_per_m: None,
+            cached_input_usd_per_m: None,
+            output_usd_per_m: None,
+            reasoning_usd_per_m: None,
+            surcharge_usd: 0.0,
+            stop: false,
+            note: String::new(),
+        }
+    }
+}
+
+/// When a tier applies. Every field that is set must hold; a field left unset
+/// is not a condition at all.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TierWhen {
+    /// Public model ids, globbed. Empty means every model.
+    pub models: Vec<String>,
+    pub efforts: Vec<String>,
+    pub min_effort: String,
+    pub max_effort: String,
+    /// Local-clock hour windows, inclusive, wrapping past midnight.
+    pub hours: Vec<HourRange>,
+    /// Monday is 0, Sunday is 6.
+    pub weekdays: Vec<u32>,
+    pub min_input_tokens: u64,
+    /// 0 means no ceiling.
+    pub max_input_tokens: u64,
+    pub min_output_tokens: u64,
+    pub max_output_tokens: u64,
+    pub min_total_tokens: u64,
+    pub max_total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streamed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HourRange {
+    pub from: u32,
+    pub to: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,6 +753,11 @@ pub struct LoggingConfig {
     pub store_bodies: String,
     pub preview_chars: usize,
     pub file_enabled: bool,
+    /// Log every phase of every request — the uid as it arrives, how long
+    /// tokenizing and injection took, time to first token, and one summary
+    /// line at the end. Goes to the terminal and the log file alike, so the
+    /// dashboard's Logs tab shows the same thing Termux does.
+    pub verbose_requests: bool,
 }
 
 impl Default for LoggingConfig {
@@ -573,6 +768,7 @@ impl Default for LoggingConfig {
             store_bodies: "preview".into(),
             preview_chars: 800,
             file_enabled: true,
+            verbose_requests: true,
         }
     }
 }
@@ -595,7 +791,9 @@ impl Default for TunnelConfig {
         Self {
             mode: "quick".into(),
             binary: "cloudflared".into(),
-            auto_start: false,
+            // On by default. A relay whose tunnel has to be started by hand is
+            // a relay that is down every time the phone reboots.
+            auto_start: true,
             token: String::new(),
             hostname: String::new(),
             config_file: String::new(),
@@ -1024,8 +1222,24 @@ pub fn normalize(mut cfg: Config) -> Config {
         if m.created_at == 0 {
             m.created_at = now;
         }
+        for rule in &mut m.system_prompts {
+            if rule.id.is_empty() {
+                rule.id = new_id("spr");
+            }
+            if rule.name.is_empty() {
+                rule.name = describe_efforts(&rule.efforts, &rule.min_effort, &rule.max_effort);
+            }
+            if rule.prompt.mode.is_empty() {
+                rule.prompt.mode = "prepend".into();
+            }
+        }
+        if m.max_tokens_per_second < 0.0 {
+            m.max_tokens_per_second = 0.0;
+        }
+        normalize_pricing(&mut m.pricing);
     }
     cfg.models.retain(|m| !m.id.is_empty());
+    normalize_pricing(&mut cfg.pricing);
 
     for k in &mut cfg.keys {
         if k.id.is_empty() {
@@ -1052,6 +1266,49 @@ pub fn normalize(mut cfg: Config) -> Config {
         cfg.timezone = "Asia/Jakarta".into();
     }
     cfg
+}
+
+/// A readable name for a prompt rule that was saved without one.
+fn describe_efforts(efforts: &[String], min: &str, max: &str) -> String {
+    if !efforts.is_empty() {
+        return format!("effort {}", efforts.join(", "));
+    }
+    match (min.is_empty(), max.is_empty()) {
+        (false, false) => format!("effort {min} to {max}"),
+        (false, true) => format!("effort {min} and up"),
+        (true, false) => format!("effort up to {max}"),
+        (true, true) => "every effort".into(),
+    }
+}
+
+fn normalize_pricing(pricing: &mut Pricing) {
+    if pricing.currency.is_empty() {
+        pricing.currency = "USD".into();
+    }
+    for tier in &mut pricing.tiers {
+        if tier.id.is_empty() {
+            tier.id = new_id("tier");
+        }
+        if tier.name.is_empty() {
+            tier.name = tier.id.clone();
+        }
+        // A multiplier of 0 means "unset" everywhere it is read, so a tier that
+        // really wants to zero a rate has to say so with an absolute 0.
+        for m in [
+            &mut tier.input_multiplier,
+            &mut tier.output_multiplier,
+            &mut tier.reasoning_multiplier,
+        ] {
+            if !m.is_finite() || *m < 0.0 {
+                *m = 1.0;
+            }
+        }
+        for hour in &mut tier.when.hours {
+            hour.from = hour.from.min(23);
+            hour.to = hour.to.min(23);
+        }
+        tier.when.weekdays.retain(|d| *d <= 6);
+    }
 }
 
 /* ----------------------------------------------------------- validate -- */
@@ -1405,123 +1662,5 @@ mod tests {
             "Deepseek-v4-flash-0731"
         );
         assert!(cfg.find_model("Deepseek-v4-flash-0731").is_none());
-    }
-}
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BackendConfig {
-    pub id: String,
-    pub name: String,
-    #[serde(default = "default_backend_type")]
-    pub r#type: String,
-    pub base_url: String,
-    #[serde(default)]
-    pub api_key: String,          // Key tunggal (backward compatibility)
-    #[serde(default)]
-    pub api_keys: Vec<String>,    // Multi-key pool
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_true")]
-    pub stream_options: bool,
-    #[serde(default)]
-    pub headers: std::collections::HashMap<String, String>,
-
-    #[serde(skip)]
-    pub key_counter: std::sync::Arc<AtomicUsize>,
-}
-
-impl BackendConfig {
-    /// Mengambil API key berikutnya secara round-robin dari pool multi-key
-    pub fn get_active_api_key(&self) -> String {
-        if !self.api_keys.is_empty() {
-            let idx = self.key_counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
-            self.api_keys[idx].clone()
-        } else {
-            self.api_key.clone()
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct TieredPricingConfig {
-    pub base_input_usd_per_m: f64,      // Harga backend per 1M token input
-    pub base_output_usd_per_m: f64,     // Harga backend per 1M token output
-    pub reasoning_multiplier: f64,      // Pengali untuk thinking token (cth: 1.5x)
-    pub proxy_margin_percent: f64,      // Margin proxy (cth: 30.0 untuk profit 30%)
-    pub peak_hours: Option<Vec<u32>>,   // Jam-jam sibuk (0-23)
-    pub peak_multiplier: Option<f64>,   // Pengali jam sibuk (cth: 1.25x)
-    pub volume_threshold: Option<u64>,  // Ambang token (cth: 32000 token)
-    pub high_volume_multiplier: Option<f64>, // Diskon/perubahan volume tinggi
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelConfig {
-    pub id: String,
-    pub backend: String,
-    pub upstream_model: String,
-    // ... field lainnya ...
-    #[serde(default)]
-    pub target_tps: Option<f64>,        // Batasi speed keluar tunnel (cth: 35.0 TPs)
-    #[serde(default)]
-    pub pricing: TieredPricingConfig,   // Tiered pricing
-}
-
-pub struct PriceResult {
-    pub backend_cost: f64,
-    pub proxy_price: f64,
-    pub profit: f64,
-}
-
-pub fn calculate_pricing(
-    pricing: &TieredPricingConfig,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    reasoning_tokens: u64,
-    hour: u32,
-) -> PriceResult {
-    let mut input_rate = pricing.base_input_usd_per_m;
-    let mut output_rate = pricing.base_output_usd_per_m;
-
-    // 1. Cek jam sibuk (Time of day)
-    if let (Some(hours), Some(mult)) = (&pricing.peak_hours, pricing.peak_multiplier) {
-        if hours.contains(&hour) {
-            input_rate *= mult;
-            output_rate *= mult;
-        }
-    }
-
-    // 2. Cek volume input token
-    if let (Some(thresh), Some(mult)) = (pricing.volume_threshold, pricing.high_volume_multiplier) {
-        if prompt_tokens > thresh {
-            input_rate *= mult;
-        }
-    }
-
-    // 3. Hitung biaya backend
-    let input_cost = (prompt_tokens as f64 / 1_000_000.0) * input_rate;
-    let standard_output = completion_tokens.saturating_sub(reasoning_tokens);
-    let reasoning_mult = if pricing.reasoning_multiplier > 0.0 { pricing.reasoning_multiplier } else { 1.0 };
-    let output_cost = ((standard_output as f64 + (reasoning_tokens as f64 * reasoning_mult)) / 1_000_000.0) * output_rate;
-    
-    let backend_cost = input_cost + output_cost;
-
-    // 4. Hitung harga jual proxy & profit
-    let margin = if pricing.proxy_margin_percent > 0.0 { pricing.proxy_margin_percent / 100.0 } else { 0.20 };
-    let proxy_price = backend_cost * (1.0 + margin);
-    let profit = proxy_price - backend_cost;
-
-    PriceResult {
-        backend_cost,
-        proxy_price,
-        profit,
     }
 }

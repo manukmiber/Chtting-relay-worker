@@ -16,7 +16,7 @@ use crate::relay::error_response;
 use crate::relay::handler::{self, Auth};
 use crate::state::AppState;
 use crate::store::RequestRecord;
-use crate::util::{day_key, hour_key, new_id, now_ms, round, truncate};
+use crate::util::{day_key, hour_key, now_ms, round, truncate};
 
 use super::{bearer_token, client_ip, cors_headers};
 pub fn router(state: Arc<AppState>) -> Router {
@@ -331,6 +331,7 @@ async fn embeddings(
     let started = std::time::Instant::now();
     let started_wall = now_ms();
     let tz = cfg.tz();
+    let user_id = crate::relay::handler::user_id_of(&body, &headers);
 
     let inputs: Vec<String> = match body.get("input") {
         Some(Value::Array(items)) => items
@@ -368,7 +369,7 @@ async fn embeddings(
 
     let (status, error, payload) = match state
         .upstream
-        .send(&backend, "v1/embeddings", &upstream_body, false)
+        .send(&backend, "v1/embeddings", &upstream_body, false, &user_id)
         .await
     {
         Ok((res, _)) => {
@@ -402,7 +403,7 @@ async fn embeddings(
     };
 
     state.store.insert(RequestRecord {
-        id: new_id("emb"),
+        id: crate::util::new_uuid_v4(),
         ts: started_wall,
         day: day_key(started_wall, &tz),
         hour: hour_key(started_wall, &tz),
@@ -421,6 +422,7 @@ async fn embeddings(
             200,
         ),
         endpoint: "v1/embeddings".into(),
+        user_id: truncate(&user_id, 120),
         public_model: route.id.clone(),
         backend_id: backend.id.clone(),
         upstream_model: route.upstream_model.clone(),

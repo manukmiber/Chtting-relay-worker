@@ -145,7 +145,7 @@ async function boot() {
   } catch (err) {
     clear(view).append(card('Cannot reach the relay', h('div', {},
       h('p.muted', { text: err.message }),
-      h('p.small.muted', { text: 'The relay is not answering. Tap the chtting-relay-start shortcut, or run: sv up chtting-relay' }),
+      h('p.small.muted', { text: 'The relay is not answering. Tap the chtting-relay-start shortcut, or run: bash ~/.chtting-relay/keeper.sh' }),
       h('button', { onclick: boot }, 'Retry'),
     )));
   }
