@@ -21,10 +21,10 @@ use std::sync::Arc;
 
 use crate::config::{mask_item, unmask_secrets};
 use crate::state::AppState;
-use crate::store::schema;
+use crate::store::{invoice, schema};
 use crate::tokenizer::chat::PROFILE_NAMES;
 use crate::util::{
-    new_client_key, new_id, percentile, random_hex, round, safe_equal, start_of_today,
+    new_client_key, new_id, percentile, random_hex, round, safe_equal, start_of_today, truncate,
 };
 
 /// The dashboard's assets, compiled into the binary so there is no "where did
@@ -37,6 +37,20 @@ const COLLECTIONS: [&str; 4] = ["models", "backends", "keys", "systemPrompts"];
 #[derive(Default)]
 pub struct Sessions {
     tokens: RwLock<HashMap<String, i64>>,
+}
+
+impl Sessions {
+    /// Drop tokens that have expired.
+    ///
+    /// Expiry is checked on use, so a stale token was never *valid*; this is
+    /// about the map, which otherwise only ever grows. Every sign-in adds an
+    /// entry and signing in again does not remove the last one, so a long-lived
+    /// relay accumulates them until something clears the set.
+    fn sweep(&self) {
+        let now = crate::util::now_ms();
+        let mut tokens = self.tokens.write();
+        tokens.retain(|_, expiry| *expiry > now);
+    }
 }
 
 pub struct Dashboard {
@@ -80,6 +94,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/usage/daily", get(usage_daily))
         .route("/api/usage/ledger", get(usage_ledger))
         .route("/api/usage/verify", get(usage_verify))
+        .route("/api/usage/keys", get(usage_by_key))
+        .route("/api/keys/{id}/usage", get(key_usage))
+        .route("/api/invoices", get(list_invoices).post(issue_invoice))
+        .route("/api/invoices/verify", get(verify_invoices))
+        .route("/api/invoices/{id}", get(get_invoice))
+        .route("/api/invoices/{id}/status", post(set_invoice_status))
         .route("/api/queue", get(queue_status))
         .route("/api/openrouter/preview", get(openrouter_preview))
         .route("/api/maintenance/prune", post(prune))
@@ -113,6 +133,67 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+/// Is this request coming from the dashboard's own page, on this machine?
+///
+/// Loopback is not a security boundary on a phone. Every app on an Android
+/// device can open `http://127.0.0.1:8788`, and so can any page the browser is
+/// pointed at — a page cannot *read* the answer without CORS, but it does not
+/// need to read it to POST a new backend, change the price list, or turn the
+/// key requirement off. Two checks close that:
+///
+/// * **`Origin`** — a request from another site carries one, and it will not be
+///   this server. The dashboard's own fetches are same-origin, so they either
+///   carry a matching origin or none at all.
+/// * **`Host`** — a name that resolves to 127.0.0.1 today can resolve to
+///   something else tomorrow, which is how DNS rebinding turns a page into a
+///   client of a loopback service. Only this machine's own names are answered.
+///
+/// Neither depends on a password being set, which matters: the default install
+/// has no password, and that is exactly the install worth protecting.
+fn same_origin(dash: &Dashboard, headers: &HeaderMap) -> Result<(), &'static str> {
+    if !dash.state.config.current().security.dashboard_origin_guard {
+        return Ok(());
+    }
+
+    if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        if !is_local_host(host) {
+            return Err("this dashboard answers only to localhost");
+        }
+    }
+
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        // No origin at all: a same-origin GET, a curl, or the page's own
+        // navigation. None of those is a cross-site request.
+        return Ok(());
+    };
+    // `null` is what a sandboxed iframe or a `file://` page sends. It is not
+    // this origin, and treating it as absent would reopen the hole.
+    let host = origin
+        .split_once("//")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin);
+    if is_local_host(host) {
+        Ok(())
+    } else {
+        Err("cross-origin requests are refused: open the dashboard directly")
+    }
+}
+
+/// A `host:port` that names this machine.
+fn is_local_host(host: &str) -> bool {
+    // An IPv6 literal is bracketed, so the last colon is only a port separator
+    // when it comes after the closing bracket.
+    let name = match host.rfind(']') {
+        Some(end) => &host[..=end],
+        None => host.split(':').next().unwrap_or(host),
+    };
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn authed(dash: &Dashboard, headers: &HeaderMap) -> bool {
     if !password_set(dash) {
         return true;
@@ -132,8 +213,15 @@ fn authed(dash: &Dashboard, headers: &HeaderMap) -> bool {
     }
 }
 
-/// Everything except sign-in itself needs a session when a password is set.
+/// Everything except sign-in itself needs a session when a password is set,
+/// and everything at all has to be coming from this machine.
 async fn guard(State(dash): State<Arc<Dashboard>>, request: Request, next: Next) -> Response {
+    // The origin check comes first and covers the static files too. A page on
+    // another site framing the dashboard is not something to serve and then
+    // refuse the API calls of.
+    if let Err(message) = same_origin(&dash, request.headers()) {
+        return error(403, message);
+    }
     let path = request.uri().path().to_string();
     let open = path == "/api/login" || path == "/api/session" || !path.starts_with("/api/");
     if !open && !authed(&dash, request.headers()) {
@@ -160,6 +248,9 @@ async fn login(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> R
 
     let token = random_hex(24);
     let ttl = cfg.dashboard.session_ttl_ms.max(60_000);
+    // Signing in is the natural moment to clear out what has expired: it is
+    // rare, and it is the only thing that grows the set.
+    dash.sessions.sweep();
     dash.sessions
         .tokens
         .write()
@@ -345,11 +436,17 @@ async fn read_json(request: Request) -> Result<Value, Response> {
 
 async fn generate_key(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> Response {
     let key = new_client_key();
+    let kind = body
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .and_then(crate::config::KeyKind::parse)
+        .unwrap_or_default();
     let item = json!({
         "id": new_id("key"),
         "label": body.get("label").and_then(|v| v.as_str()).unwrap_or("new key"),
         "key": key,
         "enabled": true,
+        "kind": kind.as_str(),
         "models": body.get("models").cloned().unwrap_or_else(|| json!(["*"])),
         "quota": body.get("quota").cloned().unwrap_or_else(|| json!({
             "requestsPerDay": 0, "tokensPerDay": 0, "requestsPerMinute": 0
@@ -913,7 +1010,8 @@ const LEDGER_SUMMARY_SQL: &str = "
       COALESCE(SUM(cache_hit),0),
       SUM(CASE WHEN phase = 'final' AND status >= 400 THEN 1 ELSE 0 END),
       SUM(CASE WHEN phase = 'final' AND status = 200 THEN 1 ELSE 0 END),
-      AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(tokens_per_sec,0)), AVG(NULLIF(queued_ms,0))
+      AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(tokens_per_sec,0)), AVG(NULLIF(queued_ms,0)),
+      COALESCE(SUM(proxy_usd),0), COALESCE(SUM(backend_usd),0)
     FROM usage_ledger WHERE ts >= ?1 AND ts <= ?2";
 
 fn ledger_summary(conn: &rusqlite::Connection, from: i64, to: i64) -> rusqlite::Result<Value> {
@@ -943,6 +1041,11 @@ fn ledger_summary(conn: &rusqlite::Connection, from: i64, to: i64) -> rusqlite::
             "avgTtftMs": round(r.get::<_, Option<f64>>(10)?.unwrap_or(0.0), 1),
             "avgTokensPerSec": round(r.get::<_, Option<f64>>(11)?.unwrap_or(0.0), 2),
             "avgQueuedMs": round(r.get::<_, Option<f64>>(12)?.unwrap_or(0.0), 1),
+            // What was charged and what it cost. The ledger's own figures, so
+            // they survive a prune of the browsable request log.
+            "proxyUsd": round(r.get::<_, f64>(13)?, 9),
+            "backendUsd": round(r.get::<_, f64>(14)?, 9),
+            "profitUsd": round(r.get::<_, f64>(13)? - r.get::<_, f64>(14)?, 9),
         }))
     })
 }
@@ -985,7 +1088,8 @@ async fn usage_daily(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQu
                         COALESCE(SUM(requests),0), COUNT(DISTINCT key_id),
                         COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                         COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_hit),0),
-                        AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(tokens_per_sec,0))
+                        AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(tokens_per_sec,0)),
+                        COALESCE(SUM(proxy_usd),0), COALESCE(SUM(backend_usd),0)
                  FROM usage_ledger GROUP BY day ORDER BY day DESC LIMIT ?1",
             )?;
             let mut rows: Vec<Value> = stmt
@@ -1003,6 +1107,8 @@ async fn usage_daily(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQu
                         "cacheHits": r.get::<_, i64>(6)?,
                         "avgTtftMs": round(r.get::<_, Option<f64>>(7)?.unwrap_or(0.0), 1),
                         "avgTokensPerSec": round(r.get::<_, Option<f64>>(8)?.unwrap_or(0.0), 2),
+                        "proxyUsd": round(r.get::<_, f64>(9)?, 9),
+                        "backendUsd": round(r.get::<_, f64>(10)?, 9),
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1026,7 +1132,7 @@ async fn usage_ledger(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQ
                 "SELECT seq, request_id, phase, ts, day, key_id, public_model, status,
                         requests, input_tokens, billed_input_tokens, output_tokens,
                         cached_tokens, cache_hit, ttft_ms, gen_ms, total_ms, queued_ms,
-                        tokens_per_sec, row_hash
+                        tokens_per_sec, row_hash, user_id, key_kind, proxy_usd, backend_usd
                  FROM usage_ledger ORDER BY seq DESC LIMIT ?1",
             )?;
             let rows: Vec<Value> = stmt
@@ -1054,6 +1160,10 @@ async fn usage_ledger(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQ
                         // Just the head of it: enough to eyeball, not enough
                         // to clutter a table on a phone screen.
                         "hash": r.get::<_, String>(19)?.chars().take(12).collect::<String>(),
+                        "userId": r.get::<_, String>(20)?,
+                        "keyKind": r.get::<_, String>(21)?,
+                        "proxyUsd": round(r.get::<_, f64>(22)?, 9),
+                        "backendUsd": round(r.get::<_, f64>(23)?, 9),
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1061,6 +1171,248 @@ async fn usage_ledger(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQ
         })
         .await;
     match result {
+        Ok(v) => Json(v).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+/* -------------------------------------------------------------- billing -- */
+
+/// Every key with what it currently owes, for the Billing screen's table.
+///
+/// One pass over the ledger per key rather than one query per key per model:
+/// the per-model breakdown is only fetched when a single key is opened.
+async fn usage_by_key(State(dash): State<Arc<Dashboard>>) -> Response {
+    let cfg = dash.state.config.current();
+    let keys: Vec<(String, String, String, bool)> = cfg
+        .keys
+        .iter()
+        .map(|k| {
+            (
+                k.id.clone(),
+                k.display_name().to_string(),
+                k.kind.as_str().to_string(),
+                k.billing.auto_invoice,
+            )
+        })
+        .collect();
+
+    let result = dash
+        .state
+        .store
+        .read(move |conn| {
+            let mut out = Vec::with_capacity(keys.len());
+            for (id, label, kind, auto) in keys {
+                let current = invoice::current_usage(conn, &id)?;
+                let lifetime = invoice::lifetime_usage(conn, &id)?;
+                let last = invoice::list(conn, Some(&id), 1)?.into_iter().next();
+                out.push(json!({
+                    "keyId": id,
+                    "label": label,
+                    "kind": kind,
+                    "autoInvoice": auto,
+                    "current": current,
+                    "lifetime": lifetime,
+                    "lastInvoice": last.map(|i| json!({
+                        "id": i.id, "number": i.number, "issuedAt": i.issued_at,
+                        "totalUsd": i.total_usd, "status": i.status,
+                    })),
+                }));
+            }
+            Ok(Value::Array(out))
+        })
+        .await;
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+/// One key in full: the open period, its per-model breakdown, and its history.
+async fn key_usage(State(dash): State<Arc<Dashboard>>, Path(id): Path<String>) -> Response {
+    let cfg = dash.state.config.current();
+    let Some(key) = cfg.keys.iter().find(|k| k.id == id) else {
+        return error(404, "key not found");
+    };
+    let meta = json!({
+        "keyId": key.id,
+        "label": key.display_name(),
+        "kind": key.kind.as_str(),
+        "billing": key.billing,
+        "currency": cfg.billing.currency,
+        "taxPercent": key.billing.tax_percent.unwrap_or(cfg.billing.tax_percent),
+    });
+
+    let result = dash
+        .state
+        .store
+        .read(move |conn| {
+            Ok(json!({
+                "current": invoice::current_usage(conn, &id)?,
+                "lifetime": invoice::lifetime_usage(conn, &id)?,
+                "invoices": invoice::list(conn, Some(&id), 50)?,
+            }))
+        })
+        .await;
+
+    match result {
+        Ok(Value::Object(mut body)) => {
+            if let Value::Object(meta) = meta {
+                body.extend(meta);
+            }
+            Json(Value::Object(body)).into_response()
+        }
+        Ok(other) => Json(other).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueBody {
+    key_id: String,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    tax_percent: Option<f64>,
+    /// Issue even when the period is under the configured minimum.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Issue an invoice, which is also what starts the key's next period.
+async fn issue_invoice(
+    State(dash): State<Arc<Dashboard>>,
+    Json(body): Json<IssueBody>,
+) -> Response {
+    let cfg = dash.state.config.current();
+    let Some(key) = cfg.keys.iter().find(|k| k.id == body.key_id).cloned() else {
+        return error(404, "key not found");
+    };
+    let billing = cfg.billing.clone();
+    let tz = cfg.tz();
+    let note = truncate(body.note.trim(), 500);
+    let force = body.force;
+    let tax_percent = body.tax_percent.filter(|t| t.is_finite() && *t >= 0.0);
+
+    let result = dash
+        .state
+        .store
+        .write(move |conn| {
+            crate::store::invoice::issue(
+                conn,
+                invoice::IssueRequest {
+                    key: &key,
+                    billing: &billing,
+                    note,
+                    tax_percent,
+                    force,
+                    tz,
+                },
+            )
+        })
+        .await;
+
+    match result {
+        Ok(invoice::Issued::Invoice(inv)) => {
+            dash.state.logger.info(format!(
+                "invoice {} issued for {}: {} {:.6} over {} request(s)",
+                inv.number, inv.key_label, inv.currency, inv.total_usd, inv.requests,
+            ));
+            Json(json!({ "ok": true, "invoice": inv })).into_response()
+        }
+        Ok(invoice::Issued::Skipped(why)) => Json(json!({
+            "ok": false,
+            "skipped": match why {
+                invoice::Skipped::NothingToBill => "nothingToBill",
+                invoice::Skipped::BelowMinimum => "belowMinimum",
+            },
+            "message": match why {
+                invoice::Skipped::NothingToBill =>
+                    "nothing has been used since the last invoice".to_string(),
+                invoice::Skipped::BelowMinimum => format!(
+                    "the period is under the {} minimum; it stays open",
+                    cfg.billing.minimum_usd
+                ),
+            },
+        }))
+        .into_response(),
+        Err(err) => error(400, &err.to_string()),
+    }
+}
+
+async fn list_invoices(
+    State(dash): State<Arc<Dashboard>>,
+    Query(q): Query<InvoiceQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let key_id = q.key_id;
+    let result = dash
+        .state
+        .store
+        .read(move |conn| Ok(invoice::list(conn, key_id.as_deref(), limit)?))
+        .await;
+    match result {
+        Ok(rows) => Json(rows).into_response(),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InvoiceQuery {
+    key_id: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn get_invoice(State(dash): State<Arc<Dashboard>>, Path(id): Path<String>) -> Response {
+    let cfg = dash.state.config.current();
+    let result = dash
+        .state
+        .store
+        .read(move |conn| Ok(invoice::get(conn, &id)?))
+        .await;
+    match result {
+        // The issuer travels with the invoice rather than being stored on it:
+        // it is the same for every invoice, and an operator who fixes a typo in
+        // their own address expects the fix to show on what they print next.
+        Ok(Some(inv)) => {
+            Json(json!({ "invoice": inv, "issuer": cfg.billing.issuer })).into_response()
+        }
+        Ok(None) => error(404, "invoice not found"),
+        Err(err) => error(500, &err.to_string()),
+    }
+}
+
+async fn set_invoice_status(
+    State(dash): State<Arc<Dashboard>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let status = body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let result = dash
+        .state
+        .store
+        .write(move |conn| invoice::set_status(conn, &id, &status))
+        .await;
+    match result {
+        Ok(inv) => Json(json!({ "ok": true, "invoice": inv })).into_response(),
+        Err(err) => error(400, &err.to_string()),
+    }
+}
+
+/// Recompute every invoice's own hash, the way `usage/verify` does the ledger.
+async fn verify_invoices(State(dash): State<Arc<Dashboard>>) -> Response {
+    match dash
+        .state
+        .store
+        .read(|conn| Ok(invoice::verify(conn)?))
+        .await
+    {
         Ok(v) => Json(v).into_response(),
         Err(err) => error(500, &err.to_string()),
     }
@@ -1441,6 +1793,25 @@ async fn setup(State(dash): State<Arc<Dashboard>>) -> Response {
             "No key, but keys are not required — the relay is open.".into()
         },
         "keys",
+    ));
+
+    // Loopback is not a boundary on a phone: every app installed on it can
+    // reach this dashboard, and this dashboard holds the backend keys. The
+    // origin guard stops a *browser* being used as the way in; a password is
+    // what stops everything else.
+    let password_set = !cfg.dashboard.password.is_empty();
+    steps.push(step(
+        "password",
+        "A dashboard password",
+        password_set,
+        if password_set {
+            "Set. The dashboard asks for it before showing anything.".into()
+        } else {
+            "Not set. Any app on this phone can open the dashboard and read \
+             your backend keys — loopback is not private on Android."
+                .into()
+        },
+        "settings",
     ));
 
     // An estimator counts, but it does not count *right*, and the whole billing

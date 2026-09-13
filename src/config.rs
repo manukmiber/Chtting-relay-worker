@@ -55,6 +55,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub tunnel: TunnelConfig,
     pub openrouter: OpenRouterConfig,
+    pub billing: BillingConfig,
 }
 
 impl Default for Config {
@@ -75,6 +76,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             tunnel: TunnelConfig::default(),
             openrouter: OpenRouterConfig::default(),
+            billing: BillingConfig::default(),
         }
     }
 }
@@ -176,8 +178,28 @@ impl Default for DashboardConfig {
 pub struct SecurityConfig {
     pub require_client_key: bool,
     pub cors_origins: Vec<String>,
+    /// Believe `CF-Connecting-IP` and `X-Forwarded-For` about who the caller
+    /// is. Only ever honoured from a loopback peer — see
+    /// [`crate::server::client_ip`] — because a header anyone can set is not
+    /// an address, and `blockedIps` is enforced against whatever this returns.
     pub trust_proxy_headers: bool,
     pub blocked_ips: Vec<String>,
+    /// What a private key's user id is, as the backend sees it.
+    ///
+    /// * `fingerprint` — a SHA-256 of the key, truncated. Stable, unique per
+    ///   key, and reveals nothing: the default, and the only one of the three
+    ///   that does not hand a credential or an internal id to a third party.
+    /// * `keyId` — the key's own `key_...` id.
+    /// * `secret` — the key itself. Only for a backend that genuinely needs
+    ///   it; it writes your client key into somebody else's request log.
+    pub private_user_id: String,
+    /// Reject a dashboard request that arrives with a cross-origin `Origin`,
+    /// or for a host that is not this machine.
+    ///
+    /// The dashboard is on loopback, but on Android loopback is not private:
+    /// every app on the phone can reach `127.0.0.1:8788`, and so can a page
+    /// the browser is pointed at. Leave this on.
+    pub dashboard_origin_guard: bool,
 }
 
 impl Default for SecurityConfig {
@@ -187,8 +209,69 @@ impl Default for SecurityConfig {
             cors_origins: vec!["*".into()],
             trust_proxy_headers: true,
             blocked_ips: Vec::new(),
+            private_user_id: PRIVATE_ID_FINGERPRINT.into(),
+            dashboard_origin_guard: true,
         }
     }
+}
+
+/// The three spellings [`SecurityConfig::private_user_id`] accepts.
+pub const PRIVATE_ID_FINGERPRINT: &str = "fingerprint";
+pub const PRIVATE_ID_KEY_ID: &str = "keyId";
+pub const PRIVATE_ID_SECRET: &str = "secret";
+pub const PRIVATE_ID_MODES: [&str; 3] =
+    [PRIVATE_ID_FINGERPRINT, PRIVATE_ID_KEY_ID, PRIVATE_ID_SECRET];
+
+/// How usage is turned into invoices, and what those invoices say.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BillingConfig {
+    /// Issue invoices at all. Off leaves the ledger accumulating, which is
+    /// exactly what it did before there was any of this.
+    pub enabled: bool,
+    /// Printed on the invoice. The relay prices in USD throughout; this only
+    /// changes the symbol, never the arithmetic.
+    pub currency: String,
+    /// `INV` gives `INV-2026-0001`.
+    pub number_prefix: String,
+    /// Added to the subtotal unless the key overrides it.
+    pub tax_percent: f64,
+    /// An invoice under this much is not worth issuing; the period rolls on
+    /// instead. 0 issues whatever is there, including nothing.
+    pub minimum_usd: f64,
+    /// Day of the month the automatic cycle runs, 1-28. Days past 28 are not
+    /// offered because February would silently skip them.
+    pub cycle_day: u32,
+    /// Run that cycle. Only keys with `billing.autoInvoice` are billed by it.
+    pub auto_issue: bool,
+    /// Who the invoice is from.
+    pub issuer: Issuer,
+}
+
+impl Default for BillingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            currency: "USD".into(),
+            number_prefix: "INV".into(),
+            tax_percent: 0.0,
+            minimum_usd: 0.0,
+            cycle_day: 1,
+            auto_issue: false,
+            issuer: Issuer::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Issuer {
+    pub name: String,
+    pub email: String,
+    pub address: String,
+    pub tax_id: String,
+    /// Free text under the totals: bank details, payment terms, a thank you.
+    pub payment_terms: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +661,43 @@ impl Default for SystemPrompt {
     }
 }
 
+/// Who is behind a client key, which decides three things: whose id goes
+/// upstream, whose name the usage is filed under, and whether the route's
+/// tokens-a-second throttle applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyKind {
+    /// A company reselling this relay to its own users. Every call carries the
+    /// end user's id, and that id is what travels upstream and what the usage
+    /// is broken down by — one key, many people behind it.
+    #[default]
+    Company,
+    /// One holder, who *is* the user. Nothing they send can say otherwise: the
+    /// key's own identity is the user id, and their replies are not paced.
+    Private,
+}
+
+impl KeyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyKind::Company => "company",
+            KeyKind::Private => "private",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "company" | "" => Some(KeyKind::Company),
+            "private" | "personal" => Some(KeyKind::Private),
+            _ => None,
+        }
+    }
+
+    pub fn is_private(self) -> bool {
+        matches!(self, KeyKind::Private)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ClientKey {
@@ -585,11 +705,16 @@ pub struct ClientKey {
     pub label: String,
     pub key: String,
     pub enabled: bool,
+    /// Company or private. See [`KeyKind`].
+    pub kind: KeyKind,
     /// `["*"]` or an explicit list of public model ids.
     pub models: Vec<String>,
     pub quota: Quota,
     pub note: String,
     pub created_at: i64,
+    /// Who this key is billed to, on the invoice. The label is used when it is
+    /// blank, which is the common case for a key nobody has invoiced yet.
+    pub billing: KeyBilling,
 }
 
 impl Default for ClientKey {
@@ -599,12 +724,47 @@ impl Default for ClientKey {
             label: String::new(),
             key: String::new(),
             enabled: true,
+            kind: KeyKind::default(),
             models: vec!["*".into()],
             quota: Quota::default(),
             note: String::new(),
             created_at: 0,
+            billing: KeyBilling::default(),
         }
     }
+}
+
+impl ClientKey {
+    /// The name to put on an invoice and in the usage tables.
+    pub fn display_name(&self) -> &str {
+        for candidate in [&self.billing.name, &self.label, &self.id] {
+            if !candidate.is_empty() {
+                return candidate;
+            }
+        }
+        ""
+    }
+}
+
+/// The parts of a key an invoice needs that are about the customer rather than
+/// about the traffic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KeyBilling {
+    /// Who the invoice is addressed to. Blank falls back to the key's label.
+    pub name: String,
+    pub email: String,
+    pub address: String,
+    /// Tax number, VAT id, NPWP — whatever the jurisdiction calls it.
+    pub tax_id: String,
+    /// Overrides `billing.taxPercent` for this customer. Absent inherits the
+    /// global rate; an explicit 0 is a real answer, and means tax-exempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tax_percent: Option<f64>,
+    /// Bill this key automatically on the global cycle. Off by default: an
+    /// invoice resets the period, and that should be somebody's decision until
+    /// they say otherwise.
+    pub auto_invoice: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -922,6 +1082,9 @@ impl Config {
             return None;
         }
         // Constant-time compare so a timing oracle cannot walk the key out.
+        // The request path does not come through here — it uses the O(1)
+        // [`KeyIndex`] the store publishes — but a scan is the right answer
+        // for the handful of callers that hold a `Config` and nothing else.
         self.keys
             .iter()
             .find(|k| crate::util::safe_equal(&k.key, secret))
@@ -929,6 +1092,60 @@ impl Config {
 
     pub fn tz(&self) -> chrono_tz::Tz {
         crate::util::parse_tz(&self.timezone)
+    }
+}
+
+/* ----------------------------------------------------------- key index -- */
+
+/// Authenticated key lookup in one hash rather than a scan.
+///
+/// The scan it replaces was O(number of keys) *constant-time compares* per
+/// request, which at a few hundred keys is the most expensive thing that
+/// happens before any work is done. Here the presented secret is hashed once
+/// and looked up; the compare that follows is still constant-time, so the
+/// timing story is unchanged — a lookup that misses does the same work as one
+/// that hits, because a wrong secret hashes to a digest that is simply not in
+/// the map.
+///
+/// Rebuilt whenever the config is published, and published with it, so the
+/// request path never rebuilds anything.
+pub struct KeyIndex {
+    by_digest: std::collections::HashMap<[u8; 32], Arc<ClientKey>>,
+}
+
+impl KeyIndex {
+    pub fn build(keys: &[ClientKey]) -> Self {
+        let mut by_digest = std::collections::HashMap::with_capacity(keys.len());
+        for key in keys {
+            if key.key.is_empty() {
+                continue;
+            }
+            by_digest.insert(
+                crate::util::digest(key.key.as_bytes()),
+                Arc::new(key.clone()),
+            );
+        }
+        Self { by_digest }
+    }
+
+    pub fn get(&self, secret: &str) -> Option<&Arc<ClientKey>> {
+        if secret.is_empty() {
+            return None;
+        }
+        let found = self
+            .by_digest
+            .get(&crate::util::digest(secret.as_bytes()))?;
+        // A digest collision would be news, but the compare costs nanoseconds
+        // and means authentication never rests on the hash alone.
+        crate::util::safe_equal(&found.key, secret).then_some(found)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_digest.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_digest.is_empty()
     }
 }
 
@@ -1208,6 +1425,9 @@ pub struct OpenRouterCapacity {
 pub struct ConfigStore {
     file: PathBuf,
     current: ArcSwap<Config>,
+    /// Published alongside the config it was built from, so the request path
+    /// authenticates in one hash instead of scanning the key list.
+    keys: ArcSwap<KeyIndex>,
     /// Serialises writers only. Readers never touch it.
     write_lock: tokio::sync::Mutex<()>,
 }
@@ -1234,6 +1454,7 @@ impl ConfigStore {
 
         Ok(Self {
             file: file.to_path_buf(),
+            keys: ArcSwap::from_pointee(KeyIndex::build(&cfg.keys)),
             current: ArcSwap::from_pointee(cfg),
             write_lock: tokio::sync::Mutex::new(()),
         })
@@ -1242,6 +1463,22 @@ impl ConfigStore {
     /// Lock-free read of the live config.
     pub fn current(&self) -> Arc<Config> {
         self.current.load_full()
+    }
+
+    /// The key index for the config as it stands. Lock-free, like the config.
+    pub fn keys(&self) -> Arc<KeyIndex> {
+        self.keys.load_full()
+    }
+
+    /// Publish a new config and the index that goes with it.
+    ///
+    /// The index goes first: a request that lands between the two stores then
+    /// sees a key that is about to exist rather than one that has just stopped
+    /// existing, and every other check it goes on to make reads the new config
+    /// anyway.
+    fn publish(&self, next: Arc<Config>) {
+        self.keys.store(Arc::new(KeyIndex::build(&next.keys)));
+        self.current.store(next);
     }
 
     pub fn file(&self) -> &Path {
@@ -1262,7 +1499,7 @@ impl ConfigStore {
 
         write_atomic(&self.file, &to_pretty(&next)?).await?;
         let next = Arc::new(next);
-        self.current.store(next.clone());
+        self.publish(next.clone());
         Ok(next)
     }
 
@@ -1286,7 +1523,7 @@ impl ConfigStore {
         }
         write_atomic(&self.file, &to_pretty(&next)?).await?;
         let next = Arc::new(next);
-        self.current.store(next.clone());
+        self.publish(next.clone());
         Ok(next)
     }
 
@@ -1432,7 +1669,23 @@ pub fn normalize(mut cfg: Config) -> Config {
         if k.created_at == 0 {
             k.created_at = now;
         }
+        // A tax rate that is not a number is a typo, and a negative one would
+        // pay the customer to buy tokens. Dropping it inherits the global rate,
+        // which is the answer that was true before somebody mistyped.
+        k.billing.tax_percent = k.billing.tax_percent.filter(|t| t.is_finite() && *t >= 0.0);
     }
+
+    // Anything unrecognised becomes the fingerprint, which is the mode that
+    // hands nothing away. Spelled case-insensitively because `keyid` and
+    // `keyId` are the same intention.
+    let mode = cfg.security.private_user_id.trim();
+    cfg.security.private_user_id = PRIVATE_ID_MODES
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(mode))
+        .map_or(PRIVATE_ID_FINGERPRINT, |known| known)
+        .to_string();
+
+    normalize_billing(&mut cfg.billing);
 
     for p in &mut cfg.system_prompts {
         if p.id.is_empty() {
@@ -1447,6 +1700,25 @@ pub fn normalize(mut cfg: Config) -> Config {
         cfg.timezone = "Asia/Jakarta".into();
     }
     cfg
+}
+
+fn normalize_billing(billing: &mut BillingConfig) {
+    if billing.currency.trim().is_empty() {
+        billing.currency = "USD".into();
+    }
+    if billing.number_prefix.trim().is_empty() {
+        billing.number_prefix = "INV".into();
+    }
+    billing.currency = billing.currency.trim().to_string();
+    billing.number_prefix = billing.number_prefix.trim().to_string();
+    for amount in [&mut billing.tax_percent, &mut billing.minimum_usd] {
+        if !amount.is_finite() || *amount < 0.0 {
+            *amount = 0.0;
+        }
+    }
+    // The 29th, 30th and 31st are not offered: February would skip them and a
+    // customer would be billed eleven times a year without anyone noticing.
+    billing.cycle_day = billing.cycle_day.clamp(1, 28);
 }
 
 /// A readable name for a prompt rule that was saved without one.

@@ -12,13 +12,20 @@ pub mod public;
 use axum::http::{HeaderMap, HeaderValue};
 use std::net::SocketAddr;
 
-/// The caller's address, honouring proxy headers only when configured to.
+/// The caller's address, honouring proxy headers only when configured to *and*
+/// only when the connection came from this machine.
 ///
-/// Behind the tunnel, `CF-Connecting-IP` is the real client; without the
-/// tunnel, trusting these headers would let anyone spoof their address, so the
-/// setting defaults on but is worth turning off on a LAN-only relay.
+/// Behind the tunnel, `CF-Connecting-IP` is the real client and the connection
+/// arrives from cloudflared on loopback, so the header is worth believing. From
+/// anywhere else it is a string the caller typed. Believing it there would let
+/// anyone walk straight through `blockedIps` — the block list is checked
+/// against whatever this returns — and write any address they like into the
+/// request log at the same time.
+///
+/// So the peer decides. `trustProxyHeaders` stays as the switch it always was;
+/// this is the condition it was always missing.
 pub fn client_ip(headers: &HeaderMap, peer: SocketAddr, trust_proxy: bool) -> String {
-    if trust_proxy {
+    if trust_proxy && peer.ip().is_loopback() {
         if let Some(ip) = headers
             .get("cf-connecting-ip")
             .and_then(|v| v.to_str().ok())
@@ -86,6 +93,10 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4000)
     }
 
+    fn loopback() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000)
+    }
+
     #[test]
     fn proxy_headers_are_honoured_only_when_trusted() {
         let mut headers = HeaderMap::new();
@@ -95,11 +106,28 @@ mod tests {
             HeaderValue::from_static("198.51.100.7, 10.1.1.1"),
         );
 
-        assert_eq!(client_ip(&headers, peer(), true), "203.0.113.9");
-        assert_eq!(client_ip(&headers, peer(), false), "10.0.0.1");
+        assert_eq!(client_ip(&headers, loopback(), true), "203.0.113.9");
+        assert_eq!(client_ip(&headers, loopback(), false), "127.0.0.1");
 
         headers.remove("cf-connecting-ip");
-        assert_eq!(client_ip(&headers, peer(), true), "198.51.100.7");
+        assert_eq!(client_ip(&headers, loopback(), true), "198.51.100.7");
+    }
+
+    /// cloudflared runs on the phone and connects over loopback, so a
+    /// forwarded-for header that did not arrive that way did not come from it.
+    /// Believing one that came off the network would make `blockedIps` a
+    /// suggestion — anyone refused could pick another address and try again.
+    #[test]
+    fn a_forwarded_address_from_a_remote_peer_is_not_believed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.9"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+
+        assert_eq!(
+            client_ip(&headers, peer(), true),
+            "10.0.0.1",
+            "the address the packets actually came from wins"
+        );
     }
 
     #[test]

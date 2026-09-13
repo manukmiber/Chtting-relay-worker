@@ -140,6 +140,35 @@ waiting, peak depth, average wait, and how many were turned away.
 | `corsOrigins` | `["*"]` | allowed browser origins |
 | `trustProxyHeaders` | `true` | read `CF-Connecting-IP` / `X-Forwarded-For` — correct behind the tunnel |
 | `blockedIps` | `[]` | refused outright |
+| `dashboardOriginGuard` | `true` | refuse dashboard requests from another origin or host |
+| `privateUserId` | `fingerprint` | what a private key's user id looks like upstream: `fingerprint`, `keyId` or `secret` |
+
+`trustProxyHeaders` is honoured only when the connection itself came from this
+machine, which is where cloudflared runs. A forwarded address that arrived off
+the network is a string the caller typed, and `blockedIps` is checked against
+whatever the relay decides the address is — so believing one would turn the
+block list into a suggestion.
+
+`dashboardOriginGuard` is what keeps the loopback dashboard from being driven
+by a web page. Loopback is not private on Android: any app on the phone can
+reach `127.0.0.1:8788`, and a page in the browser can *send* requests to it even
+though CORS stops it reading the answers — and adding a backend or switching
+`requireClientKey` off needs no answer to be useful. The guard refuses a request
+whose `Origin` is not this server, and one whose `Host` is a name that is not
+this machine, which is what DNS rebinding relies on. It is not a substitute for
+`dashboard.password`: the guard is about browsers, and the password is about
+everything else.
+
+`privateUserId` decides what a private key sends upstream as its user id.
+`fingerprint`, the default, is a truncated SHA-256 of the key — stable, unique
+per key, and reveals nothing. `keyId` sends the key's own `key_...` id.
+
+`secret` sends the key itself. It exists for the backend that genuinely
+requires it, and it costs two things: the credential lands in somebody else's
+request log, and — because the relay records the id it sent — it is also
+written in the clear into `relay.db` and shown on the Usage screen. That makes
+the metrics database as sensitive as `config.json`, which matters the moment
+anyone exports it. Leave this alone unless a backend forces it.
 
 ---
 
@@ -374,10 +403,49 @@ over streamed deltas, and a match that straddles two chunks is still caught.
 | `label` | | shown in stats |
 | `key` | | the secret the caller sends as `Authorization: Bearer` |
 | `enabled` | `true` | |
+| `kind` | `company` | `company` or `private` — see below |
 | `models` | `["*"]` | `*` or a list of public model ids |
 | `quota.requestsPerMinute` | `0` | sliding window; 0 = unlimited |
 | `quota.requestsPerDay` | `0` | counted in `timezone` days |
 | `quota.tokensPerDay` | `0` | total tokens, counted in `timezone` days |
+| `billing.name` | | who the invoice is addressed to; blank uses `label` |
+| `billing.email` | | |
+| `billing.address` | | |
+| `billing.taxId` | | VAT, NPWP, whatever the jurisdiction calls it |
+| `billing.taxPercent` | *absent* | overrides `billing.taxPercent`; an explicit `0` means tax-exempt |
+| `billing.autoInvoice` | `false` | include this key in the automatic cycle |
+
+### Company keys and private keys
+
+The kind decides one thing, and everything else follows from it: **who the
+request is on behalf of.**
+
+|  | `company` | `private` |
+|---|---|---|
+| Who is behind the key | many end users | one holder |
+| The user id sent upstream | the one the caller sent, in `user` or `x-user-id` | the key's own identity |
+| A caller-supplied `user` | honoured | **ignored** |
+| Usage breaks down by | end user | the key |
+| `maxTokensPerSecond` | applies | **never applies** |
+
+A **company** key is a reseller. Every call should carry its own end user, and
+that id is what the backend sees, what isolates their prompt cache, and what an
+invoice breaks its usage down by. This is what every key did before there were
+two kinds, so an existing config keeps behaving exactly as it did — `company` is
+the default for a key that does not say.
+
+A **private** key is one person, and the key *is* the user. Whatever the caller
+puts in `user` is not honoured: they cannot file their spend under somebody
+else's name, and they cannot reach another caller's cache partition. What
+travels upstream instead is set by `security.privateUserId`, and defaults to a
+fingerprint of the key rather than the key itself.
+
+A private key is also never paced. The route's `maxTokensPerSecond` exists so
+one reseller's traffic does not fill the phone's uplink at everybody else's
+expense; a key with a single holder behind it is the case that costs nobody
+else anything, so its replies leave at whatever speed the backend manages. The
+request row records `targetTps` as `0` for those, rather than claiming a ceiling
+that was never applied.
 
 Each key is one "daily user" in the stats. A key fronting many callers is told
 apart by the caller id — see *Caller ids and prompt caches* above.
@@ -386,6 +454,60 @@ Keys minted by the relay are shaped `Kunci-Zeiko-` followed by 32 characters
 mixing lower case, upper case, digits and symbols, with at least one of each
 guaranteed rather than hoped for. Keys of any other shape keep working; nothing
 checks the format on the way in.
+
+---
+
+## `billing`
+
+Turning recorded usage into an invoice, and starting the next period.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | off records usage as before but issues nothing |
+| `currency` | `USD` | printed on the invoice; the arithmetic stays in USD |
+| `numberPrefix` | `INV` | gives `INV-2026-0001`, counted per year |
+| `taxPercent` | `0` | added to the subtotal unless the key overrides it |
+| `minimumUsd` | `0` | under this the period stays open instead of being billed |
+| `cycleDay` | `1` | day of the month the automatic cycle runs, 1–28 |
+| `autoIssue` | `false` | run that cycle |
+| `issuer.name` / `.email` / `.address` / `.taxId` | | who the invoice is from |
+| `issuer.paymentTerms` | | free text under the totals |
+
+### What "reset the usage" actually does
+
+The usage ledger takes appends only — SQLite refuses to change or remove a row,
+and each row carries the hash of the one before it. So an invoice does not clear
+anything. It draws a line:
+
+```
+  usage_ledger   ─── seq ───────────────────────────────────────────────►
+    … 41  42  43 │ 44  45  46  47 │ 48  49  50 …
+                 │                │
+           invoice #1        invoice #2         "unbilled"
+           toSeq = 43        toSeq = 47         = everything past 47
+```
+
+A key's **unbilled** total is everything it has run past the line its last
+invoice drew. Issuing an invoice moves that line forward, which is why the
+number reads zero afterwards — without a single recorded figure being deleted,
+and with every past period still reconstructible from the same rows months
+later.
+
+Consequences worth knowing:
+
+* An invoice cannot be un-issued. **Voiding** one marks it void and hands its
+  period back, so the next invoice covers both.
+* A request that was in flight when the invoice was issued lands on the next
+  one. Its price is only known when the answer completes, and nothing had been
+  charged for it yet.
+* `minimumUsd` holds a small period **open** rather than throwing it away: the
+  usage rolls into the next invoice.
+* An issued invoice's figures are hashed with it and SQLite refuses an update
+  that touches one. Only `status`, `settledAt` and the note may change.
+
+Automatic issue only touches keys with `billing.autoInvoice`, and only on
+`cycleDay`. Everything else waits for someone to press the button on the
+Billing screen, because closing a billing period is a decision.
 
 ---
 

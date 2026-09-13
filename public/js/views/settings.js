@@ -180,14 +180,79 @@ export async function settingsView(ctx) {
   i.trustProxy = h('input', { type: 'checkbox', checked: cfg.security.trustProxyHeaders !== false });
   i.cors = text((cfg.security.corsOrigins ?? ['*']).join(', '), { class: 'mono' });
   i.blockedIps = text((cfg.security.blockedIps ?? []).join(', '), { class: 'mono' });
+  i.originGuard = h('input', { type: 'checkbox', checked: cfg.security.dashboardOriginGuard !== false });
+  i.privateUserId = select(cfg.security.privateUserId ?? 'fingerprint', [
+    ['fingerprint', 'a fingerprint of the key — reveals nothing'],
+    ['keyId', 'the key\u2019s id'],
+    ['secret', 'the key itself — sends your credential upstream'],
+  ]);
 
   root.append(card('Security', h('div', {},
     h('label.switch', { style: { marginBottom: '12px' } }, i.requireKey,
       h('span', { text: 'Require a client key on every request' })),
     h('label.switch', { style: { marginBottom: '12px' } }, i.trustProxy,
       h('span', { text: 'Trust CF-Connecting-IP / X-Forwarded-For (on behind the tunnel)' })),
+    h('p.small.muted', {
+      text: 'Forwarded addresses are believed only when the connection itself came from '
+        + 'this machine, which is where cloudflared runs. A header off the network is '
+        + 'a string the caller typed, and blocked IPs are checked against the result.',
+    }),
+    h('label.switch', { style: { marginBottom: '12px' } }, i.originGuard,
+      h('span', { text: 'Refuse dashboard requests from another origin or host' })),
+    h('p.small.muted', {
+      text: 'Loopback is not private on Android: any app on the phone can reach this '
+        + 'dashboard, and so can a page your browser is pointed at. Leave this on, and '
+        + 'set a dashboard password — that is what stops everything that is not a browser.',
+    }),
+    field('A private key\u2019s user id upstream', i.privateUserId,
+      'what the backend sees when a private key calls'),
     field('Allowed CORS origins', i.cors, '* allows browser clients from anywhere'),
     field('Blocked IPs', i.blockedIps),
+  )));
+
+  /* ----------------------------------------------------------- billing */
+  const bill = cfg.billing ?? {};
+  const issuer = bill.issuer ?? {};
+  i.blEnabled = h('input', { type: 'checkbox', checked: bill.enabled === true });
+  i.blAuto = h('input', { type: 'checkbox', checked: bill.autoIssue === true });
+  i.blCurrency = text(bill.currency ?? 'USD');
+  i.blPrefix = text(bill.numberPrefix ?? 'INV', { class: 'mono' });
+  i.blTax = number(bill.taxPercent ?? 0, { min: 0, step: 0.5 });
+  i.blMinimum = number(bill.minimumUsd ?? 0, { min: 0, step: 1 });
+  i.blCycleDay = number(bill.cycleDay ?? 1, { min: 1, max: 28 });
+  i.blIssuerName = text(issuer.name ?? '');
+  i.blIssuerEmail = text(issuer.email ?? '');
+  i.blIssuerAddress = text(issuer.address ?? '');
+  i.blIssuerTaxId = text(issuer.taxId ?? '');
+  i.blTerms = textarea(issuer.paymentTerms ?? '', { rows: 3 });
+
+  root.append(card('Billing', h('div', {},
+    h('label.switch', { style: { marginBottom: '12px' } }, i.blEnabled,
+      h('span', { text: 'Issue invoices from the usage ledger' })),
+    h('div.grid.form', {},
+      field('Currency', i.blCurrency, 'printed on the invoice; the arithmetic stays in USD'),
+      field('Number prefix', i.blPrefix, `gives ${bill.numberPrefix ?? 'INV'}-${new Date().getFullYear()}-0001`),
+      field('Tax %', i.blTax, 'a key can override this'),
+    ),
+    h('div.grid.form', {},
+      field('Minimum invoice', i.blMinimum, 'under this the period stays open'),
+      field('Cycle day', i.blCycleDay, '1 to 28 — February has no 30th'),
+    ),
+    h('label.switch', { style: { marginBottom: '12px' } }, i.blAuto,
+      h('span', { text: 'Issue automatically on the cycle day' })),
+    h('p.small.muted', {
+      text: 'Automatic issue only touches keys that asked for it, one at a time, on the '
+        + 'cycle day. Issuing closes a billing period, so for every other key it stays '
+        + 'a decision somebody makes on the Billing screen.',
+    }),
+    h('h3.small', { text: 'Who the invoice is from' }),
+    h('div.grid.form', {},
+      field('Name', i.blIssuerName),
+      field('Email', i.blIssuerEmail),
+      field('Tax id', i.blIssuerTaxId),
+    ),
+    field('Address', i.blIssuerAddress),
+    field('Payment terms', i.blTerms, 'bank details, due dates — printed under the totals'),
   )));
 
   /* ----------------------------------------------------------- logging */
@@ -354,8 +419,26 @@ export async function settingsView(ctx) {
             security: {
               requireClientKey: i.requireKey.checked,
               trustProxyHeaders: i.trustProxy.checked,
+              dashboardOriginGuard: i.originGuard.checked,
+              privateUserId: i.privateUserId.value,
               corsOrigins: parseList(i.cors.value),
               blockedIps: parseList(i.blockedIps.value),
+            },
+            billing: {
+              enabled: i.blEnabled.checked,
+              autoIssue: i.blAuto.checked,
+              currency: i.blCurrency.value.trim(),
+              numberPrefix: i.blPrefix.value.trim(),
+              taxPercent: Number(i.blTax.value) || 0,
+              minimumUsd: Number(i.blMinimum.value) || 0,
+              cycleDay: Number(i.blCycleDay.value) || 1,
+              issuer: {
+                name: i.blIssuerName.value,
+                email: i.blIssuerEmail.value,
+                address: i.blIssuerAddress.value,
+                taxId: i.blIssuerTaxId.value,
+                paymentTerms: i.blTerms.value,
+              },
             },
             pricing: {
               enabled: i.prEnabled.checked,

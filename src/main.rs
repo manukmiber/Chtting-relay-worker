@@ -343,6 +343,10 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
         }
     });
 
+    // The billing cycle, for keys that asked to be invoiced without anyone
+    // pressing a button.
+    billing_cycle(state.clone());
+
     tokio::select! {
         result = relay_task => { result??; }
         result = async {
@@ -853,4 +857,92 @@ async fn tokenizer_command(paths: Paths, action: TokenizerAction) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// Issue the invoices the calendar says are due.
+///
+/// Checked hourly rather than scheduled for a moment: a phone sleeps, gets
+/// killed and comes back, and a task waiting for one exact instant is a task
+/// that misses it. An hourly look at "is it the cycle day, and has this key
+/// already been billed today?" survives all of that and cannot double-bill,
+/// because the answer to the second half is read from the invoices themselves.
+///
+/// Only keys with `billing.autoInvoice` are touched. An invoice closes a
+/// billing period, so for everyone else it stays somebody's decision.
+fn billing_cycle(state: Arc<chtting_relay::state::AppState>) {
+    use chtting_relay::store::invoice::{self, IssueRequest, Issued};
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            ticker.tick().await;
+            let cfg = state.config.current();
+            if !cfg.billing.enabled || !cfg.billing.auto_issue {
+                continue;
+            }
+
+            let tz = cfg.tz();
+            let now = chtting_relay::util::now_ms();
+            let today = chtting_relay::util::day_key(now, &tz);
+            if chtting_relay::util::local_day_of_month(now, &tz) != cfg.billing.cycle_day {
+                continue;
+            }
+
+            for key in cfg.keys.iter().filter(|k| k.billing.auto_invoice) {
+                // Already billed today: the hourly tick has come round again on
+                // the same cycle day, not a new one.
+                let key_id = key.id.clone();
+                let tz_for_read = tz;
+                let today_for_read = today.clone();
+                let billed_today = state
+                    .store
+                    .read(move |conn| {
+                        let last = invoice::list(conn, Some(&key_id), 1)?.into_iter().next();
+                        Ok(last.is_some_and(|i| {
+                            chtting_relay::util::day_key(i.issued_at, &tz_for_read)
+                                == today_for_read
+                        }))
+                    })
+                    .await
+                    .unwrap_or(true);
+                if billed_today {
+                    continue;
+                }
+
+                let key = key.clone();
+                let billing = cfg.billing.clone();
+                let label = key.display_name().to_string();
+                let issued = state
+                    .store
+                    .write(move |conn| {
+                        invoice::issue(
+                            conn,
+                            IssueRequest {
+                                key: &key,
+                                billing: &billing,
+                                note: "issued automatically on the billing cycle".into(),
+                                tax_percent: None,
+                                // Never forced: a period under the minimum, or
+                                // with nothing in it, rolls into the next one.
+                                force: false,
+                                tz,
+                            },
+                        )
+                    })
+                    .await;
+
+                match issued {
+                    Ok(Issued::Invoice(inv)) => state.logger.info(format!(
+                        "invoice {} issued automatically for {label}: {} {:.6}",
+                        inv.number, inv.currency, inv.total_usd,
+                    )),
+                    // Nothing to bill is the ordinary state of a quiet key.
+                    Ok(Issued::Skipped(_)) => {}
+                    Err(err) => state
+                        .logger
+                        .error(format!("could not invoice {label} automatically: {err}")),
+                }
+            }
+        }
+    });
 }

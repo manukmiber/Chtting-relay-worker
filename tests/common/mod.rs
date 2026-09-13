@@ -358,6 +358,18 @@ impl Harness {
             .expect("relay is reachable")
     }
 
+    /// A post as some other key, for the tests where which key called is the
+    /// whole point.
+    pub async fn post_as(&self, key: &str, path: &str, body: Value) -> reqwest::Response {
+        self.client()
+            .post(self.url(path))
+            .header("authorization", format!("Bearer {key}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("relay is reachable")
+    }
+
     /// A post carrying headers of the caller's own, for the paths where what
     /// travels beside the body is the point.
     pub async fn post_with(
@@ -421,7 +433,8 @@ impl Harness {
                     "SELECT seq, request_id, phase, status, requests, input_tokens,
                             billed_input_tokens, output_tokens, cached_tokens, cache_hit,
                             ttft_ms, gen_ms, total_ms, queued_ms, tokens_per_sec,
-                            prev_hash, row_hash
+                            prev_hash, row_hash, key_id, user_id, key_kind,
+                            proxy_usd, backend_usd, fmt
                      FROM usage_ledger ORDER BY seq ASC",
                 )?;
                 let rows = stmt
@@ -444,6 +457,12 @@ impl Harness {
                             "tokens_per_sec": r.get::<_, f64>(14)?,
                             "prev_hash": r.get::<_, String>(15)?,
                             "row_hash": r.get::<_, String>(16)?,
+                            "key_id": r.get::<_, String>(17)?,
+                            "user_id": r.get::<_, String>(18)?,
+                            "key_kind": r.get::<_, String>(19)?,
+                            "proxy_usd": r.get::<_, f64>(20)?,
+                            "backend_usd": r.get::<_, f64>(21)?,
+                            "fmt": r.get::<_, i64>(22)?,
                         }))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;

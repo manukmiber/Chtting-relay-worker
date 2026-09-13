@@ -27,7 +27,9 @@
     "corsOrigins": [
       "*"
     ],
-    "trustProxyHeaders": true
+    "trustProxyHeaders": true,
+    "dashboardOriginGuard": true,
+    "privateUserId": "fingerprint"
   },
   "backends": [
     {
@@ -374,6 +376,11 @@
         "requestsPerMinute": 30,
         "requestsPerDay": 500,
         "tokensPerDay": 0
+      },
+      "kind": "private",
+      "billing": {
+        "name": "me",
+        "autoInvoice": false
       }
     },
     {
@@ -388,6 +395,13 @@
         "requestsPerMinute": 10,
         "requestsPerDay": 100,
         "tokensPerDay": 200000
+      },
+      "kind": "company",
+      "billing": {
+        "name": "A Friend Ltd",
+        "email": "billing@example.com",
+        "taxPercent": 11,
+        "autoInvoice": true
       }
     }
   ],
@@ -524,5 +538,21 @@
         "stop": true
       }
     ]
+  },
+  "billing": {
+    "enabled": false,
+    "currency": "USD",
+    "numberPrefix": "INV",
+    "taxPercent": 0,
+    "minimumUsd": 0,
+    "cycleDay": 1,
+    "autoIssue": false,
+    "issuer": {
+      "name": "",
+      "email": "",
+      "address": "",
+      "taxId": "",
+      "paymentTerms": ""
+    }
   }
 }
