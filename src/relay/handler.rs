@@ -640,7 +640,9 @@ pub async fn handle_chat(
                 },
             );
             drop(ticket);
-            return error_response(err.status, &err.message, "upstream_error", None);
+            // The detail above is on the record and in the log; the caller gets
+            // an answer that says nothing about what sits behind this relay.
+            return crate::relay::upstream_failure(err.status);
         }
     };
 
@@ -655,7 +657,6 @@ pub async fn handle_chat(
 
     let response = match sent {
         Sent::Failed { status, body, .. } => {
-            let message = format!("backend rejected the request: {}", truncate(&body, 400));
             finish(
                 &state,
                 record,
@@ -668,7 +669,7 @@ pub async fn handle_chat(
                     ..Default::default()
                 },
             );
-            error_response(status, &message, "upstream_error", None)
+            crate::relay::upstream_failure(status)
         }
         Sent::Ok { response, .. } => {
             let transform = ResponseTransform::merged(

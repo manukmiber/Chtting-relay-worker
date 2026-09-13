@@ -477,10 +477,16 @@ async fn a_daily_request_quota_is_enforced_too() {
 /* --------------------------------------------------- failure handling -- */
 
 #[tokio::test]
-async fn a_backend_error_status_reaches_the_caller_rather_than_a_generic_502() {
+async fn a_backend_failure_is_reshaped_before_the_caller_sees_it() {
+    // Requirement 14 on the failure path. The backend's status and its own
+    // words used to travel outwards verbatim, which told a caller both that
+    // there is a backend and what it thinks — in the one response most likely
+    // to be pasted into someone else's bug tracker.
     let mock = MockConfig {
         status: 503,
-        error_body: Some(json!({"error": {"message": "model is warming up"}}).to_string()),
+        error_body: Some(
+            json!({"error": {"message": "model is warming up on cluster eu-west-2"}}).to_string(),
+        ),
         ..Default::default()
     };
     let h = harness(mock, |_| {}).await;
@@ -488,17 +494,47 @@ async fn a_backend_error_status_reaches_the_caller_rather_than_a_generic_502() {
     let response = h.post("/v1/chat/completions", chat("hi")).await;
     assert_eq!(
         response.status(),
-        503,
-        "the backend's own status must survive"
+        502,
+        "a backend-side failure reads as unavailable, whatever status it used"
     );
     let body: serde_json::Value = response.json().await.unwrap();
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("model is warming up"));
+    let message = body["error"]["message"].as_str().unwrap();
+    assert_eq!(message, "the model is unavailable right now");
+    assert_eq!(body["error"]["code"], "upstream_unavailable");
+    assert!(
+        !message.contains("warming up") && !message.contains("eu-west-2"),
+        "the backend's own words must not travel: {message}"
+    );
 
+    // The operator still gets the real reason, on the row only they can read.
     let row = h.last_row().await;
-    assert_eq!(row["status"], 503);
+    assert_eq!(row["status"], 503, "the record keeps the true status");
+    assert!(
+        row["error"].as_str().unwrap().contains("warming up"),
+        "the record keeps the backend's own words: {}",
+        row["error"]
+    );
+}
+
+#[tokio::test]
+async fn a_request_the_caller_can_fix_keeps_its_meaning() {
+    // Not everything is collapsed into 502: a 400 says the request itself was
+    // wrong, and hiding that would leave the caller with nothing to act on.
+    let mock = MockConfig {
+        status: 400,
+        error_body: Some(json!({"error": {"message": "temperature must be <= 2"}}).to_string()),
+        ..Default::default()
+    };
+    let h = harness(mock, |_| {}).await;
+
+    let response = h.post("/v1/chat/completions", chat("hi")).await;
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["error"]["message"],
+        "that request was not accepted for this model"
+    );
+    assert_eq!(body["error"]["code"], "invalid_request");
 }
 
 #[tokio::test]
