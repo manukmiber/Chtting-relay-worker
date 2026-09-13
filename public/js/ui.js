@@ -278,3 +278,9 @@ export function stringifyKeyValues(obj) {
 export function parseList(raw) {
   return String(raw ?? '').split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
 }
+
+// One entry per line and nothing else, for values that may hold a comma of
+// their own — a sentence, say.
+export function parseLines(raw) {
+  return String(raw ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
+}

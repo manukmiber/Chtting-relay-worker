@@ -35,7 +35,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::{
     ClientKey, Config, Model, Pricing, RequestTransform, ResolvedResponseTransform,
-    ResponseTransform,
+    ResponseTransform, DEFAULT_MODEL_OWNER,
 };
 use crate::pricing::{self, Effort, Priced, Shape};
 use crate::relay::error_response;
@@ -162,7 +162,7 @@ pub fn list_models(cfg: &Config) -> Value {
                 "id": m.id,
                 "object": "model",
                 "created": m.created_at / 1000,
-                "owned_by": "chtting-relay",
+                "owned_by": if m.owner.is_empty() { DEFAULT_MODEL_OWNER } else { &m.owner },
                 "display_name": if m.display_name.is_empty() { &m.id } else { &m.display_name },
             });
             let map = entry.as_object_mut().expect("just built an object");
@@ -204,8 +204,10 @@ struct Ctx {
 }
 
 impl Ctx {
-    /// Price the request as it stands. Called once the token counts are final.
-    fn price(&self, usage: &Usage) -> Priced {
+    /// Price the request as it stands. Called once the token counts are final,
+    /// with the answer in the model's own words — before any rewriting of ours,
+    /// since a refusal is priced from what the model said.
+    fn price(&self, usage: &Usage, answer: &str) -> Priced {
         pricing::price(
             &self.pricing,
             &Shape {
@@ -218,6 +220,7 @@ impl Ctx {
                 hour: self.record.local_hour,
                 weekday: self.record.local_weekday,
                 streamed: self.client_wants_stream,
+                refused: pricing::is_refusal(answer, &self.pricing.refusal_phrases),
             },
         )
     }
@@ -237,13 +240,16 @@ impl Ctx {
                 hour: self.record.local_hour,
                 weekday: self.record.local_weekday,
                 streamed: self.client_wants_stream,
+                // Never on this side: whether the model refused is our business
+                // with the caller, and no concern of the upstream invoice.
+                refused: false,
             },
         )
     }
 
     /// The `usage` block the caller gets, cost included.
-    fn usage_json(&self, charged: &Usage) -> Value {
-        let priced = self.price(charged);
+    fn usage_json(&self, charged: &Usage, answer: &str) -> Value {
+        let priced = self.price(charged, answer);
         charged.public(self.pricing.enabled.then_some(priced.proxy_usd))
     }
 }
@@ -957,7 +963,7 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
             // price list — never the backend's usage block, which stopped at
             // the parser.
             if charged.prompt_tokens > 0 || charged.completion_tokens > 0 {
-                let chunk = usage_chunk(&ctx.identity, &ctx.usage_json(&charged));
+                let chunk = usage_chunk(&ctx.identity, &ctx.usage_json(&charged, &pumped.text));
                 emit_frame(&tx, &mut pumped, sse::format_sse(&chunk)).await;
             }
             if let Some(err) = &pumped.error {
@@ -1024,7 +1030,8 @@ async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Respo
         } else {
             &pumped.finish_reason
         },
-        &ctx.usage_json(&charged),
+        // Priced on what the model itself said, not on our rewrite of it.
+        &ctx.usage_json(&charged, &pumped.text),
     );
 
     let body = serde_json::to_vec(&assembled).unwrap_or_default();
@@ -1075,6 +1082,22 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
             return error_response(502, &message, "upstream_error", None);
         }
     };
+
+    // What the model itself said, before any rewriting of ours. A refusal is
+    // recognised by the model's own words: a replace rule that renames the
+    // backend must not be able to hide one, or to invent one.
+    let spoken = flatten_content(
+        payload
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| {
+                c.get("message")
+                    .and_then(|m| m.get("content"))
+                    .or_else(|| c.get("text"))
+            })
+            .unwrap_or(&Value::Null),
+    );
 
     let mut shaped = transform_response(&payload, &ctx.identity, &ctx.transform);
     let choice = shaped
@@ -1131,7 +1154,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
     let charged = billed.charged_to_caller(ctx.user_local);
 
     if let Some(map) = shaped.as_object_mut() {
-        map.insert("usage".into(), ctx.usage_json(&charged));
+        map.insert("usage".into(), ctx.usage_json(&charged, &spoken));
     }
 
     let finish_reason = choice
@@ -1146,7 +1169,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
     };
 
     let finished = Instant::now();
-    let usage_json = ctx.usage_json(&charged);
+    let usage_json = ctx.usage_json(&charged, &spoken);
     let out = if ctx.client_wants_stream {
         // The backend could not stream, so replay the finished answer as SSE.
         replay_as_sse(&ctx, &content, &usage_json)
@@ -1168,7 +1191,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
             finish_reason: &finish_reason,
             response_preview: &preview,
             ledgered: ctx.ledgered,
-            priced: Some(ctx.price(&charged)),
+            priced: Some(ctx.price(&charged, &spoken)),
             backend_priced: Some(ctx.backend_price(&billed)),
             bytes_out: serde_json::to_vec(&shaped)
                 .map(|b| b.len() as u64)
@@ -1249,7 +1272,7 @@ fn record_stream_outcome(ctx: &Ctx, pumped: &Pumped, billed: &Usage, charged: &U
             finish_reason: &pumped.finish_reason,
             response_preview: &preview,
             ledgered: ctx.ledgered,
-            priced: Some(ctx.price(charged)),
+            priced: Some(ctx.price(charged, &pumped.text)),
             backend_priced: Some(ctx.backend_price(billed)),
             bytes_out: pumped.bytes_out,
             bytes_upstream: pumped.bytes_upstream,

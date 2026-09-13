@@ -1,6 +1,6 @@
 import { api } from '../api.js';
 import {
-  h, card, field, text, number, textarea, select, toast, parseList,
+  h, card, field, text, number, textarea, select, toast, parseList, parseLines,
   fmtNum, fmtMs, fmtBytes, confirmDialog, copy, stat,
 } from '../ui.js';
 
@@ -111,6 +111,8 @@ export async function settingsView(ctx) {
   i.prReasoning = number(pr.reasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
   i.prMargin = number(pr.marginPercent ?? 0, { min: 0, step: 1 });
   i.prRequest = number(pr.requestUsd ?? 0, { min: 0, step: 0.0001 });
+  i.prRefusal = number(pr.refusalUsd ?? 0, { min: 0, step: 0.01 });
+  i.prRefusalPhrases = textarea((pr.refusalPhrases ?? []).join('\n'), { rows: 2 });
   i.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 12 });
 
   root.append(card('Pricing', h('div', {},
@@ -136,7 +138,14 @@ export async function settingsView(ctx) {
     h('div.grid.form', {},
       field('Margin %', i.prMargin),
       field('Per-request fee', i.prRequest),
+      field('Refused answer', i.prRefusal, 'flat price instead of tokens; 0 = off'),
     ),
+    h('p.small.muted', {
+      text: 'A reply that carries one of these sentences is a refusal: the caller pays the '
+        + 'flat price above instead of the tokens it took to say no, and the backend’s own '
+        + 'charge for reading the prompt still shows on the books.',
+    }),
+    field('Refusal wording', i.prRefusalPhrases, 'one per line, matched anywhere in the reply'),
     h('hr'),
     h('p.small.muted', {
       text: 'Tiers move the price per request, and every tier that matches applies — '
@@ -344,6 +353,8 @@ export async function settingsView(ctx) {
               reasoningUsdPerM: Number(i.prReasoning.value) || 0,
               marginPercent: Number(i.prMargin.value) || 0,
               requestUsd: Number(i.prRequest.value) || 0,
+              refusalUsd: Number(i.prRefusal.value) || 0,
+              refusalPhrases: parseLines(i.prRefusalPhrases.value),
               tiers: JSON.parse(i.prTiers.value || '[]'),
             },
             logging: {

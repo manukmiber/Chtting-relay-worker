@@ -172,6 +172,35 @@ pub fn effort_of(body: &Value) -> Effort {
 
 /* ------------------------------------------------------------- pricing -- */
 
+/// The name a refusal shows up under in the log line and the request drawer.
+pub const REFUSAL_TIER: &str = "refusal";
+
+/// Did the model refuse to answer?
+///
+/// Recognised from the completion itself rather than a status code, because a
+/// refusal is a perfectly successful HTTP 200 that happens to contain the one
+/// sentence the models are told to refuse with. Matching ignores case and
+/// collapses whitespace, so a phrase split across two streamed chunks and
+/// rejoined with a newline still reads as itself.
+pub fn is_refusal(text: &str, phrases: &[String]) -> bool {
+    if phrases.is_empty() || text.trim().is_empty() {
+        return false;
+    }
+    let flat = flatten(text);
+    phrases
+        .iter()
+        .map(|p| flatten(p))
+        .any(|p| !p.is_empty() && flat.contains(&p))
+}
+
+/// Lower case, one space between words, nothing at the ends.
+fn flatten(text: &str) -> String {
+    text.split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Everything a tier may be asked about.
 #[derive(Debug, Clone, Default)]
 pub struct Shape {
@@ -187,6 +216,9 @@ pub struct Shape {
     /// Day of week, Monday = 0 through Sunday = 6.
     pub weekday: u32,
     pub streamed: bool,
+    /// The model would not answer. Only ever set on the caller's side of the
+    /// books: the backend still ran the prompt and still invoices for it.
+    pub refused: bool,
 }
 
 /// What one request came to.
@@ -257,6 +289,14 @@ pub fn resolve(defaults: &Pricing, model: &Model) -> Pricing {
         reasoning_usd_per_m: pick(route.reasoning_usd_per_m, defaults.reasoning_usd_per_m),
         margin_percent: pick(route.margin_percent, defaults.margin_percent),
         request_usd: pick(route.request_usd, defaults.request_usd),
+        refusal_usd: pick(route.refusal_usd, defaults.refusal_usd),
+        // Wording, unlike a rate, is all-or-nothing: a model that lists its own
+        // refusal lines means those, not those on top of the global ones.
+        refusal_phrases: if route.refusal_phrases.is_empty() {
+            defaults.refusal_phrases.clone()
+        } else {
+            route.refusal_phrases.clone()
+        },
         tiers,
     }
 }
@@ -269,6 +309,20 @@ pub fn price(pricing: &Pricing, shape: &Shape) -> Priced {
 
     let backend = base_backend_rates(pricing);
     let backend_usd = charge(backend, shape) + pricing.request_usd.max(0.0) * 0.0;
+
+    // A refusal is priced as one thing that happened, not as the tokens it took
+    // to say it. The backend's own invoice is left exactly as it is: upstream
+    // read the prompt and charges for it either way, so the gap between the two
+    // is the real cost of a refusal and it belongs on the books.
+    if shape.refused && pricing.refusal_usd > 0.0 {
+        let fee = pricing.refusal_usd;
+        return Priced {
+            backend_usd: round(backend_usd.max(0.0), 9),
+            proxy_usd: round(fee, 9),
+            profit_usd: round(fee - backend_usd.max(0.0), 9),
+            tiers: vec![REFUSAL_TIER.into()],
+        };
+    }
 
     // The sell side starts either from an explicit rate or from the backend's
     // rate plus the margin, field by field, so setting one explicitly does not
@@ -501,7 +555,7 @@ mod tests {
 
     fn shape(input: u64, output: u64) -> Shape {
         Shape {
-            model_id: "wissanggeni-512B-V1".into(),
+            model_id: "Wissangeni-512B-V1".into(),
             input_tokens: input,
             output_tokens: output,
             ..Default::default()
@@ -563,7 +617,7 @@ mod tests {
         ];
 
         let shape = Shape {
-            model_id: "wissanggeni-512B-V1".into(),
+            model_id: "Wissangeni-512B-V1".into(),
             input_tokens: 300_000,
             output_tokens: 1_000,
             reasoning_tokens: 1_000,
@@ -754,6 +808,176 @@ mod tests {
             effort_of(&json!({"reasoning_effort": "low", "thinking": {"budget_tokens": 60000}})),
             Effort::Low
         );
+    }
+
+    /// The published price list for one of the three models, as the example
+    /// config writes it: a rate for each of the three thinking bands.
+    fn wissangeni() -> Pricing {
+        Pricing {
+            enabled: true,
+            input_usd_per_m: 0.80,
+            cached_input_usd_per_m: 0.20,
+            output_usd_per_m: 4.0,
+            reasoning_usd_per_m: 4.0,
+            refusal_usd: 0.05,
+            refusal_phrases: vec![REFUSAL.into()],
+            tiers: vec![
+                PricingTier {
+                    output_usd_per_m: Some(6.0),
+                    reasoning_usd_per_m: Some(6.0),
+                    stop: true,
+                    ..tier(
+                        "max thinking",
+                        TierWhen {
+                            efforts: vec!["max".into()],
+                            ..Default::default()
+                        },
+                    )
+                },
+                PricingTier {
+                    output_usd_per_m: Some(3.5),
+                    reasoning_usd_per_m: Some(3.5),
+                    stop: true,
+                    ..tier(
+                        "no thinking",
+                        TierWhen {
+                            efforts: vec!["none".into(), "minimal".into(), "default".into()],
+                            ..Default::default()
+                        },
+                    )
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    const REFUSAL: &str = "I cannot do that. I only provide AI roleplay.";
+
+    fn priced_at(effort: Effort) -> f64 {
+        price(
+            &wissangeni(),
+            &Shape {
+                effort: Some(effort),
+                ..shape(1_000_000, 1_000_000)
+            },
+        )
+        .proxy_usd
+    }
+
+    #[test]
+    fn each_thinking_band_has_its_own_output_rate() {
+        // input is 0.80/M throughout, so the difference is the output rate:
+        // 4.00 by default, 6.00 at maximum effort, 3.50 with thinking off.
+        assert_eq!(priced_at(Effort::Medium), 4.8, "the default band");
+        assert_eq!(
+            priced_at(Effort::High),
+            4.8,
+            "high is still the default band"
+        );
+        assert_eq!(priced_at(Effort::Max), 6.8, "max thinking");
+        assert_eq!(priced_at(Effort::None), 4.3, "thinking off");
+        assert_eq!(priced_at(Effort::Minimal), 4.3, "minimal is not thinking");
+        assert_eq!(
+            priced_at(Effort::Unspecified),
+            4.3,
+            "a caller who said nothing about thinking pays the non-thinking rate"
+        );
+    }
+
+    #[test]
+    fn a_cache_read_is_charged_at_its_own_published_rate() {
+        let out = price(
+            &wissangeni(),
+            &Shape {
+                cached_input_tokens: 750_000,
+                effort: Some(Effort::Medium),
+                ..shape(1_000_000, 0)
+            },
+        );
+        let expected = (250_000.0 * 0.80 + 750_000.0 * 0.20) / 1e6;
+        assert!((out.proxy_usd - expected).abs() < 1e-9, "{out:?}");
+    }
+
+    #[test]
+    fn a_refusal_costs_its_flat_price_rather_than_its_tokens() {
+        let mut p = wissangeni();
+        p.backend_input_usd_per_m = 0.28;
+        let out = price(
+            &p,
+            &Shape {
+                refused: true,
+                effort: Some(Effort::Max),
+                ..shape(1_000_000, 20)
+            },
+        );
+        assert_eq!(
+            out.proxy_usd, 0.05,
+            "the flat refusal price, not the tokens"
+        );
+        assert_eq!(out.tiers, vec!["refusal"], "and no tier of the usual chain");
+        // The backend read the whole prompt and charges for it either way, so
+        // the loss on a refusal is visible instead of hidden.
+        assert_eq!(out.backend_usd, 0.28);
+        assert_eq!(out.profit_usd, -0.23);
+    }
+
+    #[test]
+    fn a_refusal_with_no_price_set_is_billed_like_any_other_reply() {
+        let mut p = wissangeni();
+        p.refusal_usd = 0.0;
+        let out = price(
+            &p,
+            &Shape {
+                refused: true,
+                effort: Some(Effort::Medium),
+                ..shape(1_000_000, 1_000_000)
+            },
+        );
+        assert_eq!(out.proxy_usd, 4.8);
+    }
+
+    #[test]
+    fn a_refusal_is_recognised_however_it_is_spaced_or_cased() {
+        let phrases = vec![REFUSAL.to_string()];
+        assert!(is_refusal(REFUSAL, &phrases));
+        assert!(is_refusal(
+            "i cannot do that.\n  I only provide AI roleplay.",
+            &phrases
+        ));
+        assert!(
+            is_refusal(&format!("{REFUSAL} Ask me for a scene instead."), &phrases),
+            "a refusal that adds a sentence is still a refusal"
+        );
+        assert!(!is_refusal("She could not do that, so she left.", &phrases));
+        assert!(!is_refusal("", &phrases));
+        assert!(!is_refusal(REFUSAL, &[]), "nothing to recognise it by");
+    }
+
+    #[test]
+    fn a_models_own_refusal_wording_replaces_the_global_list() {
+        let defaults = Pricing {
+            refusal_usd: 0.05,
+            refusal_phrases: vec!["the house line".into()],
+            ..Default::default()
+        };
+        let inherited = resolve(&defaults, &Model::default());
+        assert_eq!(inherited.refusal_phrases, vec!["the house line"]);
+        assert_eq!(inherited.refusal_usd, 0.05);
+
+        let model = Model {
+            pricing: Pricing {
+                refusal_phrases: vec!["its own line".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = resolve(&defaults, &model);
+        assert_eq!(
+            merged.refusal_phrases,
+            vec!["its own line"],
+            "wording is all-or-nothing, not merged"
+        );
+        assert_eq!(merged.refusal_usd, 0.05, "the price is still inherited");
     }
 
     #[test]

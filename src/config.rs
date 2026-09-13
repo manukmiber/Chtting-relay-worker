@@ -239,6 +239,9 @@ impl Default for Backend {
     }
 }
 
+/// The name every model is published under unless one of them says otherwise.
+pub const DEFAULT_MODEL_OWNER: &str = "ZeikoAI";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Model {
@@ -247,6 +250,10 @@ pub struct Model {
     pub enabled: bool,
     pub display_name: String,
     pub description: String,
+    /// Who the model is published as, in `owned_by` on the OpenAI surface.
+    /// Left blank it reads as [`DEFAULT_MODEL_OWNER`]: a model served here is
+    /// the house's own, whatever hardware answers it.
+    pub owner: String,
     pub backend: String,
     /// The name actually sent upstream. Never exposed to callers.
     pub upstream_model: String,
@@ -280,6 +287,7 @@ impl Default for Model {
             enabled: true,
             display_name: String::new(),
             description: String::new(),
+            owner: DEFAULT_MODEL_OWNER.into(),
             backend: String::new(),
             upstream_model: String::new(),
             fallbacks: Vec::new(),
@@ -382,6 +390,10 @@ impl Default for SystemPromptRule {
 /// a request applies. That is the point: a price can depend on thinking effort
 /// and the hour and the size of the prompt at the same time, rather than the
 /// relay having to pick one reason to charge more.
+/// What the models say when they will not answer. One sentence, fixed wording,
+/// so a refusal can be recognised from the completion alone.
+pub const DEFAULT_REFUSAL_PHRASES: [&str; 1] = ["I cannot do that. I only provide AI roleplay."];
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Pricing {
@@ -404,6 +416,15 @@ pub struct Pricing {
     pub margin_percent: f64,
     /// A flat fee per request, on top of the token charges.
     pub request_usd: f64,
+    /// What a refused answer costs instead of its tokens. The model still had
+    /// to read the prompt to decide it would not answer, so the request is not
+    /// free; it is also not worth the full price of an answer. 0 bills a
+    /// refusal like any other reply.
+    pub refusal_usd: f64,
+    /// The wording that marks a reply as a refusal, matched case-insensitively
+    /// anywhere in the completion. Empty, with a refusal price set, falls back
+    /// to [`DEFAULT_REFUSAL_PHRASES`].
+    pub refusal_phrases: Vec<String>,
     pub tiers: Vec<PricingTier>,
 }
 
@@ -1242,6 +1263,9 @@ pub fn normalize(mut cfg: Config) -> Config {
         if m.max_tokens_per_second < 0.0 {
             m.max_tokens_per_second = 0.0;
         }
+        if m.owner.trim().is_empty() {
+            m.owner = DEFAULT_MODEL_OWNER.into();
+        }
         normalize_pricing(&mut m.pricing);
     }
     cfg.models.retain(|m| !m.id.is_empty());
@@ -1290,6 +1314,21 @@ fn describe_efforts(efforts: &[String], min: &str, max: &str) -> String {
 fn normalize_pricing(pricing: &mut Pricing) {
     if pricing.currency.is_empty() {
         pricing.currency = "USD".into();
+    }
+    if !pricing.refusal_usd.is_finite() || pricing.refusal_usd < 0.0 {
+        pricing.refusal_usd = 0.0;
+    }
+    for phrase in &mut pricing.refusal_phrases {
+        *phrase = phrase.trim().to_string();
+    }
+    pricing.refusal_phrases.retain(|p| !p.is_empty());
+    // A refusal price with nothing to recognise a refusal by would never be
+    // charged, which looks like a bug in the price list rather than a choice.
+    if pricing.refusal_usd > 0.0 && pricing.refusal_phrases.is_empty() {
+        pricing.refusal_phrases = DEFAULT_REFUSAL_PHRASES
+            .iter()
+            .map(|p| (*p).into())
+            .collect();
     }
     for tier in &mut pricing.tiers {
         if tier.id.is_empty() {

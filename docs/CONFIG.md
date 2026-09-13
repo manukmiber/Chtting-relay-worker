@@ -197,6 +197,7 @@ reshaping are configured.
 | `aliases` | `[]` | extra accepted names |
 | `enabled` | `true` | disabled models vanish from `/v1/models` and refuse calls |
 | `displayName`, `description` | | shown in the dashboard and `/v1/models` |
+| `owner` | `ZeikoAI` | published as `owned_by` in `/v1/models` |
 | `backend` | | backend id |
 | `upstreamModel` | | the real name sent upstream — never exposed |
 | `fallbacks` | `[]` | backend ids tried in order when the main one fails |
@@ -368,6 +369,8 @@ rules that move the second one.
 | `cachedInputUsdPerM`, `reasoningUsdPerM` | `0` | likewise |
 | `marginPercent` | `0` | markup over the backend rate, for every rate left at 0 |
 | `requestUsd` | `0` | a flat fee per request |
+| `refusalUsd` | `0` | what a refused answer costs instead of its tokens; `0` bills it like any other reply |
+| `refusalPhrases` | built-in | the wording that marks a reply as a refusal |
 | `tiers` | `[]` | conditional price changes; see below |
 
 Off by default on purpose: a relay nobody has priced should report nothing
@@ -376,6 +379,28 @@ rather than a column of zeroes, which reads as free service.
 A model's own `pricing` is layered over this one field by field — a non-zero
 rate there wins — and its tiers are appended after the global ones, so a model's
 rules get the last word.
+
+### Refusals
+
+A model that will not answer still had to read the prompt to decide that, so the
+request is not free — and it is not worth the price of an answer either. Set
+`refusalUsd` and a refused request costs that flat amount instead of its tokens:
+no tier applies, `price_tiers` reads `refusal`, and the request row still carries
+the backend's own charge for the prompt it read, so the cost of saying no is
+visible rather than hidden.
+
+A refusal is recognised from the completion itself — a refusal is a perfectly
+successful `200` — by matching `refusalPhrases` anywhere in the reply, ignoring
+case and collapsing whitespace. Left empty with a price set, it falls back to the
+sentence the models are told to refuse with:
+
+```json
+"refusalUsd": 0.05,
+"refusalPhrases": ["I cannot do that. I only provide AI roleplay."]
+```
+
+A model's own list replaces the global one outright rather than adding to it:
+wording, unlike a rate, is all-or-nothing.
 
 ### Tiers
 
@@ -432,7 +457,7 @@ else's invoice. So each request row carries three numbers —
 `backend_usd` (the backend's rates over the body the backend actually received),
 `proxy_usd` (our rates, after every matching tier, over the caller's own token
 count) and `profit_usd` — plus `price_tiers`, the names of the tiers that
-applied.
+applied, or `refusal` when the reply was one.
 
 `proxy_usd` also goes back to the caller, rounded, inside the `usage` block:
 
@@ -511,12 +536,12 @@ under their words.
 With `verboseRequests` on, each request writes a trail of lines under one uuid:
 
 ```
-req 32dadfde in    2026-09-13T14:41:41.383+07:00 model=wissanggeni-512B-V1 key=hp user=tenant-42 effort=high stream=true bytes=147 ip=127.0.0.1
+req 32dadfde in    2026-09-13T14:41:41.383+07:00 model=Wissangeni-512B-V1 key=hp user=tenant-42 effort=high stream=true bytes=147 ip=127.0.0.1
 req 32dadfde inj         0.1ms  rule=spr_think mode=replace
 req 32dadfde tok       811.1ms  9 caller / 9 upstream  o200k_base exact
 req 32dadfde ttft     2014.5ms
 req 32dadfde done     2766.8ms  status=200 stop
-req 32dadfde sum   uid=32dadfde-f3dd-4ad8-acc5-387b72415f46 model=wissanggeni-512B-V1 key=hp user=tenant-42 effort=high | ram=82.6MB net=147B in/1 437B out/1 889B up | tok=9 in (0 cached, 0% hit) 909 out (629 reasoning) | backend=$0.000391 proxy=$0.001291 profit=$0.000900 [jam padat, thinking effort tinggi] | latency=2766.8ms ttft=2014.5ms tps=2171.84 (held to 6)
+req 32dadfde sum   uid=32dadfde-f3dd-4ad8-acc5-387b72415f46 model=Wissangeni-512B-V1 key=hp user=tenant-42 effort=high | ram=82.6MB net=147B in/1 437B out/1 889B up | tok=9 in (0 cached, 0% hit) 909 out (629 reasoning) | backend=$0.000391 proxy=$0.001291 profit=$0.000900 [jam padat, thinking effort tinggi] | latency=2766.8ms ttft=2014.5ms tps=2171.84 (held to 6)
 ```
 
 | Line | What it says |

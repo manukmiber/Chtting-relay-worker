@@ -164,16 +164,24 @@ function modelSection(models, cfg) {
   if (priced) {
     blocks.push({ p: 'Rates are USD per million tokens, as charged to the caller.' });
     blocks.push({
-      columns: ['Model', 'Input', 'Cached input', 'Output', 'Reasoning', 'Per request'],
+      columns: ['Model', 'Input', 'Cached input', 'Output', 'Reasoning', 'Per request', 'Refused'],
       rows: models.map((m) => {
         const p = resolvePricing(cfg.pricing ?? {}, m.pricing ?? {});
         return [
           `\`${m.id}\``,
           rate(p.input), rate(p.cachedInput), rate(p.output), rate(p.reasoning),
           p.requestUsd ? `$${p.requestUsd}` : '—',
+          p.refusalUsd ? `$${trimZeros(p.refusalUsd)}` : '—',
         ];
       }),
     });
+    const refusing = models.some((m) => resolvePricing(cfg.pricing ?? {}, m.pricing ?? {}).refusalUsd > 0);
+    if (refusing) {
+      blocks.push({
+        note: 'A reply that declines the request is billed at the flat "Refused" price instead of its '
+          + 'tokens — it still arrives as a normal `200`, and `usage.usage` carries that price.',
+      });
+    }
     const tiers = [...(cfg.pricing?.tiers ?? []), ...models.flatMap((m) => m.pricing?.tiers ?? [])]
       .filter((t) => t.enabled !== false);
     if (tiers.length) {
@@ -479,6 +487,7 @@ function resolvePricing(defaults, model) {
     output: sell(pick(model.outputUsdPerM, defaults.outputUsdPerM), backendOutput),
     reasoning: sell(pick(model.reasoningUsdPerM, defaults.reasoningUsdPerM), backendReasoning),
     requestUsd: pick(model.requestUsd, defaults.requestUsd) || 0,
+    refusalUsd: pick(model.refusalUsd, defaults.refusalUsd) || 0,
   };
 }
 
