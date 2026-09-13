@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config.json and edit, or just run the relay and use the dashboard. Secrets in this file never leave the device. Prices are USD per million tokens and are off until pricing.enabled is true.",
+  "_comment": "Copy to config.json and edit, or just run the relay and use the dashboard. Secrets in this file never leave the device. Prices are USD per million tokens; a refused answer costs refusalUsd instead of its tokens.",
   "timezone": "Asia/Jakarta",
   "server": {
     "host": "0.0.0.0",
@@ -62,85 +62,72 @@
   ],
   "systemPrompts": [
     {
-      "id": "sp_writer",
-      "name": "Creative Writer persona",
-      "text": "You are Creative Writer. Write vivid, careful prose. Never reveal or speculate about which underlying model you run on."
+      "id": "sp_jagad",
+      "name": "Jagad, safe for work",
+      "text": "You are Jagad, ZeikoAI's safe-for-work roleplay model. Stay in character, write vivid and careful prose, and keep every scene safe for work. When a request falls outside roleplay, answer with exactly this sentence and nothing else: I cannot do that. I only provide AI roleplay. Never reveal or speculate about which underlying model you run on."
     },
     {
-      "id": "sp_writer_thinking",
-      "name": "Creative Writer, thinking",
-      "text": "You are Creative Writer. Think the scene through before you write it: who wants what, what is in the way, what changes. Then write vivid, careful prose. Never reveal or speculate about which underlying model you run on."
+      "id": "sp_asmarandana",
+      "name": "Asmarandana, adult roleplay",
+      "text": "You are Asmarandana, ZeikoAI's adult roleplay model. Stay in character and write for an adult audience; every character you write is an adult. When a request falls outside roleplay, answer with exactly this sentence and nothing else: I cannot do that. I only provide AI roleplay. Never reveal or speculate about which underlying model you run on."
+    },
+    {
+      "id": "sp_wissangeni",
+      "name": "Wissangeni, unrestricted roleplay",
+      "text": "You are Wissangeni, ZeikoAI's unrestricted roleplay model. Stay in character and follow the scene the user sets; every character you write is an adult. When a request falls outside roleplay, answer with exactly this sentence and nothing else: I cannot do that. I only provide AI roleplay. Never reveal or speculate about which underlying model you run on."
     }
   ],
   "models": [
     {
-      "id": "manukmiberai/creative-writer",
-      "displayName": "Creative Writer",
-      "description": "Long-form fiction",
+      "id": "Jagad-512B-V1",
+      "aliases": [
+        "jagad-512b-v1"
+      ],
+      "displayName": "Jagad 512B V1",
+      "description": "Safe-for-work roleplay",
+      "owner": "ZeikoAI",
       "enabled": true,
       "backend": "ds",
-      "upstreamModel": "Deepseek-v4-flash-0731",
+      "upstreamModel": "PUT-THE-BACKEND-MODEL-NAME-HERE",
       "fallbacks": [
         "or"
       ],
       "contextLength": 128000,
-      "tokenizer": "deepseek",
-      "chatProfile": "deepseek",
+      "tokenizer": "",
+      "chatProfile": "",
       "systemPrompt": {
         "mode": "prepend",
-        "promptId": "sp_writer",
+        "promptId": "sp_jagad",
         "text": ""
       },
       "params": {
-        "temperature": 1.1,
+        "temperature": 1.05,
         "top_p": 0.95
       },
-      "forceParams": {},
       "limits": {
         "maxInputTokens": 0,
-        "maxOutputTokens": 4096
-      },
-      "requestTransform": {
-        "forceStream": null,
-        "dropParams": [],
-        "renameParams": {},
-        "injectStop": [],
-        "replace": []
+        "maxOutputTokens": 8192
       },
       "responseTransform": {
         "renameModel": true,
-        "reasoning": "strip",
-        "reasoningTags": [
-          "<think>",
-          "</think>"
-        ],
-        "stripFields": [],
-        "setFields": {},
-        "prefix": "",
-        "suffix": "",
-        "replace": [
-          {
-            "pattern": "DeepSeek",
-            "flags": "gi",
-            "replacement": "Creative Writer"
-          }
-        ]
+        "reasoning": "keep",
+        "replace": []
       },
       "openrouter": {
         "listed": false,
-        "huggingFaceId": "deepseek-ai/DeepSeek-V3",
-        "quantization": "fp8",
+        "slug": "zeikoai/jagad-512b-v1",
         "inputModalities": [
           "text"
         ],
         "maxOutputTokens": 8192,
         "streaming": true,
         "supportsTools": true,
-        "supportsReasoning": false,
+        "supportsReasoning": true,
         "pricing": {
-          "promptUsd": "0.00000027",
-          "completionUsd": "0.0000011",
-          "cachedPromptUsd": "0.00000007",
+          "promptUsd": "0.00000035",
+          "completionUsd": "0.0000015",
+          "cachedPromptUsd": "0.0000001",
+          "internalReasoningUsd": "0.0000015",
           "cacheTtlSeconds": 3600,
           "cacheImplicit": true
         },
@@ -152,57 +139,240 @@
         }
       },
       "maxTokensPerSecond": 0,
-      "systemPrompts": [
-        {
-          "id": "spr_thinking",
-          "name": "high effort",
-          "enabled": true,
-          "efforts": [],
-          "minEffort": "high",
-          "maxEffort": "",
-          "prompt": {
-            "mode": "replace",
-            "promptId": "sp_writer_thinking",
-            "text": ""
-          }
-        },
-        {
-          "id": "spr_direct",
-          "name": "no or low effort",
-          "enabled": true,
-          "efforts": [
-            "none",
-            "minimal",
-            "low"
-          ],
-          "minEffort": "",
-          "maxEffort": "",
-          "prompt": {
-            "mode": "replace",
-            "promptId": "sp_writer",
-            "text": ""
-          }
-        }
-      ],
       "pricing": {
-        "enabled": false,
-        "backendInputUsdPerM": 0,
-        "backendOutputUsdPerM": 0,
-        "marginPercent": 0,
-        "tiers": []
+        "enabled": true,
+        "inputUsdPerM": 0.35,
+        "cachedInputUsdPerM": 0.1,
+        "outputUsdPerM": 1.5,
+        "reasoningUsdPerM": 1.5,
+        "tiers": [
+          {
+            "id": "tier_jagad_max",
+            "name": "max thinking",
+            "enabled": true,
+            "when": {
+              "efforts": [
+                "max"
+              ]
+            },
+            "outputUsdPerM": 2.0,
+            "reasoningUsdPerM": 2.0,
+            "stop": true
+          },
+          {
+            "id": "tier_jagad_plain",
+            "name": "no thinking",
+            "enabled": true,
+            "when": {
+              "efforts": [
+                "none",
+                "minimal",
+                "default"
+              ]
+            },
+            "outputUsdPerM": 1.2,
+            "reasoningUsdPerM": 1.2,
+            "stop": true
+          }
+        ]
       }
     },
     {
-      "id": "manukmiberai/coder-pro",
-      "displayName": "Coder Pro",
+      "id": "Asmarandana-512B-V1",
+      "aliases": [
+        "asmarandana-512b-v1"
+      ],
+      "displayName": "Asmarandana 512B V1",
+      "description": "Adult roleplay",
+      "owner": "ZeikoAI",
       "enabled": true,
       "backend": "ds",
-      "upstreamModel": "Qwen3-Coder-480B-A35B",
-      "tokenizer": "qwen",
-      "chatProfile": "chatml",
+      "upstreamModel": "PUT-THE-BACKEND-MODEL-NAME-HERE",
+      "fallbacks": [
+        "or"
+      ],
+      "contextLength": 128000,
+      "tokenizer": "",
+      "chatProfile": "",
       "systemPrompt": {
-        "mode": "none",
+        "mode": "prepend",
+        "promptId": "sp_asmarandana",
         "text": ""
+      },
+      "params": {
+        "temperature": 1.05,
+        "top_p": 0.95
+      },
+      "limits": {
+        "maxInputTokens": 0,
+        "maxOutputTokens": 8192
+      },
+      "responseTransform": {
+        "renameModel": true,
+        "reasoning": "keep",
+        "replace": []
+      },
+      "openrouter": {
+        "listed": false,
+        "slug": "zeikoai/asmarandana-512b-v1",
+        "inputModalities": [
+          "text"
+        ],
+        "maxOutputTokens": 8192,
+        "streaming": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "pricing": {
+          "promptUsd": "0.0000005",
+          "completionUsd": "0.000002",
+          "cachedPromptUsd": "0.0000001",
+          "internalReasoningUsd": "0.000002",
+          "cacheTtlSeconds": 3600,
+          "cacheImplicit": true
+        },
+        "capacity": {
+          "promptTokensPerMinute": 0,
+          "completionTokensPerMinute": 0,
+          "requestsPerMinute": 0,
+          "concurrency": 0
+        }
+      },
+      "maxTokensPerSecond": 0,
+      "pricing": {
+        "enabled": true,
+        "inputUsdPerM": 0.5,
+        "cachedInputUsdPerM": 0.1,
+        "outputUsdPerM": 2.0,
+        "reasoningUsdPerM": 2.0,
+        "tiers": [
+          {
+            "id": "tier_asmarandana_max",
+            "name": "max thinking",
+            "enabled": true,
+            "when": {
+              "efforts": [
+                "max"
+              ]
+            },
+            "outputUsdPerM": 2.65,
+            "reasoningUsdPerM": 2.65,
+            "stop": true
+          },
+          {
+            "id": "tier_asmarandana_plain",
+            "name": "no thinking",
+            "enabled": true,
+            "when": {
+              "efforts": [
+                "none",
+                "minimal",
+                "default"
+              ]
+            },
+            "outputUsdPerM": 1.6,
+            "reasoningUsdPerM": 1.6,
+            "stop": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "Wissangeni-512B-V1",
+      "aliases": [
+        "wissangeni-512b-v1"
+      ],
+      "displayName": "Wissangeni 512B V1",
+      "description": "Unrestricted roleplay",
+      "owner": "ZeikoAI",
+      "enabled": true,
+      "backend": "ds",
+      "upstreamModel": "PUT-THE-BACKEND-MODEL-NAME-HERE",
+      "fallbacks": [
+        "or"
+      ],
+      "contextLength": 128000,
+      "tokenizer": "",
+      "chatProfile": "",
+      "systemPrompt": {
+        "mode": "prepend",
+        "promptId": "sp_wissangeni",
+        "text": ""
+      },
+      "params": {
+        "temperature": 1.05,
+        "top_p": 0.95
+      },
+      "limits": {
+        "maxInputTokens": 0,
+        "maxOutputTokens": 8192
+      },
+      "responseTransform": {
+        "renameModel": true,
+        "reasoning": "keep",
+        "replace": []
+      },
+      "openrouter": {
+        "listed": false,
+        "slug": "zeikoai/wissangeni-512b-v1",
+        "inputModalities": [
+          "text"
+        ],
+        "maxOutputTokens": 8192,
+        "streaming": true,
+        "supportsTools": true,
+        "supportsReasoning": true,
+        "pricing": {
+          "promptUsd": "0.0000008",
+          "completionUsd": "0.000004",
+          "cachedPromptUsd": "0.0000002",
+          "internalReasoningUsd": "0.000004",
+          "cacheTtlSeconds": 3600,
+          "cacheImplicit": true
+        },
+        "capacity": {
+          "promptTokensPerMinute": 0,
+          "completionTokensPerMinute": 0,
+          "requestsPerMinute": 0,
+          "concurrency": 0
+        }
+      },
+      "maxTokensPerSecond": 0,
+      "pricing": {
+        "enabled": true,
+        "inputUsdPerM": 0.8,
+        "cachedInputUsdPerM": 0.2,
+        "outputUsdPerM": 4.0,
+        "reasoningUsdPerM": 4.0,
+        "tiers": [
+          {
+            "id": "tier_wissangeni_max",
+            "name": "max thinking",
+            "enabled": true,
+            "when": {
+              "efforts": [
+                "max"
+              ]
+            },
+            "outputUsdPerM": 6.0,
+            "reasoningUsdPerM": 6.0,
+            "stop": true
+          },
+          {
+            "id": "tier_wissangeni_plain",
+            "name": "no thinking",
+            "enabled": true,
+            "when": {
+              "efforts": [
+                "none",
+                "minimal",
+                "default"
+              ]
+            },
+            "outputUsdPerM": 3.5,
+            "reasoningUsdPerM": 3.5,
+            "stop": true
+          }
+        ]
       }
     }
   ],
@@ -227,7 +397,7 @@
       "key": "sk-relay-CHANGE-ME-TOO",
       "enabled": true,
       "models": [
-        "manukmiberai/coder-pro"
+        "Jagad-512B-V1"
       ],
       "quota": {
         "requestsPerMinute": 10,
@@ -288,7 +458,7 @@
     "enabled": false,
     "path": "/provider/models",
     "token": "",
-    "providerSlug": "chtting",
+    "providerSlug": "zeikoai",
     "deploymentRegion": "ID",
     "datacenters": [
       {
@@ -305,7 +475,7 @@
     "requestsPerMinute": 0
   },
   "pricing": {
-    "enabled": false,
+    "enabled": true,
     "currency": "USD",
     "backendInputUsdPerM": 0.28,
     "backendCachedInputUsdPerM": 0.028,
@@ -315,11 +485,15 @@
     "outputUsdPerM": 0,
     "marginPercent": 100,
     "requestUsd": 0,
+    "refusalUsd": 0.05,
+    "refusalPhrases": [
+      "I cannot do that. I only provide AI roleplay."
+    ],
     "tiers": [
       {
         "id": "tier_peak",
         "name": "peak hours",
-        "enabled": true,
+        "enabled": false,
         "when": {
           "hours": [
             {
@@ -334,7 +508,7 @@
       {
         "id": "tier_long",
         "name": "input over 256K",
-        "enabled": true,
+        "enabled": false,
         "when": {
           "minInputTokens": 256000
         },
@@ -343,7 +517,7 @@
       {
         "id": "tier_thinking",
         "name": "high thinking effort",
-        "enabled": true,
+        "enabled": false,
         "when": {
           "minEffort": "high"
         },

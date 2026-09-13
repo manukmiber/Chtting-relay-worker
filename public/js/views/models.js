@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   h, card, table, pill, drawer, field, text, number, textarea, select, toggle,
-  toast, confirmDialog, parseKeyValues, stringifyKeyValues, parseList, copy,
+  toast, confirmDialog, parseKeyValues, stringifyKeyValues, parseList, parseLines, copy,
 } from '../ui.js';
 
 /**
@@ -69,6 +69,7 @@ function editModel(ctx, existing) {
     aliases: [],
     systemPrompt: { mode: 'none', text: '', promptId: '' },
     systemPrompts: [],
+    owner: '',
     maxTokensPerSecond: 0,
     pricing: {},
     params: {},
@@ -97,6 +98,7 @@ function editModel(ctx, existing) {
     inputs.enabled = h('input', { type: 'checkbox', checked: m.enabled !== false });
     inputs.displayName = text(m.displayName, { placeholder: 'Creative Writer' });
     inputs.description = text(m.description, { placeholder: 'Shown in the dashboard only' });
+    inputs.owner = text(m.owner ?? '', { placeholder: 'ZeikoAI' });
     inputs.aliases = text((m.aliases ?? []).join(', '), { placeholder: 'extra names callers may use' });
 
     body.append(
@@ -107,7 +109,10 @@ function editModel(ctx, existing) {
         field('Display name', inputs.displayName),
         field('Extra aliases', inputs.aliases),
       ),
-      field('Description', inputs.description),
+      h('div.grid.form', {},
+        field('Owner', inputs.owner, 'published as "owned_by"; blank means ZeikoAI'),
+        field('Description', inputs.description),
+      ),
       h('label.switch', { style: { marginBottom: '14px' } }, inputs.enabled, h('span', { text: 'Published in /v1/models' })),
     );
 
@@ -189,8 +194,12 @@ function editModel(ctx, existing) {
     inputs.prBackendReasoning = number(pr.backendReasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prIn = number(pr.inputUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prOut = number(pr.outputUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prCached = number(pr.cachedInputUsdPerM ?? 0, { min: 0, step: 0.01 });
+    inputs.prReasoning = number(pr.reasoningUsdPerM ?? 0, { min: 0, step: 0.01 });
     inputs.prMargin = number(pr.marginPercent ?? 0, { min: 0, step: 1 });
     inputs.prRequest = number(pr.requestUsd ?? 0, { min: 0, step: 0.0001 });
+    inputs.prRefusal = number(pr.refusalUsd ?? 0, { min: 0, step: 0.01 });
+    inputs.prRefusalPhrases = textarea((pr.refusalPhrases ?? []).join('\n'), { rows: 2 });
     inputs.prTiers = textarea(JSON.stringify(pr.tiers ?? [], null, 1), { rows: 10 });
 
     body.append(section('Speed and price', [
@@ -214,9 +223,17 @@ function editModel(ctx, existing) {
       h('div.grid.form', {},
         field('Our input', inputs.prIn, '0 = backend rate + margin'),
         field('Our output', inputs.prOut, '0 = backend rate + margin'),
+        field('Our cached input', inputs.prCached, 'what a cache read costs the caller'),
+        field('Our reasoning', inputs.prReasoning, '0 = billed as output'),
+      ),
+      h('div.grid.form', {},
         field('Margin %', inputs.prMargin),
         field('Per-request fee', inputs.prRequest),
+        field('Refused answer', inputs.prRefusal, 'flat price instead of tokens; 0 = off'),
       ),
+      field('Refusal wording', inputs.prRefusalPhrases,
+        'one per line; a reply carrying any of them is billed as a refusal. '
+        + 'Blank inherits the global list.'),
       h('p.small.muted', {
         text: 'Tiers change the price per request, and every tier that matches applies — '
           + 'a long prompt during a busy hour at maximum thinking effort pays all three. '
@@ -423,6 +440,7 @@ function editModel(ctx, existing) {
           upstreamModel: inputs.upstreamModel.value.trim(),
           displayName: inputs.displayName.value.trim(),
           description: inputs.description.value.trim(),
+          owner: inputs.owner.value.trim(),
           aliases: parseList(inputs.aliases.value),
           systemPrompt: {
             mode: inputs.spMode.value,
@@ -441,8 +459,12 @@ function editModel(ctx, existing) {
             backendReasoningUsdPerM: Number(inputs.prBackendReasoning.value) || 0,
             inputUsdPerM: Number(inputs.prIn.value) || 0,
             outputUsdPerM: Number(inputs.prOut.value) || 0,
+            cachedInputUsdPerM: Number(inputs.prCached.value) || 0,
+            reasoningUsdPerM: Number(inputs.prReasoning.value) || 0,
             marginPercent: Number(inputs.prMargin.value) || 0,
             requestUsd: Number(inputs.prRequest.value) || 0,
+            refusalUsd: Number(inputs.prRefusal.value) || 0,
+            refusalPhrases: parseLines(inputs.prRefusalPhrases.value),
             tiers: JSON.parse(inputs.prTiers.value || '[]'),
           },
           params: parseKeyValues(inputs.params.value),

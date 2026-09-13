@@ -2,6 +2,7 @@
 
 mod common;
 
+use chtting_relay::pricing::Effort;
 use common::{harness, read_sse, stream_text, MockConfig};
 use serde_json::json;
 
@@ -10,6 +11,60 @@ fn chat(content: &str) -> serde_json::Value {
         "model": "manukmiberai/creative-writer",
         "messages": [{"role": "user", "content": content}],
     })
+}
+
+/* --------------------------------------------------- the shipped config -- */
+
+#[tokio::test]
+async fn the_example_config_is_a_valid_one() {
+    // It is copied to config.json by hand and by the installer, so a price list
+    // or a prompt id that does not survive validation would be found by whoever
+    // is setting up a phone rather than here.
+    let raw = std::fs::read_to_string("config/config.example.json").expect("the example config");
+    let cfg: chtting_relay::config::Config = serde_json::from_str(&raw).expect("it parses");
+    let cfg = chtting_relay::config::normalize(cfg);
+    let problems = chtting_relay::config::validate(&cfg);
+    assert!(problems.is_empty(), "{problems:?}");
+
+    let jagad = cfg
+        .models
+        .iter()
+        .find(|m| m.id == "Jagad-512B-V1")
+        .expect("the SFW model is listed");
+    assert_eq!(jagad.owner, "ZeikoAI");
+
+    // The published price list, band by band, straight out of the file.
+    let priced = |model: &str, effort: Effort| {
+        let route = cfg.models.iter().find(|m| m.id == model).expect(model);
+        let pricing = chtting_relay::pricing::resolve(&cfg.pricing, route);
+        chtting_relay::pricing::price(
+            &pricing,
+            &chtting_relay::pricing::Shape {
+                model_id: model.into(),
+                input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                effort: Some(effort),
+                ..Default::default()
+            },
+        )
+        .proxy_usd
+    };
+
+    // A million tokens in and a million out, so each figure reads as the two
+    // rates added.
+    let same = |got: f64, want: f64, what: &str| {
+        assert!((got - want).abs() < 1e-9, "{what}: {got} is not {want}");
+    };
+    for (model, input, default_out, max_out, plain_out) in [
+        ("Jagad-512B-V1", 0.35, 1.5, 2.0, 1.2),
+        ("Asmarandana-512B-V1", 0.50, 2.0, 2.65, 1.6),
+        ("Wissangeni-512B-V1", 0.80, 4.0, 6.0, 3.5),
+    ] {
+        same(priced(model, Effort::Medium), input + default_out, model);
+        same(priced(model, Effort::Max), input + max_out, model);
+        same(priced(model, Effort::None), input + plain_out, model);
+        same(priced(model, Effort::Unspecified), input + plain_out, model);
+    }
 }
 
 /* ------------------------------------------------- 5. name translation -- */
@@ -39,6 +94,23 @@ async fn the_model_list_shows_aliases_only() {
     let text = body.to_string();
     assert!(text.contains("manukmiberai/creative-writer"));
     assert!(!text.contains("Deepseek-v4-flash-0731"));
+}
+
+#[tokio::test]
+async fn every_model_is_published_as_its_owner() {
+    let h = harness(MockConfig::default(), |cfg| {
+        let mut own = cfg.models[0].clone();
+        own.id = "manukmiberai/borrowed".into();
+        own.owner = "SomebodyElse".into();
+        cfg.models.push(own);
+    })
+    .await;
+
+    let body: serde_json::Value = h.get("/v1/models").await.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+    // Nobody set an owner on the first model, so it is the house's.
+    assert_eq!(data[0]["owned_by"], "ZeikoAI");
+    assert_eq!(data[1]["owned_by"], "SomebodyElse");
 }
 
 #[tokio::test]
@@ -1850,6 +1922,199 @@ async fn every_tier_that_describes_a_request_applies_to_its_price() {
         row["proxy_usd"].as_f64().unwrap() > row["backend_usd"].as_f64().unwrap(),
         "{row}"
     );
+}
+
+#[tokio::test]
+async fn a_refused_answer_costs_its_flat_price_and_says_so_on_the_row() {
+    const REFUSAL: &str = "I cannot do that. I only provide AI roleplay.";
+
+    let h = harness(
+        MockConfig {
+            reply: REFUSAL.into(),
+            ..MockConfig::default()
+        },
+        |cfg| {
+            cfg.models[0].tokenizer = "o200k_base".into();
+            cfg.pricing = chtting_relay::config::Pricing {
+                enabled: true,
+                backend_input_usd_per_m: 1_000_000.0,
+                input_usd_per_m: 1_000_000.0,
+                output_usd_per_m: 1_000_000.0,
+                refusal_usd: 0.05,
+                refusal_phrases: vec![REFUSAL.into()],
+                ..Default::default()
+            };
+        },
+    )
+    .await;
+
+    let body: serde_json::Value = h
+        .post("/v1/chat/completions", chat("something out of scope"))
+        .await
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body["usage"]["usage"], 0.05,
+        "the caller is charged the refusal price, not the tokens: {body}"
+    );
+    let row = h.last_row().await;
+    assert_eq!(row["proxy_usd"], 0.05);
+    assert_eq!(row["price_tiers"].as_str().unwrap(), "refusal");
+    // The backend still read the prompt and still charges for it, so a refusal
+    // shows up as the loss it is rather than as a clean sale.
+    assert!(row["backend_usd"].as_f64().unwrap() > 0.0, "{row}");
+    assert!(row["profit_usd"].as_f64().unwrap() < 0.0, "{row}");
+}
+
+#[tokio::test]
+async fn a_rewrite_of_ours_can_neither_hide_a_refusal_nor_invent_one() {
+    const REFUSAL: &str = "I cannot do that. I only provide AI roleplay.";
+
+    // A rule that rewrites the refusal on its way out. What the caller reads no
+    // longer contains the sentence, but the model still refused and the bill
+    // follows the model.
+    let h = harness(
+        MockConfig {
+            reply: REFUSAL.into(),
+            ..MockConfig::default()
+        },
+        |cfg| {
+            cfg.models[0].tokenizer = "o200k_base".into();
+            cfg.models[0].response_transform.replace =
+                Some(vec![chtting_relay::config::TextRule {
+                    pattern: "I only provide AI roleplay.".into(),
+                    replacement: "Ask me for a scene instead.".into(),
+                    literal: true,
+                    ..Default::default()
+                }]);
+            cfg.pricing = chtting_relay::config::Pricing {
+                enabled: true,
+                input_usd_per_m: 1_000_000.0,
+                output_usd_per_m: 1_000_000.0,
+                refusal_usd: 0.05,
+                refusal_phrases: vec![REFUSAL.into()],
+                ..Default::default()
+            };
+        },
+    )
+    .await;
+
+    let body: serde_json::Value = h
+        .post("/v1/chat/completions", chat("something out of scope"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Ask me for a scene instead."),
+        "{body}"
+    );
+    assert_eq!(body["usage"]["usage"], 0.05, "{body}");
+    assert_eq!(
+        h.last_row().await["price_tiers"].as_str().unwrap(),
+        "refusal"
+    );
+}
+
+#[tokio::test]
+async fn only_the_model_can_refuse_for_the_refusal_price() {
+    // A request the relay turns away itself never reached a model, so nothing
+    // refused it in the sense the price list means: the flat price is what a
+    // model charges for reading a prompt and declining it, and this prompt was
+    // never read.
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.models[0].limits.max_input_tokens = 5;
+        cfg.pricing = chtting_relay::config::Pricing {
+            enabled: true,
+            input_usd_per_m: 1_000_000.0,
+            output_usd_per_m: 1_000_000.0,
+            refusal_usd: 0.05,
+            refusal_phrases: vec!["I cannot do that. I only provide AI roleplay.".into()],
+            ..Default::default()
+        };
+    })
+    .await;
+
+    let response = h
+        .post(
+            "/v1/chat/completions",
+            chat("this prompt is comfortably longer than five tokens by any measure"),
+        )
+        .await;
+
+    assert_eq!(response.status(), 413);
+    assert_eq!(h.backend.request_count(), 0, "the backend was never asked");
+    let row = h.last_row().await;
+    assert_eq!(row["proxy_usd"], 0.0, "nothing to charge for: {row}");
+    assert_eq!(row["price_tiers"].as_str().unwrap(), "");
+}
+
+#[tokio::test]
+async fn a_streamed_refusal_carries_the_refusal_price_on_its_closing_frame() {
+    const REFUSAL: &str = "I cannot do that. I only provide AI roleplay.";
+
+    let h = harness(
+        MockConfig {
+            reply: REFUSAL.into(),
+            ..MockConfig::default()
+        },
+        |cfg| {
+            cfg.models[0].tokenizer = "o200k_base".into();
+            cfg.pricing = chtting_relay::config::Pricing {
+                enabled: true,
+                input_usd_per_m: 1_000_000.0,
+                output_usd_per_m: 1_000_000.0,
+                refusal_usd: 0.05,
+                refusal_phrases: vec![REFUSAL.into()],
+                ..Default::default()
+            };
+        },
+    )
+    .await;
+
+    let mut body = chat("something out of scope");
+    body["stream"] = json!(true);
+    let (events, _) = read_sse(h.post("/v1/chat/completions", body).await).await;
+    let usage = events
+        .iter()
+        .find_map(|e| e.get("usage").cloned())
+        .expect("the closing frame carries usage");
+
+    assert_eq!(usage["usage"], 0.05, "{usage}");
+    assert_eq!(h.last_row().await["proxy_usd"], 0.05);
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_a_refusal_is_priced_on_its_tokens() {
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.pricing = chtting_relay::config::Pricing {
+            enabled: true,
+            input_usd_per_m: 1_000_000.0,
+            output_usd_per_m: 1_000_000.0,
+            refusal_usd: 0.05,
+            refusal_phrases: vec!["I cannot do that. I only provide AI roleplay.".into()],
+            ..Default::default()
+        };
+    })
+    .await;
+
+    let row = h
+        .post("/v1/chat/completions", chat("write me a scene"))
+        .await;
+    assert_eq!(row.status(), 200);
+    let row = h.last_row().await;
+    assert!(
+        row["proxy_usd"].as_f64().unwrap() > 0.05,
+        "an answered request is priced on its tokens: {row}"
+    );
+    assert_eq!(row["price_tiers"].as_str().unwrap(), "");
 }
 
 #[tokio::test]

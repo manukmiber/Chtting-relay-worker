@@ -36,7 +36,7 @@ Yang keluar dari relay ini tidak menyisakan jejak backend sama sekali:
 ```jsonc
 // dari backend                          // ke pemanggil
 { "id": "3251459c-90b4-…",               { "id": "32dadfde-f3dd-4ad8-…",
-  "model": "deepseek-flash",               "model": "wissanggeni-512B-V1",
+  "model": "deepseek-flash",               "model": "Wissangeni-512B-V1",
   "system_fingerprint": "aeb564…",         "object": "chat.completion.chunk",
   "created": 1789263746,                   "created": 1789285301,
   "choices": [{ "index": 0,                "choices": [{ "index": 0,
@@ -260,6 +260,10 @@ POST /v1/chat/completions
 Satu alias bisa punya `aliases` tambahan, dan bisa punya `fallbacks` — daftar
 backend cadangan yang dicoba berurutan kalau yang utama mati atau kena limit.
 
+Tiap model juga punya pemiliknya sendiri, yang terbit sebagai `owned_by` di
+`/v1/models`. Dikosongkan, isinya **ZeikoAI** — model yang dilayani di sini
+memang model rumah sendiri, mesin siapa pun yang menjawabnya.
+
 ---
 
 ## 3. Injeksi system prompt
@@ -441,6 +445,41 @@ model dievaluasi belakangan, jadi dia yang berkata terakhir.
 Tier tidak pernah menyentuh angka backend: markup kita tidak bisa mengubah
 tagihan orang lain. Daftar lengkapnya di [docs/CONFIG.md](docs/CONFIG.md).
 
+### Daftar harga ZeikoAI
+
+Tarif jual yang dipasang di `config/config.example.json`, USD per juta token:
+
+| Model | Input | Cache read | Output | Max thinking | Tanpa thinking |
+|---|---|---|---|---|---|
+| `Jagad-512B-V1` — SFW | $0,35 | $0,10 | $1,50 | $2,00 | $1,20 |
+| `Asmarandana-512B-V1` — NSFW | $0,50 | $0,10 | $2,00 | $2,65 | $1,60 |
+| `Wissangeni-512B-V1` — uncensored | $0,80 | $0,20 | $4,00 | $6,00 | $3,50 |
+
+Kolom **Output** itu tarif bakunya: berlaku untuk thinking effort `low`,
+`medium`, dan `high`. Effort `max` pindah ke kolom **Max thinking**. Effort
+`none`, `minimal`, dan pemanggil yang tidak menyebut thinking sama sekali masuk
+kolom **Tanpa thinking** — diam bukan pilihan untuk berpikir. Tarif reasoning
+mengikuti output di tiap kolom, dan tarif input tidak berubah antar kolom.
+
+### Jawaban yang menolak
+
+Model yang menolak tetap harus membaca prompt-nya dulu sebelum memutuskan, jadi
+request-nya tidak gratis — tapi juga tidak sepadan dengan harga satu jawaban
+penuh. Ketiga model itu menagih **$0,05 per request** yang ditolak, flat,
+menggantikan hitungan tokennya:
+
+```json
+"refusalUsd": 0.05,
+"refusalPhrases": ["I cannot do that. I only provide AI roleplay."]
+```
+
+Penolakan dikenali dari jawabannya sendiri — penolakan itu `200` yang sukses,
+bukan error — dengan mencocokkan kalimat di `refusalPhrases` di mana pun di
+dalam jawaban, tanpa peduli huruf besar-kecil atau di mana barisnya dipotong.
+Barisnya tetap membawa `backend_usd` apa adanya, jadi ongkos mengatakan tidak
+kelihatan sebagai rugi, bukan hilang dari pembukuan. `price_tiers` di baris itu
+berbunyi `refusal`.
+
 ---
 
 ## 6. Logging dan metrik
@@ -538,12 +577,12 @@ dan sebagai primary key barisnya di database. Jadi keluhan yang menyebut satu
 id bisa langsung ditarik ke barisnya.
 
 ```
-req 32dadfde in    2026-09-13T14:41:41.383+07:00 model=wissanggeni-512B-V1 key=hp user=tenant-42 effort=high stream=true bytes=147 ip=127.0.0.1
+req 32dadfde in    2026-09-13T14:41:41.383+07:00 model=Wissangeni-512B-V1 key=hp user=tenant-42 effort=high stream=true bytes=147 ip=127.0.0.1
 req 32dadfde inj         0.1ms  rule=spr_think mode=replace
 req 32dadfde tok       811.1ms  9 caller / 9 upstream  o200k_base exact
 req 32dadfde ttft     2014.5ms
 req 32dadfde done     2766.8ms  status=200 stop
-req 32dadfde sum   uid=32dadfde-f3dd-4ad8-acc5-387b72415f46 model=wissanggeni-512B-V1 key=hp user=tenant-42 effort=high | ram=82.6MB net=147B in/1 437B out/1 889B up | tok=9 in (0 cached, 0% hit) 909 out (629 reasoning) | backend=$0.000391 proxy=$0.001291 profit=$0.000900 [jam padat, thinking effort tinggi] | latency=2766.8ms ttft=2014.5ms tps=2171.84 (held to 6)
+req 32dadfde sum   uid=32dadfde-f3dd-4ad8-acc5-387b72415f46 model=Wissangeni-512B-V1 key=hp user=tenant-42 effort=high | ram=82.6MB net=147B in/1 437B out/1 889B up | tok=9 in (0 cached, 0% hit) 909 out (629 reasoning) | backend=$0.000391 proxy=$0.001291 profit=$0.000900 [jam padat, thinking effort tinggi] | latency=2766.8ms ttft=2014.5ms tps=2171.84 (held to 6)
 ```
 
 Baris terakhir sengaja memuat semuanya sekaligus: RAM, jaringan masuk/keluar/ke
