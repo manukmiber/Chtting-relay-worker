@@ -104,9 +104,9 @@ pub async fn claim_tunnel(state: &Arc<AppState>) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while held_by_a_live_process(&lock).await {
         if tokio::time::Instant::now() >= deadline {
-            state.logger.warn(
-                "the previous instance is still holding the tunnel; taking it over anyway",
-            );
+            state
+                .logger
+                .warn("the previous instance is still holding the tunnel; taking it over anyway");
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -178,7 +178,7 @@ pub async fn spawn_successor(state: &Arc<AppState>) -> Result<u32> {
         tokio::fs::create_dir_all(dir).await?;
     }
 
-    let exe = std::env::current_exe()?;
+    let exe = own_binary()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut command = tokio::process::Command::new(&exe);
     command
@@ -201,6 +201,34 @@ pub async fn spawn_successor(state: &Arc<AppState>) -> Result<u32> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     bail!("generation {generation} did not come up within {READY_TIMEOUT:?}");
+}
+
+/// The binary to start the successor from.
+///
+/// `current_exe` is the right answer almost always, but not after the binary
+/// has been replaced underneath a running process — an upgrade, or a `cargo
+/// build` during development. Linux then reports the old path with a
+/// " (deleted)" suffix, and spawning it fails with a bare "no such file or
+/// directory" that says nothing about why.
+fn own_binary() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    // Strip the marker Linux appends and see whether a new binary has taken the
+    // old one's place — which is exactly the case after an upgrade, and the case
+    // where rotating is most worth doing.
+    let text = exe.to_string_lossy();
+    if let Some(stripped) = text.strip_suffix(" (deleted)") {
+        let replaced = PathBuf::from(stripped);
+        if replaced.is_file() {
+            return Ok(replaced);
+        }
+    }
+    bail!(
+        "this relay's own binary is gone from {}; nothing to start a successor from",
+        exe.display()
+    );
 }
 
 /// Wait for the requests already in flight to finish.
@@ -248,6 +276,16 @@ mod tests {
         // Garbage rather than a pid.
         tokio::fs::write(&lock, "not a pid").await.unwrap();
         assert!(!held_by_a_live_process(&lock).await);
+    }
+
+    #[test]
+    fn the_successor_is_started_from_a_binary_that_exists() {
+        // On a normal run this is just current_exe; the point of the test is
+        // that whatever comes back is something that can actually be spawned,
+        // because the alternative is a rotation that fails with "no such file".
+        let exe = own_binary().expect("a running process has a binary");
+        assert!(exe.is_file(), "{exe:?}");
+        assert!(!exe.to_string_lossy().contains("(deleted)"));
     }
 
     #[test]

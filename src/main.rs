@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use chtting_relay::config::{Backend, ConfigStore, Model};
 use chtting_relay::logging::{Level, Logger};
-use chtting_relay::server;
 use chtting_relay::rotate;
+use chtting_relay::server;
 use chtting_relay::state::{AppState, Paths};
 use chtting_relay::system::Host;
 use chtting_relay::tokenizer::registry::{BUILTIN_TIKTOKEN, HF_PRESETS};
@@ -328,7 +328,7 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
     }
 
     // Requirement 19: retire on a clock, before Android decides to do it for us.
-    if cfg.server.rotate_hours > 0 {
+    if rotate_every(&cfg).is_some() {
         rotate_on_a_clock(state.clone(), retire.clone());
     }
 
@@ -365,6 +365,33 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
         }
     }
     Ok(())
+}
+
+/// How long between rotations, or `None` when they are switched off.
+///
+/// Minutes win over hours when both are set: the finer setting is the more
+/// deliberate one, and it is the one a test reaches for.
+fn rotate_every(cfg: &chtting_relay::config::Config) -> Option<std::time::Duration> {
+    if cfg.server.rotate_minutes > 0 {
+        return Some(std::time::Duration::from_secs(
+            u64::from(cfg.server.rotate_minutes) * 60,
+        ));
+    }
+    if cfg.server.rotate_hours > 0 {
+        return Some(std::time::Duration::from_secs(
+            u64::from(cfg.server.rotate_hours) * 3_600,
+        ));
+    }
+    None
+}
+
+fn humanise(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs % 3_600 == 0 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}m", secs / 60)
+    }
 }
 
 /// Bind a listener that can share its port with the instance being replaced.
@@ -406,17 +433,15 @@ fn listen(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
 fn rotate_on_a_clock(state: Arc<AppState>, retire: tokio::sync::watch::Sender<bool>) {
     tokio::spawn(async move {
         loop {
-            let cfg = state.config.current();
-            let hours = cfg.server.rotate_hours;
-            if hours == 0 {
+            let Some(every) = rotate_every(&state.config.current()) else {
                 return; // switched off while running
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(u64::from(hours) * 3_600)).await;
+            };
+            tokio::time::sleep(every).await;
 
             let generation = rotate::generation();
             state.logger.info(format!(
-                "rotating: generation {} has served {hours}h, starting generation {}",
-                generation,
+                "rotating: generation {generation} has served {}, starting generation {}",
+                humanise(every),
                 generation + 1
             ));
 
@@ -438,8 +463,9 @@ fn rotate_on_a_clock(state: Arc<AppState>, retire: tokio::sync::watch::Sender<bo
             ));
             let _ = retire.send(true);
 
-            let timeout =
-                std::time::Duration::from_millis(state.config.current().server.rotate_drain_timeout_ms);
+            let timeout = std::time::Duration::from_millis(
+                state.config.current().server.rotate_drain_timeout_ms,
+            );
             let stranded = rotate::drain(&state, timeout).await;
             if stranded > 0 {
                 state.logger.warn(format!(

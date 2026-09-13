@@ -133,7 +133,10 @@ mod tests {
             "{second:?}"
         );
         let third = pacer.delay_for(&text).expect("still spent");
-        assert!(third > second, "{third:?} should be further out than {second:?}");
+        assert!(
+            third > second,
+            "{third:?} should be further out than {second:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

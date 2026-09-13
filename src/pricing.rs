@@ -28,9 +28,10 @@ use crate::util::{glob_match, round};
 /// A normalised vocabulary, because the same intent arrives spelled four
 /// different ways: OpenAI's `reasoning_effort`, OpenRouter's `reasoning.effort`,
 /// Anthropic's `thinking.budget_tokens`, and Qwen's `enable_thinking`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Effort {
     /// The caller said nothing about thinking at all.
+    #[default]
     Unspecified,
     /// The caller explicitly turned thinking off.
     None,
@@ -85,7 +86,10 @@ impl Effort {
     /// True for the efforts that actually buy reasoning tokens, which is what
     /// decides between a model's thinking and non-thinking system prompt.
     pub fn is_thinking(self) -> bool {
-        matches!(self, Effort::Low | Effort::Medium | Effort::High | Effort::Max)
+        matches!(
+            self,
+            Effort::Low | Effort::Medium | Effort::High | Effort::Max
+        )
     }
 }
 
@@ -183,12 +187,6 @@ pub struct Shape {
     /// Day of week, Monday = 0 through Sunday = 6.
     pub weekday: u32,
     pub streamed: bool,
-}
-
-impl Default for Effort {
-    fn default() -> Self {
-        Effort::Unspecified
-    }
 }
 
 /// What one request came to.
@@ -640,10 +638,28 @@ mod tests {
         };
         let t = tier("night", when);
         for hour in [22, 23, 0, 3, 5] {
-            assert!(matches(&t, &Shape { hour, ..shape(1, 1) }), "hour {hour}");
+            assert!(
+                matches(
+                    &t,
+                    &Shape {
+                        hour,
+                        ..shape(1, 1)
+                    }
+                ),
+                "hour {hour}"
+            );
         }
         for hour in [6, 12, 21] {
-            assert!(!matches(&t, &Shape { hour, ..shape(1, 1) }), "hour {hour}");
+            assert!(
+                !matches(
+                    &t,
+                    &Shape {
+                        hour,
+                        ..shape(1, 1)
+                    }
+                ),
+                "hour {hour}"
+            );
         }
     }
 
@@ -686,7 +702,11 @@ mod tests {
         assert_eq!(merged.backend_output_usd_per_m, 1.0, "overridden");
         assert_eq!(merged.margin_percent, 50.0);
         assert_eq!(
-            merged.tiers.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            merged
+                .tiers
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["global", "model"],
             "the model's rules get the last word"
         );
@@ -694,8 +714,14 @@ mod tests {
 
     #[test]
     fn every_spelling_of_an_effort_is_understood() {
-        assert_eq!(effort_of(&json!({"reasoning_effort": "high"})), Effort::High);
-        assert_eq!(effort_of(&json!({"reasoning_effort": "XHIGH"})), Effort::Max);
+        assert_eq!(
+            effort_of(&json!({"reasoning_effort": "high"})),
+            Effort::High
+        );
+        assert_eq!(
+            effort_of(&json!({"reasoning_effort": "XHIGH"})),
+            Effort::Max
+        );
         assert_eq!(
             effort_of(&json!({"reasoning": {"effort": "low"}})),
             Effort::Low

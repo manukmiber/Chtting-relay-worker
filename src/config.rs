@@ -121,6 +121,10 @@ pub struct ServerConfig {
     /// How long a retiring instance waits for its in-flight requests before it
     /// exits anyway.
     pub rotate_drain_timeout_ms: u64,
+    /// The rotation interval in minutes, when it needs to be finer than hours.
+    /// Set, it wins over `rotateHours`; it exists so the handover can be
+    /// exercised for real rather than trusted for an hour at a time.
+    pub rotate_minutes: u32,
 }
 
 impl Default for ServerConfig {
@@ -139,6 +143,7 @@ impl Default for ServerConfig {
             sse_keepalive_text: "Zeiko is still here, Just be patience".into(),
             rotate_hours: 1,
             rotate_drain_timeout_ms: 10 * 60 * 1000,
+            rotate_minutes: 0,
         }
     }
 }
@@ -344,8 +349,9 @@ pub struct SystemPromptRule {
     /// A caller who named no effort matches neither.
     pub min_effort: String,
     pub max_effort: String,
-    /// What to inject when this rule wins.
-    #[serde(flatten)]
+    /// What to inject when this rule wins. Shaped exactly like the model's own
+    /// `systemPrompt`, and nested rather than flattened into the rule so that a
+    /// rule reads as a condition and a prompt rather than a bag of both.
     pub prompt: SystemPromptSpec,
 }
 

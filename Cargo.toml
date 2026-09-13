@@ -79,6 +79,9 @@ sha2 = "0.10"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# Lets the mock backend go quiet mid-stream, which is the only way to see
+# whether the relay fills the silence with a keep-alive of its own.
+async-stream = "0.3"
 # The dashboard tests need a cookie jar to hold a signed-in session.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2", "charset", "cookies"] }
 

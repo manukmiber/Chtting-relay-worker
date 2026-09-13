@@ -790,10 +790,7 @@ async fn handing_over_to_a_keeper_that_was_never_installed_says_so() {
     assert_eq!(res.status(), 400);
     let body: Value = res.json().await.unwrap();
     let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        message.contains("keeper"),
-        "unhelpful refusal: {body}"
-    );
+    assert!(message.contains("keeper"), "unhelpful refusal: {body}");
 }
 
 #[tokio::test]

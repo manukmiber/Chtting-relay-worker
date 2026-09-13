@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   h, card, table, pill, drawer, select, clear, toast,
-  fmtNum, fmtMs, fmtTime, copy,
+  fmtNum, fmtMs, fmtTime, fmtUsd, fmtBytes, live, copy,
 } from '../ui.js';
 
 /** The request log: one row per relayed call, with the full timing breakdown. */
@@ -68,25 +68,40 @@ export async function requestsView(ctx) {
 
   function renderTable(rows) {
     return table(
-      [{ label: 'When' }, { label: 'Model' }, { label: 'Key' }, { label: 'In', num: true },
+      [{ label: 'When' }, { label: 'Model' }, { label: 'Caller' }, { label: 'In', num: true },
         { label: 'Out', num: true }, { label: 'TTFT', num: true }, { label: 'TPS', num: true },
-        { label: 'Total', num: true }, { label: 'Status' }],
+        { label: 'Total', num: true }, { label: 'Profit', num: true }, { label: 'Status' }],
       rows,
       (r) => h('tr.clickable', { onclick: () => showDetail(r.id) },
         h('td.small', { text: fmtTime(r.ts) }),
         h('td.mono.small', {}, h('span.truncate', { text: r.public_model, title: `${r.public_model} → ${r.upstream_model}` })),
-        h('td.small', { text: r.key_label || '—' }),
+        h('td.small', {},
+          h('div', { text: r.key_label || '—' }),
+          r.user_id ? h('div.small.muted.mono', { text: r.user_id }) : null,
+        ),
         h('td.num', { text: fmtNum(r.prompt_tokens) }),
         h('td.num', { text: fmtNum(r.completion_tokens) }),
         h('td.num', { text: r.ttft_ms ? fmtMs(r.ttft_ms) : '—' }),
         h('td.num', { text: r.tokens_per_sec ? r.tokens_per_sec.toFixed(1) : '—' }),
         h('td.num', { text: fmtMs(r.total_ms) }),
+        h('td.num', { text: r.proxy_usd ? fmtUsd(r.profit_usd) : '—' }),
         h('td', {}, statusPill(r)),
       ),
     );
   }
 
+  // Requirement 4: the list keeps itself current. Only while sitting on the
+  // newest page — refreshing under someone who has paged back would shuffle
+  // rows out from under them.
+  const liveToggle = h('input', { type: 'checkbox', checked: ctx.store.requestsLive !== false });
+  liveToggle.addEventListener('change', () => { ctx.store.requestsLive = liveToggle.checked; });
+  live(ctx, 5000, () => {
+    if (!liveToggle.checked || state.offset !== 0) return undefined;
+    return load();
+  });
+
   root.append(card('Requests', body, [modelFilter, statusFilter, search,
+    h('label.switch', {}, liveToggle, h('span', { text: 'Live' })),
     h('button.sm', { onclick: load }, '↻')]));
   await load();
   return root;
@@ -122,6 +137,9 @@ async function showDetail(id) {
     kv('Backend', r.backend_id),
     kv('Endpoint', r.endpoint),
     kv('Client key', r.key_label),
+    kv('Caller id', r.user_id || '— (none sent)', true),
+    kv('Reasoning effort', r.reasoning_effort || '—'),
+    r.prompt_id ? kv('System prompt rule', r.prompt_id, true) : null,
     kv('IP', r.ip),
     kv('User agent', r.user_agent),
     kv('Finish reason', r.finish_reason || '—'),
@@ -132,8 +150,30 @@ async function showDetail(id) {
       miniStat('TTFT', r.ttft_ms ? fmtMs(r.ttft_ms) : '—', 'to first token'),
       miniStat('Generation', r.gen_ms ? fmtMs(r.gen_ms) : '—', 'first to last token'),
       miniStat('Total', fmtMs(r.total_ms), 'end to end'),
-      miniStat('Throughput', r.tokens_per_sec ? `${r.tokens_per_sec}` : '—', 'tokens / second'),
+      miniStat('Throughput', r.tokens_per_sec ? `${r.tokens_per_sec}` : '—',
+        r.target_tps ? `held to ${r.target_tps} tok/s` : 'tokens / second'),
     ),
+
+    h('h3', { style: { fontSize: '13px', marginTop: '18px' }, text: 'Work done' }),
+    h('div.grid.stats', {},
+      miniStat('Tokenizing', r.tokenize_ms ? fmtMs(r.tokenize_ms) : '—', 'counting the prompt'),
+      miniStat('Injection', r.inject_ms ? fmtMs(r.inject_ms) : '—', 'building the upstream body'),
+      miniStat('Network', fmtBytes(r.bytes_in), `${fmtBytes(r.bytes_out)} out · ${fmtBytes(r.bytes_upstream)} upstream`),
+      miniStat('Memory', r.rss_mb ? `${r.rss_mb} MB` : '—', 'relay resident size'),
+    ),
+
+    r.proxy_usd
+      ? h('div', {},
+        h('h3', { style: { fontSize: '13px', marginTop: '18px' }, text: 'Money' }),
+        h('div.grid.stats', {},
+          miniStat('Backend', fmtUsd(r.backend_usd), 'what we were charged'),
+          miniStat('Proxy', fmtUsd(r.proxy_usd), 'what the caller is charged'),
+          miniStat('Profit', fmtUsd(r.profit_usd),
+            r.backend_usd ? `${Math.round((r.profit_usd / r.backend_usd) * 100)}% margin` : ''),
+        ),
+        r.price_tiers ? h('p.small.muted', { text: `Tiers applied: ${r.price_tiers}` }) : null,
+      )
+      : null,
 
     h('h3', { style: { fontSize: '13px', marginTop: '18px' }, text: 'Tokens' }),
     h('div.grid.stats', {},

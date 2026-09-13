@@ -100,11 +100,8 @@ impl Trace {
         if !self.on {
             return;
         }
-        self.logger.info(format!(
-            "req {} {phase:<5} {}",
-            self.short,
-            detail.as_ref()
-        ));
+        self.logger
+            .info(format!("req {} {phase:<5} {}", self.short, detail.as_ref()));
     }
 
     /// A millisecond figure, always with one decimal so the column is stable.
@@ -135,11 +132,7 @@ mod tests {
     #[test]
     fn the_short_id_is_the_first_uuid_segment() {
         let logger = Logger::console(crate::logging::Level::Silent);
-        let trace = Trace::new(
-            logger,
-            "6f1c9a2b-7d43-4e0f-9c1a-2b3c4d5e6f70",
-            true,
-        );
+        let trace = Trace::new(logger, "6f1c9a2b-7d43-4e0f-9c1a-2b3c4d5e6f70", true);
         assert_eq!(trace.short, "6f1c9a2b");
     }
 

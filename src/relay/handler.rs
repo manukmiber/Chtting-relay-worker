@@ -308,11 +308,7 @@ pub async fn handle_chat(
     // request writes and by every byte of the reply it produces.
     let id = new_uuid_v4();
     let local = crate::util::local_parts(started_wall, &tz);
-    let trace = Trace::new(
-        state.logger.clone(),
-        &id,
-        cfg.logging.verbose_requests,
-    );
+    let trace = Trace::new(state.logger.clone(), &id, cfg.logging.verbose_requests);
     let effort = pricing::effort_of(&body);
     let user_id = user_id_of(&body, headers);
 
@@ -363,7 +359,9 @@ pub async fn handle_chat(
                 &record.user_id
             },
             effort.as_str(),
-            body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+            body.get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             record.bytes_in,
             record.ip,
         ),
@@ -596,7 +594,10 @@ pub async fn handle_chat(
         }
         map.insert("stream".into(), Value::Bool(stream_upstream));
         if stream_upstream {
-            let wants_usage = backend_cfg.as_ref().map(|b| b.stream_options).unwrap_or(true);
+            let wants_usage = backend_cfg
+                .as_ref()
+                .map(|b| b.stream_options)
+                .unwrap_or(true);
             if wants_usage {
                 map.insert(
                     "stream_options".into(),
@@ -1168,7 +1169,9 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
             ledgered: ctx.ledgered,
             priced: Some(ctx.price(&charged)),
             backend_priced: Some(ctx.backend_price(&billed)),
-            bytes_out: serde_json::to_vec(&shaped).map(|b| b.len() as u64).unwrap_or(0),
+            bytes_out: serde_json::to_vec(&shaped)
+                .map(|b| b.len() as u64)
+                .unwrap_or(0),
             bytes_upstream,
             trace: Some(&ctx.trace),
         },
@@ -1415,8 +1418,16 @@ fn summary_line(r: &RequestRecord) -> String {
          latency={}ms ttft={}ms tps={}{}",
         r.id,
         r.public_model,
-        if r.key_label.is_empty() { "-" } else { &r.key_label },
-        if r.user_id.is_empty() { "-" } else { &r.user_id },
+        if r.key_label.is_empty() {
+            "-"
+        } else {
+            &r.key_label
+        },
+        if r.user_id.is_empty() {
+            "-"
+        } else {
+            &r.user_id
+        },
         if r.reasoning_effort.is_empty() {
             "-"
         } else {

@@ -311,7 +311,10 @@ impl Usage {
             );
         }
         if let Some(cost) = cost {
-            map.insert("usage".into(), serde_json::json!(crate::util::round(cost, 6)));
+            map.insert(
+                "usage".into(),
+                serde_json::json!(crate::util::round(cost, 6)),
+            );
         }
         out
     }

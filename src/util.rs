@@ -79,9 +79,8 @@ pub fn new_client_key() -> String {
     const LEN: usize = 32;
 
     let mut rng = rand::rng();
-    let pick = |rng: &mut rand::rngs::ThreadRng, set: &[u8]| -> u8 {
-        set[rng.random_range(0..set.len())]
-    };
+    let pick =
+        |rng: &mut rand::rngs::ThreadRng, set: &[u8]| -> u8 { set[rng.random_range(0..set.len())] };
 
     let mut out = vec![
         pick(&mut rng, LOWER),
@@ -368,8 +367,7 @@ mod tests {
 
     #[test]
     fn two_keys_are_never_the_same() {
-        let keys: std::collections::HashSet<String> =
-            (0..500).map(|_| new_client_key()).collect();
+        let keys: std::collections::HashSet<String> = (0..500).map(|_| new_client_key()).collect();
         assert_eq!(keys.len(), 500);
     }
 
@@ -383,7 +381,10 @@ mod tests {
                 vec![8, 4, 4, 4, 12],
                 "{id}"
             );
-            assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{id}");
+            assert!(
+                id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+                "{id}"
+            );
             assert!(parts[2].starts_with('4'), "not version 4: {id}");
             assert!(
                 matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),

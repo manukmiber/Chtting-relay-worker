@@ -14,6 +14,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -39,6 +40,13 @@ pub struct MockConfig {
     pub never_streams: bool,
     pub model_echo: Option<String>,
     pub delay_ms: u64,
+    /// Go quiet for this long after the opening frame, the way a backend does
+    /// while it is thinking. What the caller sees during that gap is the
+    /// relay's own keep-alive, if it sends one.
+    pub quiet_ms: u64,
+    /// Keep-alive noise of the backend's own, emitted during `quiet_ms`. The
+    /// relay must swallow it: its shape says which backend is upstream.
+    pub backend_keepalive: Option<String>,
 }
 
 impl Default for MockConfig {
@@ -53,6 +61,8 @@ impl Default for MockConfig {
             never_streams: false,
             model_echo: None,
             delay_ms: 0,
+            quiet_ms: 0,
+            backend_keepalive: None,
         }
     }
 }
@@ -60,6 +70,9 @@ impl Default for MockConfig {
 pub struct MockBackend {
     pub addr: SocketAddr,
     pub received: Arc<Mutex<Vec<Value>>>,
+    /// The headers of each request, so a test can check what travelled beside
+    /// the body — the caller's user id, for one.
+    pub headers: Arc<Mutex<Vec<HashMap<String, String>>>>,
     config: Arc<Mutex<MockConfig>>,
 }
 
@@ -68,6 +81,7 @@ impl MockBackend {
         let state = MockState {
             config: Arc::new(Mutex::new(config)),
             received: Arc::new(Mutex::new(Vec::new())),
+            headers: Arc::new(Mutex::new(Vec::new())),
         };
 
         let app = Router::new()
@@ -85,6 +99,7 @@ impl MockBackend {
         Self {
             addr,
             received: state.received,
+            headers: state.headers,
             config: state.config,
         }
     }
@@ -105,12 +120,18 @@ impl MockBackend {
     pub fn request_count(&self) -> usize {
         self.received.lock().len()
     }
+
+    /// The headers of the last request the relay sent upstream.
+    pub fn last_headers(&self) -> HashMap<String, String> {
+        self.headers.lock().last().cloned().unwrap_or_default()
+    }
 }
 
 #[derive(Clone)]
 struct MockState {
     config: Arc<Mutex<MockConfig>>,
     received: Arc<Mutex<Vec<Value>>>,
+    headers: Arc<Mutex<Vec<HashMap<String, String>>>>,
 }
 
 async fn embeddings(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
@@ -124,8 +145,23 @@ async fn embeddings(State(state): State<MockState>, Json(body): Json<Value>) -> 
     .into_response()
 }
 
-async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
+async fn handle(
+    State(state): State<MockState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     state.received.lock().push(body.clone());
+    state.headers.lock().push(
+        headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect(),
+    );
     let config = state.config.lock().clone();
 
     if config.delay_ms > 0 {
@@ -167,12 +203,23 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
     if let Some(reasoning) = &config.reasoning {
         message["reasoning_content"] = json!(reasoning);
     }
+    // Everything a real backend puts on the wire, including the parts that say
+    // which backend it is. The relay is supposed to drop all of it.
     let mut payload = json!({
-        "id": "chatcmpl-mock",
+        "id": BACKEND_REQUEST_ID,
         "object": "chat.completion",
         "created": 1_700_000_000,
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "system_fingerprint": BACKEND_FINGERPRINT,
+        "service_tier": "scale",
+        "provider": "deepseek",
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": "stop",
+            "logprobs": null,
+            "matched_stop": 128_001,
+        }],
     });
     if let Some(usage) = &config.usage {
         payload["usage"] = usage.clone();
@@ -186,11 +233,18 @@ fn stream_response(config: &MockConfig, model: &str) -> Response {
         format!(
             "data: {}\n\n",
             json!({
-                "id": "chatcmpl-mock",
+                "id": BACKEND_REQUEST_ID,
                 "object": "chat.completion.chunk",
                 "created": 1_700_000_000,
                 "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                "system_fingerprint": BACKEND_FINGERPRINT,
+                "service_tier": "scale",
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": null,
+                    "logprobs": null,
+                }],
             })
         )
     };
@@ -208,38 +262,71 @@ fn stream_response(config: &MockConfig, model: &str) -> Response {
     raw.push_str(&format!(
         "data: {}\n\n",
         json!({
-            "id": "chatcmpl-mock", "object": "chat.completion.chunk",
+            "id": BACKEND_REQUEST_ID, "object": "chat.completion.chunk",
             "created": 1_700_000_000, "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "system_fingerprint": BACKEND_FINGERPRINT,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": null}],
         })
     ));
     if let Some(usage) = &config.usage {
         raw.push_str(&format!(
             "data: {}\n\n",
             json!({
-                "id": "chatcmpl-mock", "object": "chat.completion.chunk",
+                "id": BACKEND_REQUEST_ID, "object": "chat.completion.chunk",
                 "created": 1_700_000_000, "model": model,
+                "system_fingerprint": BACKEND_FINGERPRINT,
                 "choices": [], "usage": usage,
             })
         ));
     }
     raw.push_str("data: [DONE]\n\n");
 
-    // Optionally cut the byte stream at hostile boundaries.
-    let bytes = raw.into_bytes();
-    let chunk_size = config.byte_chunk_size.unwrap_or(bytes.len().max(1));
-    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = bytes
-        .chunks(chunk_size.max(1))
-        .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
-        .collect();
+    // A backend that pauses does so between frames, never inside one, so the
+    // pieces are split on frame boundaries when there is a pause to insert and
+    // at hostile byte boundaries otherwise.
+    let chunks: Vec<bytes::Bytes> = if config.quiet_ms > 0 {
+        raw.split_inclusive("\n\n")
+            .map(|frame| bytes::Bytes::copy_from_slice(frame.as_bytes()))
+            .collect()
+    } else {
+        let bytes = raw.into_bytes();
+        let chunk_size = config.byte_chunk_size.unwrap_or(bytes.len().max(1));
+        bytes
+            .chunks(chunk_size.max(1))
+            .map(bytes::Bytes::copy_from_slice)
+            .collect()
+    };
+
+    // A backend that thinks before it speaks: nothing on the wire for a while,
+    // optionally with keep-alive noise of its own.
+    let quiet = std::time::Duration::from_millis(config.quiet_ms);
+    let keepalive = config.backend_keepalive.clone();
+    let stream = async_stream::stream! {
+        let mut first = true;
+        for chunk in chunks {
+            if !first && !quiet.is_zero() {
+                if let Some(text) = &keepalive {
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(text.clone()));
+                }
+                tokio::time::sleep(quiet).await;
+            }
+            first = false;
+            yield Ok(chunk);
+        }
+    };
 
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/event-stream")],
-        Body::from_stream(futures_util::stream::iter(chunks)),
+        Body::from_stream(stream),
     )
         .into_response()
 }
+
+/// The backend's own request id and fingerprint. A test asserting the relay
+/// leaks neither needs to know what it is looking for.
+pub const BACKEND_REQUEST_ID: &str = "3251459c-90b4-4b7c-86c6-91df859903b9";
+pub const BACKEND_FINGERPRINT: &str = "aeb56401ca74e127821c4f9126dcb669";
 
 /* ---------------------------------------------------------- relay app -- */
 
@@ -269,6 +356,24 @@ impl Harness {
             .send()
             .await
             .expect("relay is reachable")
+    }
+
+    /// A post carrying headers of the caller's own, for the paths where what
+    /// travels beside the body is the point.
+    pub async fn post_with(
+        &self,
+        path: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let mut req = self
+            .client()
+            .post(self.url(path))
+            .header("authorization", format!("Bearer {}", self.client_key));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.json(&body).send().await.expect("relay is reachable")
     }
 
     pub async fn get(&self, path: &str) -> reqwest::Response {

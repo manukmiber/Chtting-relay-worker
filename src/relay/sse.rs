@@ -266,9 +266,7 @@ mod tests {
         );
         // A client parsing it must see no event at all.
         let mut parser = SseParser::new();
-        assert!(parser
-            .push(&String::from_utf8(frame.to_vec()).unwrap())
-            .is_empty());
+        assert!(parser.push(std::str::from_utf8(&frame).unwrap()).is_empty());
     }
 
     #[test]

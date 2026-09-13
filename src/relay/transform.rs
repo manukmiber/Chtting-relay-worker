@@ -205,7 +205,7 @@ pub fn transform_request(
 ///
 /// Returns the rule's id alongside the spec, so the request row can record
 /// which prompt a given answer was produced under.
-pub fn select_system_prompt<'a>(route: &'a Model, effort: Effort) -> (&'a SystemPromptSpec, String) {
+pub fn select_system_prompt(route: &Model, effort: Effort) -> (&SystemPromptSpec, String) {
     for rule in route.system_prompts.iter().filter(|r| r.enabled) {
         if rule_answers(rule, effort) {
             return (&rule.prompt, rule.id.clone());
@@ -658,7 +658,10 @@ fn transform_delta(
                     state.open = true;
                     transform.reasoning_open.as_str()
                 };
-                delta.insert("content".into(), Value::String(format!("{open}{r}{content}")));
+                delta.insert(
+                    "content".into(),
+                    Value::String(format!("{open}{r}{content}")),
+                );
             } else if state.open && (!content.is_empty() || finished) {
                 state.open = false;
                 delta.insert(
@@ -764,7 +767,13 @@ mod tests {
             "model": "manukmiberai/creative-writer",
             "messages": [{"role": "user", "content": "halo"}],
         });
-        let out = transform_request(&body, &route, &cfg, &ResolvedRequestTransform::default(), &route.system_prompt);
+        let out = transform_request(
+            &body,
+            &route,
+            &cfg,
+            &ResolvedRequestTransform::default(),
+            &route.system_prompt,
+        );
         assert_eq!(out["model"], "Deepseek-v4-flash-0731");
     }
 
@@ -779,7 +788,13 @@ mod tests {
             .insert("top_p".into(), serde_json::json!(0.9));
 
         let body = serde_json::json!({"temperature": 0.1, "top_p": 0.1, "messages": []});
-        let out = transform_request(&body, &route, &cfg, &ResolvedRequestTransform::default(), &route.system_prompt);
+        let out = transform_request(
+            &body,
+            &route,
+            &cfg,
+            &ResolvedRequestTransform::default(),
+            &route.system_prompt,
+        );
         assert_eq!(
             out["temperature"], 0.1,
             "a default must not override the caller"
@@ -807,7 +822,8 @@ mod tests {
 
         let asked_nothing = serde_json::json!({"messages": []});
         assert_eq!(
-            transform_request(&asked_nothing, &route, &cfg, &rt, &route.system_prompt)["max_tokens"],
+            transform_request(&asked_nothing, &route, &cfg, &rt, &route.system_prompt)
+                ["max_tokens"],
             100
         );
     }

@@ -474,7 +474,9 @@ const SUMMARY_SQL: &str = "
       COALESCE(SUM(reasoning_tokens),0),
       SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
       SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END),
-      AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(total_ms,0)), AVG(NULLIF(tokens_per_sec,0))
+      AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(total_ms,0)), AVG(NULLIF(tokens_per_sec,0)),
+      COALESCE(SUM(backend_usd),0), COALESCE(SUM(proxy_usd),0), COALESCE(SUM(profit_usd),0),
+      COUNT(DISTINCT NULLIF(user_id,''))
     FROM requests WHERE ts >= ?1 AND ts <= ?2";
 
 /// The aggregate row `SUMMARY_SQL` produces, named so the columns cannot be
@@ -492,6 +494,11 @@ struct SummaryRow {
     avg_ttft: Option<f64>,
     avg_total: Option<f64>,
     avg_tps: Option<f64>,
+    backend_usd: f64,
+    proxy_usd: f64,
+    profit_usd: f64,
+    /// Callers, as opposed to keys: one key can front many of them.
+    callers: i64,
 }
 
 fn summary(conn: &rusqlite::Connection, since: i64, until: i64) -> anyhow::Result<Value> {
@@ -509,6 +516,10 @@ fn summary(conn: &rusqlite::Connection, since: i64, until: i64) -> anyhow::Resul
             avg_ttft: r.get(9)?,
             avg_total: r.get(10)?,
             avg_tps: r.get(11)?,
+            backend_usd: r.get(12)?,
+            proxy_usd: r.get(13)?,
+            profit_usd: r.get(14)?,
+            callers: r.get(15)?,
         })
     })?;
 
@@ -567,6 +578,15 @@ fn summary(conn: &rusqlite::Connection, since: i64, until: i64) -> anyhow::Resul
         "p95_total_ms": round(percentile(&total, 95.0), 1),
         "p50_tps": round(percentile(&tps, 50.0), 2),
         "p95_tps": round(percentile(&tps, 95.0), 2),
+        "callers": row.callers,
+        "backend_usd": round(row.backend_usd, 6),
+        "proxy_usd": round(row.proxy_usd, 6),
+        "profit_usd": round(row.profit_usd, 6),
+        "margin_percent": if row.backend_usd > 0.0 {
+            round(row.profit_usd / row.backend_usd * 100.0, 1)
+        } else {
+            0.0
+        },
     }))
 }
 
@@ -679,6 +699,10 @@ async fn stats_by(
         "key" => "key_id",
         "backend" => "backend_id",
         "upstream" => "upstream_model",
+        // Who the callers behind a key are, and how hard they asked the model
+        // to think — the two questions the price list is written against.
+        "user" => "user_id",
+        "effort" => "reasoning_effort",
         _ => return error(400, &format!("cannot group by \"{column}\"")),
     };
     let since = range_start(&q.range.unwrap_or_else(|| "30d".into()));
@@ -693,7 +717,9 @@ async fn stats_by(
                         COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
                         COALESCE(SUM(total_tokens),0),
                         SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
-                        AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(total_ms,0)), AVG(NULLIF(tokens_per_sec,0))
+                        AVG(NULLIF(ttft_ms,0)), AVG(NULLIF(total_ms,0)), AVG(NULLIF(tokens_per_sec,0)),
+                        COALESCE(SUM(backend_usd),0), COALESCE(SUM(proxy_usd),0),
+                        COALESCE(SUM(profit_usd),0)
                  FROM requests WHERE ts >= ?1
                  GROUP BY {sql_column} ORDER BY COUNT(*) DESC LIMIT ?2"
             );
@@ -711,6 +737,9 @@ async fn stats_by(
                         "avg_ttft": round(r.get::<_, Option<f64>>(7)?.unwrap_or(0.0), 1),
                         "avg_total": round(r.get::<_, Option<f64>>(8)?.unwrap_or(0.0), 1),
                         "avg_tps": round(r.get::<_, Option<f64>>(9)?.unwrap_or(0.0), 2),
+                        "backend_usd": round(r.get::<_, f64>(10)?, 6),
+                        "proxy_usd": round(r.get::<_, f64>(11)?, 6),
+                        "profit_usd": round(r.get::<_, f64>(12)?, 6),
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
