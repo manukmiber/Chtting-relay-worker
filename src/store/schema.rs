@@ -17,7 +17,7 @@ impl ToSql for KeyKind {
     }
 }
 
-pub const FIELDS: [&str; 57] = [
+pub const FIELDS: [&str; 58] = [
     "id",
     "ts",
     "day",
@@ -55,6 +55,7 @@ pub const FIELDS: [&str; 57] = [
     "retries",
     "user_prompt_tokens",
     "billed_prompt_tokens",
+    "billed_cached_tokens",
     "system_prompt_tokens",
     "cache_hit",
     "queued_ms",
@@ -102,6 +103,7 @@ CREATE TABLE IF NOT EXISTS requests (
   drift_prompt INTEGER, drift_completion INTEGER,
   req_preview TEXT, res_preview TEXT, retries INTEGER,
   user_prompt_tokens INTEGER, billed_prompt_tokens INTEGER,
+  billed_cached_tokens INTEGER,
   system_prompt_tokens INTEGER, cache_hit INTEGER, queued_ms REAL,
   user_id TEXT, reasoning_effort TEXT, prompt_id TEXT,
   local_hour INTEGER, local_weekday INTEGER,
@@ -136,7 +138,8 @@ pub const INSERT_SQL: &str = "INSERT OR REPLACE INTO requests (
   tokens_per_sec, usage_source, tokenizer, exact,
   local_prompt, local_completion, drift_prompt, drift_completion,
   req_preview, res_preview, retries,
-  user_prompt_tokens, billed_prompt_tokens, system_prompt_tokens,
+  user_prompt_tokens, billed_prompt_tokens, billed_cached_tokens,
+  system_prompt_tokens,
   cache_hit, queued_ms,
   user_id,
   reasoning_effort,
@@ -161,16 +164,17 @@ pub const INSERT_SQL: &str = "INSERT OR REPLACE INTO requests (
   ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
   ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
   ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
-  ?51, ?52, ?53, ?54, ?55, ?56, ?57
+  ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58
 )";
 
 /// Columns added after the first release. `CREATE TABLE IF NOT EXISTS` leaves
 /// an existing table alone, so an install that predates them needs each one
 /// added by hand; SQLite has no `ADD COLUMN IF NOT EXISTS`, so the caller
 /// checks `PRAGMA table_info` first.
-pub const ADDED_COLUMNS: [(&str, &str); 22] = [
+pub const ADDED_COLUMNS: [(&str, &str); 23] = [
     ("user_prompt_tokens", "INTEGER"),
     ("billed_prompt_tokens", "INTEGER"),
+    ("billed_cached_tokens", "INTEGER"),
     ("system_prompt_tokens", "INTEGER"),
     ("cache_hit", "INTEGER"),
     ("queued_ms", "REAL"),
@@ -242,6 +246,13 @@ pub struct RequestRecord {
     /// What the backend charged for the same prompt, injection included. The
     /// gap between the two is the relay's own cost of doing business.
     pub billed_prompt_tokens: i64,
+    /// The backend's own cache hit, over the body the backend actually
+    /// received. `cached_tokens` beside it is the caller's share of that hit —
+    /// what is left once the injected prefix is taken off the front — so the
+    /// two answer different questions and neither can stand in for the other:
+    /// this one reconciles the upstream invoice, that one is what the caller
+    /// was discounted on.
+    pub billed_cached_tokens: i64,
     /// The injected prompt itself, as this relay's own tokenizer counts it —
     /// so it answers what the system prompt costs, independently of whether the
     /// backend reported any usage. Negative when the route replaced a longer
@@ -340,6 +351,7 @@ impl RequestRecord {
             &self.retries,
             &self.user_prompt_tokens,
             &self.billed_prompt_tokens,
+            &self.billed_cached_tokens,
             &self.system_prompt_tokens,
             &self.cache_hit,
             &self.queued_ms,

@@ -441,7 +441,8 @@
         "profile": "openai"
       }
     ],
-    "billSystemPromptToUser": false
+    "billSystemPromptToUser": false,
+    "cacheCreditMinTokens": 2048
   },
   "logging": {
     "level": "info",

@@ -253,6 +253,57 @@ pub struct Usage {
     pub reasoning_tokens: u64,
 }
 
+/// Whose prompt a backend cache hit is credited against.
+///
+/// The relay injects a system prompt in front of the caller's body, and the
+/// backend's cache hit covers the whole thing. Which of the two is being billed
+/// decides how much of that hit is a discount the caller earned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheCredit {
+    /// The caller is billed for their own body only, so the injected prefix in
+    /// front of it comes off the hit before any of it is credited to them.
+    #[default]
+    CallersBodyOnly,
+    /// The caller is billed for the whole upstream body, injection included, so
+    /// the whole hit discounts tokens they are paying for.
+    WholeBody,
+}
+
+/// How a backend cache hit divides between the relay and the caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheBasis {
+    pub credit: CacheCredit,
+    /// The relay's own count of the prompt it injected — a known quantity,
+    /// measured on the way out rather than reconstructed afterwards. It is the
+    /// floor under the prefix that comes off a hit.
+    pub injected: u64,
+    /// Below this many tokens of the caller's own prompt, nothing is credited
+    /// and the whole prompt bills as fresh input. 0 disables the floor.
+    pub floor: u64,
+}
+
+impl CacheBasis {
+    /// No floor and no injected prompt: the caller's body is the whole body.
+    #[cfg(test)]
+    pub fn callers_body() -> Self {
+        Self {
+            credit: CacheCredit::CallersBodyOnly,
+            injected: 0,
+            floor: 0,
+        }
+    }
+
+    /// No floor, whole hit credited.
+    #[cfg(test)]
+    pub fn whole_body() -> Self {
+        Self {
+            credit: CacheCredit::WholeBody,
+            injected: 0,
+            floor: 0,
+        }
+    }
+}
+
 impl Usage {
     /// The numbers the caller is shown and accounted for.
     ///
@@ -275,15 +326,74 @@ impl Usage {
     ///
     /// What the backend billed is kept beside it on the request row, so the
     /// margin stays visible to the operator and to nobody else.
-    pub fn charged_to_caller(&self, user_local: u64) -> Usage {
+    pub fn charged_to_caller(&self, user_local: u64, basis: CacheBasis) -> Usage {
         Usage {
             prompt_tokens: user_local,
             total_tokens: user_local + self.completion_tokens,
-            // A cache hit is a fact about the caller's own prompt, so it
-            // travels — but it cannot be larger than the prompt it is part of.
-            cached_tokens: self.cached_tokens.min(user_local),
+            cached_tokens: self.caller_cached(user_local, basis),
             ..self.clone()
         }
+    }
+
+    /// How much of the backend's cache hit was the caller's own prompt.
+    ///
+    /// A cache hit is not, on its own, a fact about the caller's prompt.
+    /// Prefix caching matches from the first token forward, and the first
+    /// tokens of the upstream body are the prompt the relay injected — so the
+    /// leading cached tokens are the relay's own words coming back, and only
+    /// what is left over ever reached the caller's body.
+    ///
+    /// The prefix is measured as the backend's own prompt count less the
+    /// caller's body: everything the backend charged for beyond what the
+    /// caller wrote is the relay's, whether it is injected prompt, chat
+    /// template overhead, or the backend's tokenizer counting richer than
+    /// ours. Taking the relay's local count of the injection instead would
+    /// subtract a figure in this tokenizer's units from a hit in the backend's,
+    /// and under-subtract by exactly the drift between them — which is worst
+    /// in the case this exists for, where the backend reports thousands of
+    /// cached tokens for a body the caller contributed a handful to.
+    ///
+    /// Clamping without the offset is what made short requests book a loss. A
+    /// caller who sends 7 tokens behind a 3.7k-token injected prompt comes back
+    /// with a cache hit in the thousands; `min` alone calls all 7 of them
+    /// cached, bills every one at the cache rate, and applies the fresh input
+    /// rate to nothing at all. The relay still pays the backend for the real
+    /// body it sent, so the request earns a rounding error and costs real
+    /// money. Subtracting the prefix first leaves those 7 tokens fresh, which
+    /// is what they were.
+    ///
+    /// The clamp stays behind the offset: a backend that reports more cached
+    /// tokens than the caller has is still not evidence of a bigger discount.
+    fn caller_cached(&self, user_local: u64, basis: CacheBasis) -> u64 {
+        // Under the floor the split is not worth trusting: it is drawn by
+        // subtracting two tokenizers' counts, and on a short prompt that drift
+        // is most of the answer. Bill the lot as fresh input.
+        if user_local < basis.floor {
+            return 0;
+        }
+        let offset = match basis.credit {
+            // Two readings of where the caller's body starts, and the prefix
+            // is the longer of them.
+            //
+            // `injected` is what the relay measured itself putting in front of
+            // the caller — a known number, not a reconstruction, and the one
+            // the operator can point at. The subtraction is everything the
+            // backend charged for beyond the caller's body: the same injected
+            // prompt, plus the chat template's own per-message overhead, plus
+            // whatever the backend's tokenizer counts differently from ours.
+            //
+            // Neither is reliably the larger. The measured count misses the
+            // template overhead sitting in front of the caller's first token;
+            // the subtraction misses nothing but inherits the drift on the
+            // caller's body, which is unbounded and varies per request. Taking
+            // the longer prefix discounts both and credits the caller only what
+            // clears each — never a discount the relay did not receive.
+            CacheCredit::CallersBodyOnly => basis
+                .injected
+                .max(self.prompt_tokens.saturating_sub(user_local)),
+            CacheCredit::WholeBody => 0,
+        };
+        self.cached_tokens.saturating_sub(offset).min(user_local)
     }
 
     /// The `usage` object handed back to the caller.
@@ -422,6 +532,254 @@ pub fn normalize_usage(usage: &Value) -> Option<NormalizedUsage> {
 mod tests {
     use super::*;
 
+    /// The report this fix came from: `{"content":"hai"}` behind a 3.7k-token
+    /// injected prompt, billed to a caller who sent seven tokens.
+    #[test]
+    fn an_injected_prompts_cache_hit_is_not_the_callers_discount() {
+        let billed = Usage {
+            prompt_tokens: 3_941,
+            completion_tokens: 8,
+            cached_tokens: 3_712,
+            ..Usage::default()
+        };
+        // 3,712 cached, all of it inside a 3,934-token injected prefix: none of
+        // it reached the seven tokens the caller actually wrote.
+        let charged = billed.charged_to_caller(7, CacheBasis::callers_body());
+        assert_eq!(charged.prompt_tokens, 7);
+        assert_eq!(
+            charged.cached_tokens, 0,
+            "the hit was the relay's own prompt"
+        );
+        assert_eq!(charged.total_tokens, 15);
+        // What the clamp alone used to do, and why the request lost money: all
+        // seven tokens at the cache rate, nothing left at the input rate.
+        assert_eq!(billed.cached_tokens.min(7), 7);
+    }
+
+    /// The worked example from the design sketch: a 3,710-token injected
+    /// prompt, 109 tokens of the caller's own, and a backend hit of 3,802 —
+    /// which reaches 92 tokens past the injection into what the caller wrote.
+    #[test]
+    fn the_known_injected_count_draws_the_line_the_hit_is_measured_from() {
+        let billed = Usage {
+            prompt_tokens: 3_819,
+            completion_tokens: 40,
+            cached_tokens: 3_802,
+            ..Usage::default()
+        };
+        let basis = CacheBasis {
+            credit: CacheCredit::CallersBodyOnly,
+            injected: 3_710,
+            floor: 0,
+        };
+        let charged = billed.charged_to_caller(109, basis);
+        assert_eq!(charged.cached_tokens, 92, "3,802 - 3,710");
+        assert_eq!(charged.prompt_tokens, 109);
+        // So 17 of the caller's 109 tokens are fresh.
+        assert_eq!(charged.prompt_tokens - charged.cached_tokens, 17);
+    }
+
+    #[test]
+    fn the_floor_overrides_that_split_on_a_short_prompt() {
+        // The same request under the 2048 rule: the split is correct and is
+        // still not used, because 109 tokens of discount is worth less than
+        // the confidence it would take to trust it.
+        let billed = Usage {
+            prompt_tokens: 3_819,
+            cached_tokens: 3_802,
+            ..Usage::default()
+        };
+        let basis = CacheBasis {
+            credit: CacheCredit::CallersBodyOnly,
+            injected: 3_710,
+            floor: 2_048,
+        };
+        let charged = billed.charged_to_caller(109, basis);
+        assert_eq!(charged.cached_tokens, 0);
+        assert_eq!(charged.prompt_tokens, 109, "billed full fresh input");
+    }
+
+    #[test]
+    fn the_longer_of_the_two_prefixes_wins() {
+        let billed = Usage {
+            prompt_tokens: 4_000,
+            cached_tokens: 3_800,
+            ..Usage::default()
+        };
+        // Measured injection 3,710, but the backend charged 4,000 for a body
+        // the caller contributed 109 to — 3,891 of it was not theirs. The
+        // extra 181 is chat template and tokenizer drift, and it sits in front
+        // of their first token just as the injection does.
+        let basis = CacheBasis {
+            credit: CacheCredit::CallersBodyOnly,
+            injected: 3_710,
+            floor: 0,
+        };
+        assert_eq!(
+            billed.charged_to_caller(109, basis).cached_tokens,
+            0,
+            "3,800 does not clear the 3,891-token prefix"
+        );
+
+        // The other way round: the backend counts the caller's body richer
+        // than we do, so the subtraction reads a short prefix and the measured
+        // injection is the honest one.
+        let rich = Usage {
+            prompt_tokens: 3_750,
+            cached_tokens: 3_740,
+            ..Usage::default()
+        };
+        assert_eq!(
+            rich.charged_to_caller(109, basis).cached_tokens,
+            30,
+            "3,740 - 3,710, not 3,740 - 3,641"
+        );
+    }
+
+    #[test]
+    fn under_the_floor_a_hit_buys_the_caller_nothing() {
+        // Even a backend calling the whole prompt cached: under the floor the
+        // caller's tokens bill as fresh input, because the split between their
+        // body and the injected prefix is drawn by subtracting two tokenizers'
+        // counts and is worth least exactly where it is least reliable.
+        let billed = Usage {
+            prompt_tokens: 1_500,
+            completion_tokens: 8,
+            cached_tokens: 1_500,
+            ..Usage::default()
+        };
+        let basis = CacheBasis {
+            credit: CacheCredit::CallersBodyOnly,
+            injected: 0,
+            floor: 2_048,
+        };
+        assert_eq!(billed.charged_to_caller(1_500, basis).cached_tokens, 0);
+        // And with the prefix out of the picture entirely.
+        let whole = CacheBasis {
+            credit: CacheCredit::WholeBody,
+            injected: 0,
+            floor: 2_048,
+        };
+        assert_eq!(billed.charged_to_caller(1_500, whole).cached_tokens, 0);
+    }
+
+    #[test]
+    fn at_the_floor_the_offset_takes_over_again() {
+        let billed = Usage {
+            prompt_tokens: 12_000,
+            completion_tokens: 8,
+            cached_tokens: 9_000,
+            ..Usage::default()
+        };
+        let basis = CacheBasis {
+            credit: CacheCredit::CallersBodyOnly,
+            injected: 0,
+            floor: 2_048,
+        };
+        // Exactly at the floor: credited, and the 9,952-token prefix comes off
+        // the hit, which leaves nothing of it for the caller.
+        assert_eq!(billed.charged_to_caller(2_048, basis).cached_tokens, 0);
+        // One token under, and the floor answers instead of the offset. Same
+        // result here, reached a different way — the assertion that matters is
+        // that neither route ever credits more than the offset would.
+        assert_eq!(billed.charged_to_caller(2_047, basis).cached_tokens, 0);
+
+        // Well past the floor, the hit clears the prefix and is credited.
+        let long = Usage {
+            prompt_tokens: 26_000,
+            cached_tokens: 22_000,
+            ..Usage::default()
+        };
+        assert_eq!(
+            long.charged_to_caller(22_300, basis).cached_tokens,
+            18_300,
+            "a real conversation still earns its discount"
+        );
+    }
+
+    #[test]
+    fn a_zero_floor_leaves_the_offset_in_sole_charge() {
+        let billed = Usage {
+            prompt_tokens: 1_500,
+            cached_tokens: 1_500,
+            ..Usage::default()
+        };
+        let basis = CacheBasis {
+            credit: CacheCredit::CallersBodyOnly,
+            injected: 0,
+            floor: 0,
+        };
+        // 1,500 cached over a 1,500-token prompt the caller wrote all of: no
+        // prefix to subtract, so the hit is theirs. Turning the floor off is
+        // what makes that reachable.
+        assert_eq!(billed.charged_to_caller(1_500, basis).cached_tokens, 1_500);
+    }
+
+    #[test]
+    fn a_hit_reaching_past_the_injected_prefix_is_credited_to_the_caller() {
+        let billed = Usage {
+            prompt_tokens: 26_000,
+            completion_tokens: 600,
+            cached_tokens: 22_000,
+            ..Usage::default()
+        };
+        // A long conversation: the hit covers the 3,700-token injection and
+        // 18,300 tokens of the caller's own history, which is a real discount.
+        let charged = billed.charged_to_caller(22_300, CacheBasis::callers_body());
+        assert_eq!(charged.cached_tokens, 18_300);
+        assert_eq!(charged.prompt_tokens, 22_300);
+    }
+
+    #[test]
+    fn the_callers_share_of_a_hit_never_exceeds_their_own_prompt() {
+        let billed = Usage {
+            prompt_tokens: 400,
+            cached_tokens: 900,
+            ..Usage::default()
+        };
+        // A backend reporting more cached tokens than it counted prompt
+        // tokens: there is no prefix left to subtract, and the hit still
+        // cannot be larger than the 500-token body it is part of.
+        assert_eq!(
+            billed
+                .charged_to_caller(500, CacheBasis::callers_body())
+                .cached_tokens,
+            500
+        );
+    }
+
+    #[test]
+    fn billing_the_injected_prompt_to_the_caller_passes_the_whole_hit_on() {
+        let billed = Usage {
+            prompt_tokens: 3_941,
+            completion_tokens: 8,
+            cached_tokens: 3_712,
+            ..Usage::default()
+        };
+        // `bill_system_prompt_to_user` charges them for the full body, so the
+        // offset is zero and the cache discount over it is theirs.
+        let charged = billed.charged_to_caller(3_941, CacheBasis::whole_body());
+        assert_eq!(charged.cached_tokens, 3_712);
+    }
+
+    #[test]
+    fn a_shorter_injected_prompt_leaves_nothing_to_discount() {
+        let billed = Usage {
+            prompt_tokens: 800,
+            cached_tokens: 600,
+            ..Usage::default()
+        };
+        // The route replaced a longer system prompt of the caller's with a
+        // shorter one: `injected` was negative and the handler floors it at 0,
+        // so the hit stays the caller's.
+        assert_eq!(
+            billed
+                .charged_to_caller(1_000, CacheBasis::callers_body())
+                .cached_tokens,
+            600
+        );
+    }
+
     #[test]
     fn the_backend_number_wins_and_the_difference_is_kept_as_drift() {
         let local = LocalCount {
@@ -533,7 +891,7 @@ mod usage_tests {
     #[test]
     fn the_caller_is_charged_the_prompt_they_actually_wrote() {
         // 100 tokens went upstream, 40 of them the caller's. They pay for 40.
-        let charged = usage(100, 20).charged_to_caller(40);
+        let charged = usage(100, 20).charged_to_caller(40, CacheBasis::callers_body());
         assert_eq!(charged.prompt_tokens, 40);
         assert_eq!(charged.completion_tokens, 20, "output is theirs entirely");
         assert_eq!(charged.total_tokens, 60);
@@ -544,7 +902,7 @@ mod usage_tests {
         // The backend charged 120 for what the relay measured as 100, of which
         // 40 was the caller's. The backend's arithmetic is the backend's; the
         // caller wrote 40 tokens and 40 is what they are told.
-        let charged = usage(120, 10).charged_to_caller(40);
+        let charged = usage(120, 10).charged_to_caller(40, CacheBasis::callers_body());
         assert_eq!(charged.prompt_tokens, 40);
     }
 
@@ -553,7 +911,7 @@ mod usage_tests {
         // A backend that counts the prompt more cheaply than the relay does is
         // a real case, and it is still not the caller's number. Theirs does not
         // move because somebody else's tokenizer disagreed.
-        let charged = usage(41, 27).charged_to_caller(40);
+        let charged = usage(41, 27).charged_to_caller(40, CacheBasis::callers_body());
         assert_eq!(charged.prompt_tokens, 40);
     }
 
@@ -562,14 +920,14 @@ mod usage_tests {
         // The whole point, at the scale it actually bites: the caller wrote 6k
         // and the relay injected 4k on top. The backend bills for all 10k (and
         // counts it as 10_500 with its own tokenizer). The caller is told 6000.
-        let charged = usage(10_500, 300).charged_to_caller(6_000);
+        let charged = usage(10_500, 300).charged_to_caller(6_000, CacheBasis::callers_body());
         assert_eq!(charged.prompt_tokens, 6_000);
         assert_eq!(charged.total_tokens, 6_300);
     }
 
     #[test]
     fn nothing_injected_means_nothing_taken_off() {
-        let charged = usage(100, 20).charged_to_caller(100);
+        let charged = usage(100, 20).charged_to_caller(100, CacheBasis::callers_body());
         assert_eq!(charged.prompt_tokens, 100);
         assert_eq!(charged.total_tokens, 120);
     }
@@ -582,13 +940,13 @@ mod usage_tests {
         // is the relay's decision, not a discount it owes them. The margin is
         // the operator's to set in the price list, not something to smuggle
         // into a token count.
-        let charged = usage(80, 5).charged_to_caller(200);
+        let charged = usage(80, 5).charged_to_caller(200, CacheBasis::callers_body());
         assert_eq!(charged.prompt_tokens, 200);
     }
 
     #[test]
     fn an_empty_prompt_counts_as_nothing() {
-        let charged = usage(0, 0).charged_to_caller(0);
+        let charged = usage(0, 0).charged_to_caller(0, CacheBasis::callers_body());
         assert_eq!(charged.prompt_tokens, 0);
         assert_eq!(charged.total_tokens, 0);
     }
@@ -602,13 +960,24 @@ mod usage_tests {
             cached_tokens: 900,
             ..usage(1_000, 10)
         };
-        let charged = billed.charged_to_caller(400);
+        // 600 injected, so 300 of the hit is the caller's by the offset — but
+        // a backend that reports 900 cached against a 400-token body is over
+        // its own prompt either way, and the clamp is the backstop.
+        assert_eq!(
+            billed
+                .charged_to_caller(400, CacheBasis::callers_body())
+                .cached_tokens,
+            300
+        );
+        let charged = billed.charged_to_caller(400, CacheBasis::whole_body());
         assert_eq!(charged.cached_tokens, 400);
     }
 
     #[test]
     fn the_public_usage_carries_the_cost_and_prunes_what_is_empty() {
-        let plain = usage(10, 5).charged_to_caller(10).public(None);
+        let plain = usage(10, 5)
+            .charged_to_caller(10, CacheBasis::callers_body())
+            .public(None);
         assert_eq!(plain["prompt_tokens"], 10);
         assert!(plain.get("usage").is_none(), "no cost, no field");
         assert!(plain.get("cost").is_none());
@@ -620,7 +989,7 @@ mod usage_tests {
             reasoning_tokens: 3,
             ..usage(10, 5)
         }
-        .charged_to_caller(10)
+        .charged_to_caller(10, CacheBasis::callers_body())
         .public(Some(0.102_949_9));
         assert_eq!(priced["usage"], 0.102_949_9);
         // The same number under OpenRouter's spelling, never a second price.
@@ -631,7 +1000,7 @@ mod usage_tests {
         // A short request at a tenth of a dollar per million tokens: six
         // decimal places reported this as free, which is the bug.
         let small = usage(61, 190)
-            .charged_to_caller(61)
+            .charged_to_caller(61, CacheBasis::callers_body())
             .public(Some(0.000_009_15));
         assert_eq!(small["usage"], 0.000_009_15);
     }

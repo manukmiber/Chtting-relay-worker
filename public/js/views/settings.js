@@ -288,6 +288,7 @@ export async function settingsView(ctx) {
   i.fallback = text(cfg.tokenizer.fallback, { class: 'mono' });
   i.preferUpstream = h('input', { type: 'checkbox', checked: cfg.tokenizer.preferUpstreamUsage !== false });
   i.billSystem = h('input', { type: 'checkbox', checked: cfg.tokenizer.billSystemPromptToUser === true });
+  i.cacheFloor = number(cfg.tokenizer.cacheCreditMinTokens ?? 2048, { min: 0, step: 256 });
   i.rules = textarea(JSON.stringify(cfg.tokenizer.rules ?? [], null, 1), { rows: 12 });
 
   root.append(card('Token counting', h('div', {},
@@ -298,6 +299,15 @@ export async function settingsView(ctx) {
     h('p.small.muted', {
       text: 'Off by default: the caller did not write that prompt and cannot see it. '
         + 'Either way both numbers are recorded, so the difference stays visible in Usage.',
+    }),
+    field('Cache credit floor', i.cacheFloor,
+      'below this many tokens of the caller\'s own prompt, a backend cache hit is '
+      + 'not passed on and the whole prompt bills as fresh input'),
+    h('p.small.muted', {
+      text: 'A reported hit covers the injected prompt as well as the caller\'s, and the two '
+        + 'are told apart by subtraction, which carries the drift between the backend\'s '
+        + 'tokenizer and this one. On a short prompt that drift is most of the answer, so the '
+        + 'split is least trustworthy where the discount is worth least. 0 credits every hit.',
     }),
     field('Fallback vocabulary', i.fallback, 'used when no rule matches'),
     field('Model → tokenizer rules', i.rules,
@@ -485,6 +495,7 @@ export async function settingsView(ctx) {
               fallback: i.fallback.value.trim(),
               preferUpstreamUsage: i.preferUpstream.checked,
               billSystemPromptToUser: i.billSystem.checked,
+              cacheCreditMinTokens: Number(i.cacheFloor.value) || 0,
               rules: JSON.parse(i.rules.value || '[]'),
             },
             openrouter: {
