@@ -405,6 +405,12 @@
       }
     }
   ],
+
+  "defaults": {
+    "_comment": "What a request that never sent reasoning_effort is taken to have asked for. Resolved once, at the door, so the system prompt, the price band and the request row all agree. \"high\" puts those callers on the model's Default prompt; \"none\" puts them on its No thinking one; \"default\" leaves silence outside the scale entirely.",
+    "effort": "high"
+  },
+
   "tokenizer": {
     "fallback": "o200k_base",
     "preferUpstreamUsage": true,

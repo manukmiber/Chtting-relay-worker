@@ -41,7 +41,9 @@ export async function modelsView(ctx) {
         m.systemPrompt?.mode && m.systemPrompt.mode !== 'none'
           ? pill(m.systemPrompt.mode, 'accent')
           : h('span.muted', { text: '—' }),
-        m.systemPrompts?.length ? pill(`+${m.systemPrompts.length} by effort`, 'accent') : null,
+        m.systemPrompts?.filter((r) => r.enabled !== false).length
+          ? pill(`+${m.systemPrompts.filter((r) => r.enabled !== false).length} by effort`, 'accent')
+          : null,
         m.maxTokensPerSecond ? pill(`${m.maxTokensPerSecond} tok/s`, 'warn') : null,
         m.pricing?.enabled ? pill(priceLabel(m.pricing), 'ok') : null,
         m.openrouter?.listed ? pill('OpenRouter', 'ok') : null),
@@ -136,24 +138,26 @@ function editModel(ctx, existing) {
     body.append(section('System prompt injection', [
       h('h3.small', { text: 'Default' }),
       h('p.small.muted', {
-        text: 'What the model is told when the caller asked it to think \u2014 low, medium, '
-          + 'high or max \u2014 and what everyone gets while the box below is left at none.',
+        text: 'What the model is told when the caller asked it to think \u2014 medium, high '
+          + 'or max \u2014 and what a caller who said nothing about thinking gets, because '
+          + 'silence is read as the effort set in Settings (high, unless you changed it). '
+          + 'Also what everyone gets while the box below is left at none.',
       }),
       ...inputs.spDefault.rows,
       h('hr'),
       h('h3.small', { text: 'No thinking' }),
       h('p.small.muted', {
-        text: 'What the model is told when thinking is off, set to minimal, or never '
-          + 'mentioned at all \u2014 the same three the no-thinking price band covers, '
-          + 'because silence is not a choice to think and should not be answered as one. '
-          + 'Leave the mode at none and these callers fall through to Default.',
+        text: 'What the model is told when thinking is off, minimal, or low \u2014 the '
+          + 'bottom half of the four levels a caller can ask for. Leave the mode at none '
+          + 'and these callers fall through to Default; the text stays here either way.',
       }),
       ...inputs.spNonThinking.rows,
       h('hr'),
       h('p.small.muted', {
         text: 'Anything narrower than those two is a rule of its own. Rules are tried '
           + 'before the two boxes above, first match wins; efforts are none, minimal, '
-          + 'low, medium, high, max and default.',
+          + 'low, medium, high and max. "default" matches only if Settings leaves '
+          + 'unspecified thinking unresolved.',
       }),
       field('Extra rules by effort', inputs.promptRules,
         'JSON, and rarely needed: [{"efforts":["max"],"prompt":{"mode":"replace","promptId":"sp_…"}}]'),
@@ -219,8 +223,9 @@ function editModel(ctx, existing) {
       priceCard.el,
       h('p.small.muted', {
         text: 'Reasoning tokens are output tokens, at the band\u2019s own output rate. '
-          + 'A caller who never mentioned thinking is on the no-thinking row: silence is '
-          + 'not a choice to think, and should not be billed as one.',
+          + 'A caller who never mentioned thinking is billed on the row for the effort '
+          + 'Settings resolves silence to \u2014 high, and so the standard row, unless you '
+          + 'changed it.',
       }),
       h('hr'),
       h('div.grid.form', {},
@@ -626,10 +631,17 @@ function editModel(ctx, existing) {
 const NON_THINKING_RULE = 'sp-non-thinking';
 
 /**
- * The efforts that rule answers for — the same three the no-thinking price band
- * covers, so a request is never told one thing and billed as another.
+ * The efforts that rule answers for: thinking off, thinking barely on, and the
+ * lowest level that counts as thinking at all. Everything above — medium, high,
+ * max — gets the Default prompt.
+ *
+ * A caller who named no effort is not on this list because they never reach it:
+ * silence is resolved into a real effort first, by "Unspecified thinking" in
+ * Settings, which ships as high. The relay keeps this list in step on every
+ * save (see `NON_THINKING_EFFORTS` in `config.rs`), so a model saved before it
+ * changed does not answer to the old one.
  */
-const NON_THINKING_EFFORTS = ['none', 'minimal', 'default'];
+const NON_THINKING_EFFORTS = ['none', 'minimal', 'low'];
 
 /**
  * One prompt: how to inject it, which saved prompt it is, and the text itself.
@@ -646,6 +658,18 @@ function promptEditor(cfg, spec, { placeholder }) {
     ['replace', 'replace — drop whatever the caller sent'],
     ['merge', 'merge — one system message, ours on top'],
   ]);
+
+  // Writing a prompt is choosing to inject one. Leaving the mode at `none`
+  // after typing a page of instructions is never what anyone meant, so the
+  // first keystroke moves it to `prepend` — visibly, in the dropdown, and only
+  // until the operator sets the mode themselves.
+  let modeChosen = false;
+  mode.addEventListener('change', () => { modeChosen = true; });
+  const nudgeMode = () => {
+    if (modeChosen || mode.value !== 'none') return;
+    mode.value = 'prepend';
+    modeChosen = true;
+  };
   const promptId = select(spec?.promptId ?? '', [
     ['', '— write it inline below —'],
     ...(cfg.systemPrompts ?? []).map((p) => [p.id, p.name]),
@@ -664,7 +688,12 @@ function promptEditor(cfg, spec, { placeholder }) {
       ? `Prompt text — from "${saved.name}", edit it in the Prompts tab`
       : 'Prompt text';
   };
-  promptId.addEventListener('change', sync);
+  promptId.addEventListener('change', () => {
+    sync();
+    // Picking a saved prompt is the same decision as typing one.
+    if (promptId.value) nudgeMode();
+  });
+  box.addEventListener('input', nudgeMode);
   sync();
 
   return {
@@ -689,17 +718,25 @@ function promptEditor(cfg, spec, { placeholder }) {
  * The rule list as the relay reads it: the operator's own rules first, so a
  * narrower one can still win, then the "No thinking" box as the last word.
  *
- * A box left at `none` writes no rule at all rather than one that injects
- * nothing — the difference matters, because a rule that matches and injects
- * nothing would stop those callers reaching the Default prompt.
+ * A box left at `none` is saved as a *disabled* rule rather than dropped. The
+ * relay skips disabled rules, so those callers still fall through to the
+ * Default prompt — which is the behaviour the mode asks for — but the text
+ * survives the round trip. Dropping the rule outright is what used to make a
+ * prompt typed into this box vanish the next time the model was opened: the
+ * mode starts at `none`, and anyone who typed without touching it lost the lot,
+ * silently, behind a "Saved" toast.
+ *
+ * Nothing at all — no text, no saved prompt, mode still `none` — writes no rule,
+ * because an empty disabled rule is just clutter in the config file.
  */
 function promptRules(extras, nonThinking) {
   const kept = extras.filter((r) => r?.id !== NON_THINKING_RULE);
-  if (nonThinking.mode === 'none') return kept;
+  const empty = nonThinking.mode === 'none' && !nonThinking.text.trim() && !nonThinking.promptId;
+  if (empty) return kept;
   return [...kept, {
     id: NON_THINKING_RULE,
     name: 'No thinking',
-    enabled: true,
+    enabled: nonThinking.mode !== 'none',
     efforts: NON_THINKING_EFFORTS,
     prompt: nonThinking,
   }];

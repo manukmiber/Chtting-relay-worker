@@ -80,6 +80,7 @@ export const api = {
 
   setup: () => request('GET', '/api/setup'),
   serviceAction: (action) => request('POST', `/api/service/${action}`),
+  update: () => request('GET', '/api/update'),
   installPackage: (name) => request('POST', '/api/system/package', { package: name }),
   wakeLock: (on) => request('POST', '/api/system/wakelock', { on }),
 

@@ -367,7 +367,11 @@ pub async fn handle_chat(
     let id = new_uuid_v4();
     let local = crate::util::local_parts(started_wall, &tz);
     let trace = Trace::new(state.logger.clone(), &id, cfg.logging.verbose_requests);
-    let effort = pricing::effort_of(&body);
+    // What the caller asked for, and what a caller who asked for nothing gets.
+    // Resolved here and nowhere else: every later decision — which system
+    // prompt is injected, which price band applies, what the request row says —
+    // reads this one value.
+    let effort = pricing::effort_of(&body).or(pricing::default_effort(&cfg));
     let user_id = effective_user_id(&cfg, &key, &body, headers);
 
     let mut record = RequestRecord {

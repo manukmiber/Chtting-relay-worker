@@ -601,21 +601,36 @@ impl Host {
 /// both the supervised and the unsupervised case.
 #[cfg(unix)]
 pub fn exec_self() -> anyhow::Error {
+    match std::env::current_exe() {
+        Ok(path) => exec_binary(&path),
+        Err(err) => anyhow!("cannot find my own binary to restart: {err}"),
+    }
+}
+
+/// Replace this process with a *named* binary, keeping its arguments.
+///
+/// The one caller that needs this rather than [`exec_self`] is the updater: it
+/// has just moved the running binary aside to make room for the linker, so
+/// `current_exe` no longer names the thing that should come back. Everything
+/// else about the restart is the same — same arguments, same PID, same port.
+#[cfg(unix)]
+pub fn exec_binary(path: &Path) -> anyhow::Error {
     use std::os::unix::process::CommandExt;
-    let exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(err) => return anyhow!("cannot find my own binary to restart: {err}"),
-    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `exec` only returns when it failed.
     anyhow!(
         "restart failed: {}",
-        std::process::Command::new(exe).args(args).exec()
+        std::process::Command::new(path).args(args).exec()
     )
 }
 
 #[cfg(not(unix))]
 pub fn exec_self() -> anyhow::Error {
+    anyhow!("restarting in place is only implemented for Unix")
+}
+
+#[cfg(not(unix))]
+pub fn exec_binary(_path: &Path) -> anyhow::Error {
     anyhow!("restarting in place is only implemented for Unix")
 }
 

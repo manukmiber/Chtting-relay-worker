@@ -110,6 +110,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/tunnel", get(tunnel_status))
         .route("/api/tunnel/{action}", post(tunnel_action))
         .route("/api/setup", get(setup))
+        .route("/api/update", get(update_status))
         .route("/api/service/{action}", post(service_action))
         .route("/api/system/package", post(install_package))
         .route("/api/system/wakelock", post(wake_lock))
@@ -1711,6 +1712,11 @@ async fn tokenizer_install(
     .into_response()
 }
 
+/// How far the `git pull` and build have got. Polled while one is running.
+async fn update_status(State(dash): State<Arc<Dashboard>>) -> Response {
+    Json(dash.state.updater.status()).into_response()
+}
+
 /* ------------------------------------------------------------- tunnel -- */
 
 async fn tunnel_status(State(dash): State<Arc<Dashboard>>) -> Response {
@@ -1885,6 +1891,9 @@ async fn setup(State(dash): State<Arc<Dashboard>>) -> Response {
         );
         map.insert("wantsWakeLock".into(), json!(cfg.server.wake_lock));
         map.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
+        // What "Update & restart" would pull, and whether the two tools it
+        // needs are there — worth saying before a five-minute build, not after.
+        map.insert("update".into(), state.updater.status());
     }
     Json(report).into_response()
 }
@@ -1923,6 +1932,36 @@ async fn service_action(
                 "message": "Restarting — this page comes back in a few seconds.",
             }))
         }
+        // Pull, build, and restart into the result. It answers straight away
+        // and does the work in the background: on a phone the build alone is
+        // five to fifteen minutes, which no browser will wait out. The progress
+        // is at `GET /api/update`.
+        "update" => {
+            if state.updater.status()["busy"] == Value::Bool(true) {
+                return error(409, "an update is already running");
+            }
+            state
+                .logger
+                .info("update requested from the dashboard: git pull, build, restart");
+            let background = state.clone();
+            tokio::spawn(async move {
+                match background.updater.run().await {
+                    // Nothing to build. Restart anyway — the operator asked for
+                    // one, and a relay that has been up for days is worth
+                    // replacing on its own account.
+                    Ok(None) => leave(background, Ending::Restart),
+                    Ok(Some(binary)) => leave(background, Ending::RestartInto(binary)),
+                    // The relay is still up and still serving; the failure is
+                    // in the update status for the dashboard to show.
+                    Err(_) => {}
+                }
+            });
+            Ok(json!({
+                "ok": true,
+                "action": "update",
+                "message": "Pulling and building. This page comes back when the relay does.",
+            }))
+        }
         "stop" => {
             state.logger.info("stop requested from the dashboard");
             leave(state.clone(), Ending::Stop);
@@ -1957,10 +1996,15 @@ async fn service_action(
 }
 
 /// How this process is meant to go away.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Ending {
     /// Come straight back, same PID, same port.
     Restart,
+    /// Come back as a different binary: the one an update has just built. The
+    /// path is named rather than looked up, because the update moved the
+    /// running binary aside to make room for the linker and `current_exe` no
+    /// longer points at the thing that should come back.
+    RestartInto(std::path::PathBuf),
     /// Go, and stay gone.
     Stop,
     /// Go, and let the supervisor start the next one.
@@ -1983,6 +2027,10 @@ fn leave(state: Arc<AppState>, ending: Ending) {
                 // Only returns if it failed, and then the honest thing is to
                 // stay up rather than leave the caller with nothing.
                 let err = crate::system::exec_self();
+                state.logger.error(err.to_string());
+            }
+            Ending::RestartInto(binary) => {
+                let err = crate::system::exec_binary(&binary);
                 state.logger.error(err.to_string());
             }
             Ending::Stop => {

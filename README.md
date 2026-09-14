@@ -335,31 +335,41 @@ Aturan rewrite request tidak pernah menyentuh system prompt kamu sendiri.
 Panggilan tanpa reasoning dan panggilan dengan effort maksimum butuh instruksi
 yang berbeda: yang pertama perlu jawabannya dibentuk langsung, yang kedua perlu
 ruang untuk berpikir. Tapi di praktiknya pembacanya cuma dua — yang minta model
-berpikir, dan yang tidak. Jadi di dashboard isinya dua kotak, bukan editor
-aturan:
+berpikir, dan yang tidak. Effort yang bisa diminta pemanggil ada empat (off,
+low, high, max), dan dua kotak itu membelahnya jadi dua:
 
 * **Default** — `systemPrompt` model itu sendiri. Dipakai untuk pemanggil yang
-  minta model berpikir (`low`, `medium`, `high`, `max`), dan untuk semua orang
-  selama kotak kedua masih di mode `none`.
+  benar-benar minta model berpikir (`medium`, `high`, `max`), dan untuk semua
+  orang selama kotak kedua masih di mode `none`.
 * **No thinking** — satu aturan `systemPrompts[]` dengan id khusus
-  `sp-non-thinking` dan `efforts: ["none", "minimal", "default"]`.
+  `sp-non-thinking` dan `efforts: ["none", "minimal", "low"]`.
 
 ```json
 "systemPrompts": [
   { "id": "sp-non-thinking", "name": "No thinking", "enabled": true,
-    "efforts": ["none", "minimal", "default"],
+    "efforts": ["none", "minimal", "low"],
     "prompt": { "mode": "replace", "text": "Jawab langsung, tanpa basa-basi." } }
 ]
 ```
 
-Tiga effort itu persis yang ditanggung **band harga no-thinking**, dan memang
-harus tetap begitu: diam bukan pilihan untuk berpikir, jadi jangan dijawab
-seperti itu dan jangan ditagih seperti itu. Request yang dibilang satu hal lalu
-ditagih hal lain adalah satu-satunya bug yang tidak kelihatan dari layar mana
-pun. Ada test yang mengunci ini.
+Id itu dipesan, dan daftar effort-nya ikut dipesan: relay menulis ulang daftar
+itu tiap kali config dibaca dan disimpan, jadi model yang disimpan waktu
+pembagiannya masih di tempat lain ikut maju sendiri — tidak perlu dibuka dan
+di-Save satu per satu. Aturan tulisanmu sendiri, dengan id apa pun selain itu,
+tidak disentuh.
 
-Kotak yang dibiarkan di mode `none` tidak menulis aturan sama sekali — jadi
-pemanggilnya jatuh ke Default, yang memang arti dari "belum saya isi".
+Pemanggil yang **tidak menyebut effort sama sekali** tidak ada di daftar itu,
+karena dia tidak pernah sampai ke sana: diamnya diterjemahkan dulu jadi effort
+beneran oleh `defaults.effort` (Settings → *Unspecified thinking*), yang isinya
+`high`. Satu nilai itu yang menentukan prompt mana yang dikirim, pita harga mana
+yang ditagih, dan apa yang ditulis di baris request — jadi tidak ada request yang
+dibilang satu hal lalu ditagih hal lain. Ada test yang mengunci ini.
+
+Kotak yang dibiarkan di mode `none` disimpan sebagai aturan **disabled**: relay
+melewati aturan disabled, jadi pemanggilnya tetap jatuh ke Default persis
+seolah-olah aturannya tidak ada — tapi teks yang sudah kamu tulis masih ada di
+kotaknya waktu model itu dibuka lagi. (Dulu aturannya dibuang, jadi prompt yang
+diketik di kotak yang mode-nya masih `none` hilang di balik toast "Saved".)
 
 Di bawah dua kotak itu `systemPrompts` tetap daftar aturan biasa buat hal yang
 lebih sempit: aturan pertama yang cocok yang menang, dan aturan tulisanmu
@@ -501,7 +511,7 @@ Pitanya dipilih dari thinking effort yang diminta pemanggil, dan hanya itu:
 |---|---|---|
 | baku | `low`, `medium`, `high` | `inputUsdPerM`, `cachedInputUsdPerM`, `outputUsdPerM` |
 | max thinking | `max` (dan budget thinking di atas 32K) | `maxThinking` |
-| tanpa thinking | `none`, `minimal`, **dan pemanggil yang tidak menyebut apa pun** | `nonThinking` |
+| tanpa thinking | `none`, `minimal` | `nonThinking` |
 
 ```json
 "inputUsdPerM": 0.35,
@@ -515,8 +525,10 @@ Tarif yang dibiarkan `0` di sebuah pita menagih tarif baku, bukan menagih nol �
 jadi pita yang cuma menggeser output cukup menyebut satu angka. Token reasoning
 itu token output, dengan tarif output pita yang sedang berlaku.
 
-Diam ditagih sebagai tanpa thinking dengan sengaja: pemanggil yang tidak pernah
-menyebut thinking tidak memilih membelinya, jadi tidak membayarnya.
+Pemanggil yang tidak pernah menyebut thinking ditagih di pita untuk effort hasil
+terjemahan `defaults.effort` — `high`, jadi pita baku, kecuali kamu mengubahnya.
+Setel ke `none` kalau kamu mau diam ditagih sebagai tanpa thinking, atau ke
+`default` kalau diam memang tidak boleh dihitung sebagai effort apa pun.
 
 ### Daftar harga ZeikoAI
 
@@ -826,8 +838,8 @@ ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pu
 
 | Tab | Isinya |
 |---|---|
-| Setup | checklist apa yang belum siap, service/shortcut/boot, wake lock, pasang paket, start–stop–restart relay |
-| Overview | statistik, grafik harian, rincian per model dan per key |
+| Setup | checklist apa yang belum siap, service/shortcut/boot, wake lock, pasang paket, stop relay, **Update & restart** |
+| Overview | statistik, grafik harian, rincian per model dan per key, plus tombol **Update & restart** dan **Restart** |
 | Models | editor alias: terjemahan nama, prompt, params, limit, tokenizer, reshaping |
 | Backends | provider upstream + tombol tes koneksi |
 | Prompts | library system prompt |
@@ -844,6 +856,41 @@ ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pu
 
 Beri password lewat Settings kalau HP-mu dipakai orang lain. Secret selalu
 tampil termask, dan menyimpan form tidak akan menimpa key asli dengan masknya.
+
+### Update & restart: `git pull`, build, lalu balik lagi
+
+Relay di HP itu satu clone git plus satu binary hasil build dari clone itu, dan
+memajukannya dulu berarti buka Termux dan mengetik tiga perintah. Sekarang tiga
+perintah itu ada di balik satu tombol — di **Overview** dan di **Setup**:
+
+```
+git pull --ff-only  →  cargo build  →  exec binary yang baru
+```
+
+Ketiganya harus ada. `git pull` saja tidak mengubah apa pun yang bisa dilihat
+pemanggil: HTML, CSS, dan JavaScript dashboard **ikut ter-compile ke dalam
+binary**, jadi source baru di disk itu source yang tidak ada yang menjalankan.
+Makanya tombolnya menarik, membangun apa yang ditarik, baru restart ke hasilnya
+— itulah arti "restart" untuk relay yang sekaligus sebuah checkout.
+
+Dua hal yang disengaja:
+
+* **Relay tetap melayani sampai binary baru benar-benar jadi.** Pull yang gagal,
+  build yang gagal, toolchain yang belum dipasang — semuanya meninggalkan relay
+  yang sedang jalan persis seperti semula dan melapor kenapa. Yang menghentikan
+  proses lama cuma satu: binary baru yang sudah ada di disk.
+* **Binary yang sedang jalan dipindah dulu, bukan ditimpa.** Menautkan (link) ke
+  file yang sedang dieksekusi gagal dengan `ETXTBSY` di Linux. Mengganti namanya
+  gratis (proses yang jalan memegang inode-nya, bukan namanya), membebaskan path
+  yang dipanggil skrip keeper untuk build baru, dan menyisakan sesuatu untuk
+  dikembalikan kalau build-nya gagal.
+
+Di HP prosesnya lima sampai lima belas menit, jadi request-nya dijawab
+langsung dan kemajuannya diikuti lewat `GET /api/update` — log build-nya muncul
+di halaman selagi jalan. Tombol **Restart** yang di sebelahnya melewati `git
+pull` dan cuma menjalankan ulang binary yang sudah ada: hitungan detik, dan
+tidak mengubah kode apa pun. Itu yang dipakai kalau cuma ganti port atau bind
+address.
 
 ### Dokumentasi API untuk yang mau integrasi
 
@@ -877,6 +924,14 @@ Tab **Tunnel**, atau setel `tunnel.autoStart` di config.
 
 Yang dipublikasikan hanya port relay. Dashboard tetap di localhost. Tunnel token
 tidak pernah ikut tertulis ke buffer log yang ditampilkan dashboard.
+
+Tombol **Stop** dan **Restart** di tab itu benar-benar menghentikan cloudflared.
+Dulu tidak: proses pengawasnya memegang mutex penjaga child process selama
+`child.wait()`, jadi Stop menunggu kunci yang baru dilepas kalau cloudflared
+sudah mati duluan dengan sendirinya — persis hal yang mau dibikin terjadi oleh
+tombol itu. Sekarang child-nya dimiliki task pengawas itu sendiri dan Stop
+mengirim sinyal lewat channel, lalu menunggu sampai prosesnya benar-benar habis
+sebelum Restart mengikat yang baru.
 
 ---
 
@@ -1031,6 +1086,7 @@ src/
   store/         SQLite, buku besar, invoice, quota tracker, rate limiter
   system.rs      keeper, shortcut, hook boot, wake lock, restart/stop
   tunnel.rs      supervisor cloudflared
+  update.rs      git pull + build + restart ke binary yang baru
 public/          dashboard (vanilla JS, ikut ter-compile ke binary)
 scripts/         setup Termux, build Android
 tests/           test end-to-end lewat HTTP asli

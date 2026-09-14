@@ -81,6 +81,9 @@ pub struct AppState {
     /// The phone itself: the service, the boot hook, the wake lock. Everything
     /// that used to be a Termux command.
     pub host: Arc<Host>,
+    /// `git pull`, `cargo build` and the restart into the result — the rest of
+    /// what used to be a Termux command.
+    pub updater: Arc<crate::update::Updater>,
     pub paths: Paths,
     pub stats: Arc<Stats>,
     /// How many calls may be in flight upstream at once, and the line waiting
@@ -99,6 +102,7 @@ impl AppState {
         let upstream = Arc::new(crate::relay::upstream::Upstream::new(logger.clone())?);
         let tunnel = Arc::new(TunnelManager::new(config.clone(), logger.clone()));
         let host = Arc::new(Host::new(paths.clone(), logger.clone()));
+        let updater = Arc::new(crate::update::Updater::new(paths.clone(), logger.clone()));
 
         let today = crate::util::day_key(crate::util::now_ms(), &cfg.tz());
         let quotas = Arc::new(QuotaTracker::new(today.clone()));
@@ -122,6 +126,7 @@ impl AppState {
             quotas,
             tunnel,
             host,
+            updater,
             paths,
             stats,
             gate,

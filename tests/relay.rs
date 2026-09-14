@@ -1824,12 +1824,12 @@ async fn without_a_ceiling_the_stream_goes_out_as_fast_as_it_arrives() {
 /* --------------------------------------- 21. a prompt per thinking effort -- */
 
 #[tokio::test]
-async fn the_no_thinking_prompt_answers_for_exactly_the_no_thinking_price_band() {
-    // The dashboard offers two prompt boxes, Default and No thinking, and
-    // writes the second as one rule with these three efforts. They are the same
-    // three the no-thinking price band covers, and they have to stay that way:
-    // a request told one thing and billed as another is the one bug nobody
-    // reading either screen can see.
+async fn the_two_prompt_boxes_split_the_four_efforts_a_caller_can_ask_for() {
+    // The dashboard offers two prompt boxes, Default and No thinking, and there
+    // are four efforts to divide between them: off, low, high and max. The
+    // bottom two go to No thinking, the top two to Default — and a caller who
+    // named no effort at all is resolved into one of the four before any of
+    // this is read, so silence lands on a real prompt rather than in a gap.
     use chtting_relay::config::{SystemPromptRule, SystemPromptSpec};
 
     let h = harness(MockConfig::default(), |cfg| {
@@ -1841,6 +1841,9 @@ async fn the_no_thinking_prompt_answers_for_exactly_the_no_thinking_price_band()
         cfg.models[0].system_prompts = vec![SystemPromptRule {
             id: "sp-non-thinking".into(),
             name: "No thinking".into(),
+            // Deliberately the list this rule used to carry: the relay owns the
+            // efforts of its own reserved rule and rewrites them on load, so a
+            // config written before the split moved does not keep the old one.
             efforts: vec!["none".into(), "minimal".into(), "default".into()],
             prompt: SystemPromptSpec {
                 mode: "replace".into(),
@@ -1859,33 +1862,93 @@ async fn the_no_thinking_prompt_answers_for_exactly_the_no_thinking_price_band()
             .to_string()
     };
 
-    // Thinking off, thinking minimal, and never mentioned at all.
-    for asked in [Some("none"), Some("minimal"), None] {
+    // Thinking off, thinking barely on, and thinking at its lowest real level.
+    for asked in ["none", "minimal", "low"] {
         let mut body = chat("hi");
-        if let Some(effort) = asked {
-            body["reasoning_effort"] = json!(effort);
-        }
+        body["reasoning_effort"] = json!(asked);
         h.post("/v1/chat/completions", body).await;
         assert!(
             system_sent(&h).contains("NO THINKING PROMPT"),
-            "{asked:?} should be on the no-thinking prompt, got {}",
+            "{asked} should be on the no-thinking prompt, got {}",
             system_sent(&h)
         );
         assert_eq!(h.last_row().await["prompt_id"], "sp-non-thinking");
     }
 
-    // Everyone who did ask it to think is on the default prompt.
-    for effort in ["low", "medium", "high", "max"] {
+    // Everyone who asked it to think properly is on the default prompt — and so
+    // is the caller who asked for nothing, because nothing now means high.
+    for effort in [Some("medium"), Some("high"), Some("max"), None] {
         let mut body = chat("hi");
-        body["reasoning_effort"] = json!(effort);
+        if let Some(effort) = effort {
+            body["reasoning_effort"] = json!(effort);
+        }
         h.post("/v1/chat/completions", body).await;
         assert!(
             system_sent(&h).contains("DEFAULT PROMPT"),
-            "{effort} should be on the default prompt, got {}",
+            "{effort:?} should be on the default prompt, got {}",
             system_sent(&h)
         );
         assert_eq!(h.last_row().await["prompt_id"], "");
     }
+    // Silence is recorded as the effort it was read as, not as an absence, so
+    // the row and the prompt tell the same story.
+    assert_eq!(h.last_row().await["reasoning_effort"], "high");
+}
+
+#[tokio::test]
+async fn what_an_unspecified_effort_means_is_a_setting_rather_than_a_rule() {
+    // Most clients never send `reasoning_effort` at all. Where that silence
+    // lands is one setting, read once per request, and everything downstream —
+    // the prompt, the price band, the row — follows it.
+    use chtting_relay::config::{SystemPromptRule, SystemPromptSpec};
+
+    let prompt_for = |effort: &'static str| async move {
+        let h = harness(MockConfig::default(), move |cfg| {
+            cfg.defaults.effort = effort.into();
+            cfg.models[0].system_prompt = SystemPromptSpec {
+                mode: "replace".into(),
+                text: "DEFAULT PROMPT".into(),
+                prompt_id: String::new(),
+            };
+            cfg.models[0].system_prompts = vec![SystemPromptRule {
+                id: "sp-non-thinking".into(),
+                name: "No thinking".into(),
+                efforts: vec!["none".into(), "minimal".into(), "low".into()],
+                prompt: SystemPromptSpec {
+                    mode: "replace".into(),
+                    text: "NO THINKING PROMPT".into(),
+                    prompt_id: String::new(),
+                },
+                ..Default::default()
+            }];
+        })
+        .await;
+        h.post("/v1/chat/completions", chat("hi")).await;
+        let sent = h.backend.last_request()["messages"][0]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let row = h.last_row().await["reasoning_effort"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        (sent, row)
+    };
+
+    let (sent, row) = prompt_for("high").await;
+    assert!(sent.contains("DEFAULT PROMPT"), "got {sent}");
+    assert_eq!(row, "high");
+
+    // Turned the other way, the same silence lands in the other box.
+    let (sent, row) = prompt_for("none").await;
+    assert!(sent.contains("NO THINKING PROMPT"), "got {sent}");
+    assert_eq!(row, "none");
+
+    // And it can be left unresolved, which is what the relay did before the
+    // setting existed: silence is then not an effort at all.
+    let (sent, row) = prompt_for("default").await;
+    assert!(sent.contains("DEFAULT PROMPT"), "got {sent}");
+    assert_eq!(row, "default");
 }
 
 #[tokio::test]
@@ -1952,16 +2015,17 @@ async fn a_model_can_carry_one_system_prompt_per_reasoning_effort() {
     );
     assert_eq!(h.last_row().await["prompt_id"], "quick");
 
-    // A caller who said nothing about thinking matches neither rule and gets
-    // the model's own prompt, which is what it is there for.
+    // A caller who said nothing is read as the relay's default effort — high,
+    // which the ranked rule above answers for — rather than as a request that
+    // matches nothing.
     h.post("/v1/chat/completions", chat("hi")).await;
     assert!(
-        system_sent(&h).contains("FALLBACK PROMPT"),
+        system_sent(&h).contains("THINKING PROMPT"),
         "{}",
         system_sent(&h)
     );
-    assert_eq!(h.last_row().await["prompt_id"], "");
-    assert_eq!(h.last_row().await["reasoning_effort"], "default");
+    assert_eq!(h.last_row().await["prompt_id"], "thinker");
+    assert_eq!(h.last_row().await["reasoning_effort"], "high");
 
     // An Anthropic-shaped budget is understood as well as a named level.
     let mut budgeted = chat("hi");
@@ -2537,15 +2601,52 @@ async fn the_thinking_band_a_caller_asks_for_is_the_one_they_are_billed_on() {
     assert_eq!(max_band, "max thinking");
     assert_eq!(off_band, "no thinking");
     assert_eq!(
-        silent_band, "no thinking",
-        "a caller who said nothing about thinking is not billed for it"
+        silent_band, "",
+        "silence is read as the relay's default effort — high, and so the standard band"
     );
 
     assert!(max > standard, "{max} is not dearer than {standard}");
     assert!(standard > off, "{standard} is not dearer than {off}");
     assert_eq!(
-        off, silent,
-        "silence and thinking-off are the same band, so the same price"
+        standard, silent,
+        "silence resolves to high, so it is billed exactly as high is"
+    );
+}
+
+#[tokio::test]
+async fn silence_is_billed_as_whatever_it_was_told_it_meant() {
+    // The prompt a request gets and the band it is billed on read the same
+    // resolved effort, so turning the setting down moves both together. A
+    // request told one thing and billed as another is the one bug nobody
+    // reading either screen can see.
+    let priced = |default_effort: &'static str| async move {
+        let h = harness(MockConfig::default(), move |cfg| {
+            cfg.defaults.effort = default_effort.into();
+            cfg.pricing = chtting_relay::config::Pricing {
+                enabled: true,
+                input_usd_per_m: 0.35,
+                output_usd_per_m: 1.5,
+                non_thinking: chtting_relay::config::BandRates {
+                    input_usd_per_m: 0.35,
+                    output_usd_per_m: 1.2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+        })
+        .await;
+        h.post("/v1/chat/completions", chat("hi")).await;
+        let row = h.last_row().await;
+        (
+            row["price_tiers"].as_str().unwrap_or("").to_string(),
+            row["reasoning_effort"].as_str().unwrap_or("").to_string(),
+        )
+    };
+
+    assert_eq!(priced("high").await, (String::new(), "high".into()));
+    assert_eq!(
+        priced("none").await,
+        ("no thinking".to_string(), "none".to_string())
     );
 }
 

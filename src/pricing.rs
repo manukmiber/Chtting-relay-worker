@@ -99,6 +99,24 @@ impl Effort {
             Effort::Low | Effort::Medium | Effort::High | Effort::Max
         )
     }
+
+    /// Read silence as a choice, once: `fallback` when the caller named no
+    /// effort at all, and what they named otherwise.
+    pub fn or(self, fallback: Effort) -> Effort {
+        match self {
+            Effort::Unspecified => fallback,
+            chosen => chosen,
+        }
+    }
+}
+
+/// What a request that named no effort is treated as having asked for.
+///
+/// Read once per request, before anything looks at the effort, so the prompt
+/// that goes out, the band that is billed and the row that is written all agree
+/// about what the caller wanted.
+pub fn default_effort(cfg: &crate::config::Config) -> Effort {
+    Effort::parse(&cfg.defaults.effort).unwrap_or(Effort::Unspecified)
 }
 
 /// Read the caller's thinking request out of the body they sent.
@@ -460,7 +478,9 @@ pub const NON_THINKING_BAND: &str = "no thinking";
 fn band_for(pricing: &Pricing, effort: Effort) -> Option<(&'static str, &BandRates)> {
     let (name, band) = match effort {
         Effort::Max => (MAX_THINKING_BAND, &pricing.max_thinking),
-        // Silence is not a choice to think, so it is billed like thinking off.
+        // Silence reaches this only when nothing resolved it into a real
+        // effort, and then the honest reading is that no thinking was asked
+        // for. `defaults.effort` normally resolves it long before here.
         Effort::None | Effort::Minimal | Effort::Unspecified => {
             (NON_THINKING_BAND, &pricing.non_thinking)
         }
