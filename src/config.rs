@@ -452,6 +452,24 @@ pub struct SystemPromptRule {
     pub prompt: SystemPromptSpec,
 }
 
+/// The id the dashboard's "No thinking" box owns.
+///
+/// Reserved: a rule carrying it *is* that box, which is what lets the box be
+/// edited as a plain prompt while the relay still reads it as one entry in an
+/// ordered list. Because the relay owns the meaning of the id, it also owns the
+/// efforts the rule answers for — see [`NON_THINKING_EFFORTS`].
+pub const NON_THINKING_RULE: &str = "sp-non-thinking";
+
+/// What the "No thinking" box covers: thinking off, thinking barely on, and the
+/// lowest level that counts as thinking at all. Medium, high and max get the
+/// model's Default prompt instead.
+///
+/// Canonical, and rewritten onto the reserved rule on every load and save. A
+/// model saved when this list was spelled differently would otherwise keep
+/// answering to the old spelling until somebody opened it in the dashboard and
+/// pressed Save, which is a migration nobody would know they owed.
+pub const NON_THINKING_EFFORTS: [&str; 3] = ["none", "minimal", "low"];
+
 impl Default for SystemPromptRule {
     fn default() -> Self {
         Self {
@@ -534,9 +552,10 @@ pub struct Pricing {
     pub reasoning_usd_per_m: f64,
     /// The band for `reasoning_effort: "max"` and the budgets that large.
     pub max_thinking: BandRates,
-    /// The band for thinking turned off, thinking set to minimal, and for a
-    /// caller who said nothing about thinking at all — silence is not a choice
-    /// to think, and should not be billed as one.
+    /// The band for thinking turned off and thinking set to minimal — and for a
+    /// caller who said nothing about thinking at all, if and only if
+    /// [`Defaults::effort`] leaves silence unresolved. It ships resolving to
+    /// `high`, which puts those callers on the standard band instead.
     pub non_thinking: BandRates,
     /// Markup over the backend rate, in percent, for every sell-side rate left
     /// at 0.
@@ -775,13 +794,44 @@ pub struct Quota {
     pub requests_per_minute: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// What a caller who never mentioned thinking is taken to have asked for.
+///
+/// High rather than nothing, because "nothing" is not a level this relay
+/// publishes: the four a caller can pick from are off, low, high and max, and
+/// the two prompts a model carries divide them in half. Silence has to land on
+/// one side of that line, and the useful side is the thinking one — a client
+/// that simply never learned to send `reasoning_effort` should get the model at
+/// its best, not the answer written for callers who asked it not to think.
+pub const DEFAULT_EFFORT: &str = "high";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Defaults {
     pub system_prompt: SystemPromptSpec,
     pub params: Map<String, Value>,
     pub request_transform: RequestTransform,
     pub response_transform: ResponseTransform,
+    /// The effort a request that named none is treated as having asked for:
+    /// `none`, `minimal`, `low`, `medium`, `high` or `max`. It decides which of
+    /// the model's prompts is injected, which price band the request is on, and
+    /// what the request row records — one answer, used everywhere, so a caller
+    /// is never told one thing and billed as another.
+    ///
+    /// `default` puts silence back outside the scale, which is what the relay
+    /// did before this setting existed.
+    pub effort: String,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self {
+            system_prompt: SystemPromptSpec::default(),
+            params: Map::new(),
+            request_transform: RequestTransform::default(),
+            response_transform: ResponseTransform::default(),
+            effort: DEFAULT_EFFORT.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1641,6 +1691,14 @@ pub fn normalize(mut cfg: Config) -> Config {
             if rule.id.is_empty() {
                 rule.id = new_id("spr");
             }
+            if rule.id == NON_THINKING_RULE {
+                // The dashboard's own box: the relay decides which efforts it
+                // answers for, so changing that list here is enough to change
+                // every model that carries one.
+                rule.efforts = NON_THINKING_EFFORTS.iter().map(|e| (*e).into()).collect();
+                rule.min_effort.clear();
+                rule.max_effort.clear();
+            }
             if rule.name.is_empty() {
                 rule.name = describe_efforts(&rule.efforts, &rule.min_effort, &rule.max_effort);
             }
@@ -1695,6 +1753,16 @@ pub fn normalize(mut cfg: Config) -> Config {
             p.updated_at = now;
         }
     }
+
+    // A misspelled effort would silently mean "no default at all", which is the
+    // one answer nobody sets this field to ask for.
+    let effort = cfg.defaults.effort.trim();
+    cfg.defaults.effort = if effort.is_empty() {
+        DEFAULT_EFFORT.into()
+    } else {
+        crate::pricing::Effort::parse(effort)
+            .map_or_else(|| DEFAULT_EFFORT.to_string(), |e| e.as_str().to_string())
+    };
 
     if cfg.timezone.trim().is_empty() {
         cfg.timezone = "Asia/Jakarta".into();
@@ -2246,6 +2314,87 @@ mod tests {
         // ...but a genuinely new value still replaces it
         let patch = serde_json::json!({"apiKey": "sk-brand-new"});
         assert_eq!(unmask_secrets(&patch, &current)["apiKey"], "sk-brand-new");
+    }
+
+    #[test]
+    fn the_reserved_no_thinking_rule_answers_for_the_efforts_the_relay_says_it_does() {
+        // The dashboard's "No thinking" box is one rule with a reserved id, so
+        // which efforts it covers is the relay's decision, not a copy saved into
+        // every model. A config written when the split was somewhere else is
+        // brought forward on load rather than needing every model re-saved.
+        let mut cfg = cfg_with_backend();
+        cfg.models.push(Model {
+            id: "writer".into(),
+            backend: "be1".into(),
+            upstream_model: "deepseek".into(),
+            system_prompts: vec![SystemPromptRule {
+                id: NON_THINKING_RULE.into(),
+                efforts: vec!["none".into(), "minimal".into(), "default".into()],
+                min_effort: "none".into(),
+                max_effort: "minimal".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let cfg = normalize(cfg);
+        let rule = &cfg.models[0].system_prompts[0];
+        assert_eq!(rule.efforts, NON_THINKING_EFFORTS);
+        assert!(
+            rule.min_effort.is_empty() && rule.max_effort.is_empty(),
+            "a stale range would still be matched before the list"
+        );
+    }
+
+    #[test]
+    fn a_rule_of_the_operators_own_is_left_exactly_as_they_wrote_it() {
+        let mut cfg = cfg_with_backend();
+        cfg.models.push(Model {
+            id: "writer".into(),
+            backend: "be1".into(),
+            upstream_model: "deepseek".into(),
+            system_prompts: vec![SystemPromptRule {
+                id: "mine".into(),
+                efforts: vec!["max".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let cfg = normalize(cfg);
+        assert_eq!(cfg.models[0].system_prompts[0].efforts, vec!["max"]);
+    }
+
+    #[test]
+    fn an_unreadable_default_effort_falls_back_to_high_rather_than_to_nothing() {
+        // A typo here would quietly mean "silence is not an effort at all",
+        // which is the one answer nobody sets this field to ask for.
+        let mut cfg = Config::default();
+        cfg.defaults.effort = "hgih".into();
+        assert_eq!(normalize(cfg).defaults.effort, DEFAULT_EFFORT);
+
+        let mut cfg = Config::default();
+        cfg.defaults.effort = String::new();
+        assert_eq!(normalize(cfg).defaults.effort, DEFAULT_EFFORT);
+
+        // Spelled any of the ways an effort can be spelled, it survives.
+        let mut cfg = Config::default();
+        cfg.defaults.effort = "  OFF ".into();
+        assert_eq!(normalize(cfg).defaults.effort, "none");
+
+        // And it can be turned off, which puts silence back outside the scale.
+        let mut cfg = Config::default();
+        cfg.defaults.effort = "default".into();
+        assert_eq!(normalize(cfg).defaults.effort, "default");
+    }
+
+    #[test]
+    fn a_relay_nobody_configured_reads_silence_as_high() {
+        let cfg = normalize(Config::default());
+        assert_eq!(
+            crate::pricing::default_effort(&cfg),
+            crate::pricing::Effort::High
+        );
     }
 
     #[test]

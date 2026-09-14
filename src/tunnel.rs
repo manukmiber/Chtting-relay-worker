@@ -58,13 +58,29 @@ struct Inner {
     pid: Option<u32>,
 }
 
+/// A handle on the cloudflared that is currently up.
+///
+/// The [`Child`] itself is *not* here: it belongs to the supervisor task, which
+/// is the only thing that may await it. Keeping it in a mutex and holding that
+/// mutex across `child.wait()` is what used to make Stop and Restart hang —
+/// they waited for a lock the supervisor only released when cloudflared exited
+/// on its own, which is precisely what they were trying to make happen.
+struct Running {
+    /// Dropped or sent to ask the supervisor to kill the process.
+    stop: tokio::sync::oneshot::Sender<()>,
+    /// Resolves once the supervisor has killed and reaped it, so a stop can
+    /// promise the port is actually free before a restart claims it again.
+    reaped: tokio::sync::oneshot::Receiver<()>,
+}
+
 pub struct TunnelManager {
     config: Arc<ConfigStore>,
     logger: Arc<Logger>,
     inner: Mutex<Inner>,
-    child: tokio::sync::Mutex<Option<Child>>,
+    running: tokio::sync::Mutex<Option<Running>>,
     /// Set while a deliberate stop is in progress, so the supervisor does not
-    /// treat the exit as a crash and restart it.
+    /// treat the exit as a crash and restart it — and so a supervisor already
+    /// sleeping out its backoff does not bring one back after a stop.
     stopping: Arc<AtomicBool>,
 }
 
@@ -74,7 +90,7 @@ impl TunnelManager {
             config,
             logger,
             inner: Mutex::new(Inner::default()),
-            child: tokio::sync::Mutex::new(None),
+            running: tokio::sync::Mutex::new(None),
             stopping: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -173,11 +189,13 @@ impl TunnelManager {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<serde_json::Value> {
-        {
-            let child = self.child.lock().await;
-            if child.is_some() {
-                return Ok(self.status());
-            }
+        // Held for the whole of a start, so two callers cannot both decide
+        // nothing is running and spawn a cloudflared each. Nothing under this
+        // lock ever waits on the tunnel process itself, so a stop is never
+        // blocked for longer than it takes to spawn one.
+        let mut running = self.running.lock().await;
+        if running.is_some() {
+            return Ok(self.status());
         }
 
         let cfg = self.config.current();
@@ -231,8 +249,15 @@ impl TunnelManager {
             self.watch_output(Box::pin(BufReader::new(stderr)));
         }
 
-        *self.child.lock().await = Some(child);
-        self.supervise();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (reaped_tx, reaped_rx) = tokio::sync::oneshot::channel();
+        *running = Some(Running {
+            stop: stop_tx,
+            reaped: reaped_rx,
+        });
+        drop(running);
+
+        self.supervise(child, stop_rx, reaped_tx);
         Ok(self.status())
     }
 
@@ -249,21 +274,45 @@ impl TunnelManager {
         });
     }
 
-    /// Watch for the child exiting and bring it back if it was not asked to go.
-    fn supervise(self: &Arc<Self>) {
+    /// Own the child: wait for it to exit, or kill it when asked to, and bring
+    /// it back if it went without being asked.
+    ///
+    /// This task is the only owner of the [`Child`]. Everything else talks to it
+    /// through the `stop` channel, which is what lets a stop arrive *while* the
+    /// process is running rather than only after it has already gone.
+    fn supervise(
+        self: &Arc<Self>,
+        mut child: Child,
+        stop: tokio::sync::oneshot::Receiver<()>,
+        reaped: tokio::sync::oneshot::Sender<()>,
+    ) {
         let manager = self.clone();
         tokio::spawn(async move {
-            let status = {
-                let mut guard = manager.child.lock().await;
-                match guard.as_mut() {
-                    Some(child) => child.wait().await,
-                    None => return,
+            let mut exited = None;
+            // Either cloudflared goes on its own, or somebody asks us to end it.
+            let asked_to_stop = tokio::select! {
+                status = child.wait() => {
+                    exited = Some(status);
+                    false
+                }
+                _ = stop => true,
+            };
+            let status = match exited {
+                Some(status) => status,
+                None => {
+                    let _ = child.start_kill();
+                    child.wait().await
                 }
             };
-            *manager.child.lock().await = None;
-            manager.inner.lock().pid = None;
 
-            if manager.stopping.load(Ordering::SeqCst) {
+            // The process is gone either way: drop the handle so a later start
+            // is not refused by a tunnel that is no longer there, and say so to
+            // whoever asked, before anything below can take time.
+            let _ = manager.running.lock().await.take();
+            manager.inner.lock().pid = None;
+            let _ = reaped.send(());
+
+            if asked_to_stop || manager.stopping.load(Ordering::SeqCst) {
                 manager.inner.lock().state_label = Some(State::Stopped);
                 return;
             }
@@ -291,16 +340,33 @@ impl TunnelManager {
             let wait = Duration::from_millis((1_000u64 << streak.min(5)).min(60_000));
             manager.log(&format!("restarting in {}s", wait.as_secs()));
             tokio::time::sleep(wait).await;
+            // A stop that arrived while we were backing off had no process to
+            // signal, so it is read here instead: coming back now would undo it.
+            if manager.stopping.load(Ordering::SeqCst) {
+                manager.inner.lock().state_label = Some(State::Stopped);
+                return;
+            }
             if let Err(err) = manager.start().await {
                 manager.logger.warn(format!("tunnel restart failed: {err}"));
             }
         });
     }
 
+    /// Stop the tunnel, and do not come back until it is actually down.
+    ///
+    /// The wait matters: [`restart`](Self::restart) binds a new cloudflared
+    /// straight afterwards, and a stop that returned while the old one was
+    /// still exiting would leave two of them fighting over the same tunnel.
     pub async fn stop(&self) -> Result<serde_json::Value> {
         self.stopping.store(true, Ordering::SeqCst);
-        if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.kill().await;
+        // Taken out from under the lock and awaited outside it: the supervisor
+        // needs that same lock to report the process gone.
+        let running = self.running.lock().await.take();
+        if let Some(running) = running {
+            let _ = running.stop.send(());
+            // An error means the supervisor is already finished, which is the
+            // outcome being waited for.
+            let _ = running.reaped.await;
         }
         {
             let mut inner = self.inner.lock();
@@ -372,7 +438,7 @@ impl TunnelManager {
                 if !cfg.tunnel.auto_start || cfg.tunnel.mode == "off" {
                     return;
                 }
-                if manager.child.lock().await.is_some() {
+                if manager.running.lock().await.is_some() {
                     return; // already up, and supervise() owns it from here
                 }
                 match manager.start().await {
@@ -417,6 +483,7 @@ fn redact_arg(arg: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use std::path::PathBuf;
 
     async fn manager_with(tunnel: crate::config::TunnelConfig, port: u16) -> Arc<TunnelManager> {
         let dir = std::env::temp_dir().join(format!("chtting-tunnel-{}", crate::util::new_id("t")));
@@ -551,6 +618,81 @@ mod tests {
         .await;
         let err = manager.start().await.unwrap_err().to_string();
         assert!(err.contains("\"off\""), "unhelpful error: {err}");
+    }
+
+    /// A stand-in for cloudflared: answers `--version` and then stays up until
+    /// it is killed, which is the shape that matters here.
+    async fn fake_cloudflared() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("chtting-fake-{}", crate::util::new_id("f")));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let script = dir.join("cloudflared");
+        tokio::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'cloudflared test'; exit 0;; esac\nexec sleep 600\n",
+        )
+        .await
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        script
+    }
+
+    /// The regression this file exists to keep fixed: the supervisor used to
+    /// hold the mutex guarding the child across `child.wait()`, so Stop and
+    /// Restart waited for a lock that was only released once cloudflared had
+    /// exited by itself. Both buttons did nothing, for ever.
+    #[tokio::test]
+    async fn stop_does_not_wait_for_the_tunnel_to_exit_on_its_own() {
+        let script = fake_cloudflared().await;
+        let manager = manager_with(
+            crate::config::TunnelConfig {
+                mode: "quick".into(),
+                binary: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            8787,
+        )
+        .await;
+
+        manager.start().await.unwrap();
+        assert!(manager.status()["pid"].is_u64(), "nothing was started");
+
+        tokio::time::timeout(Duration::from_secs(10), manager.stop())
+            .await
+            .expect("stop blocked until the tunnel exited on its own")
+            .unwrap();
+        assert_eq!(manager.status()["state"], "stopped");
+        assert!(manager.status()["pid"].is_null());
+    }
+
+    /// Restart is stop-then-start, so it inherits the same deadlock — and has
+    /// to leave a tunnel running afterwards rather than a stopped one.
+    #[tokio::test]
+    async fn restart_replaces_a_running_tunnel() {
+        let script = fake_cloudflared().await;
+        let manager = manager_with(
+            crate::config::TunnelConfig {
+                mode: "quick".into(),
+                binary: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            8787,
+        )
+        .await;
+
+        manager.start().await.unwrap();
+        let first = manager.status()["pid"].as_u64().expect("a first pid");
+
+        tokio::time::timeout(Duration::from_secs(10), manager.restart())
+            .await
+            .expect("restart blocked on the tunnel it was replacing")
+            .unwrap();
+
+        let second = manager.status()["pid"].as_u64().expect("a second pid");
+        assert_ne!(first, second, "restart left the old process in place");
+        let _ = manager.stop().await;
     }
 
     #[tokio::test]

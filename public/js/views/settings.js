@@ -310,6 +310,15 @@ export async function settingsView(ctx) {
 
   /* ---------------------------------------------------------- defaults */
   const d = cfg.defaults ?? {};
+  i.defEffort = select(d.effort ?? 'high', [
+    ['high', 'high — treat silence as a thinking request (default)'],
+    ['max', 'max'],
+    ['medium', 'medium'],
+    ['low', 'low'],
+    ['minimal', 'minimal'],
+    ['none', 'none — treat silence as thinking turned off'],
+    ['default', 'leave it unresolved — silence is not an effort at all'],
+  ]);
   i.defReasoning = select(d.responseTransform?.reasoning ?? 'keep', [
     ['keep', 'keep'], ['strip', 'strip'], ['inline', 'inline'], ['field', 'field'],
   ]);
@@ -319,6 +328,16 @@ export async function settingsView(ctx) {
 
   root.append(card('Defaults for every model', h('div', {},
     h('p.small.muted', { text: 'A model alias inherits these and may override any of them.' }),
+    field('Unspecified thinking', i.defEffort,
+      'what a request that never sent reasoning_effort is taken to have asked for'),
+    h('p.small.muted', {
+      text: 'Most clients never send reasoning_effort at all. Resolving that silence to '
+        + 'an effort \u2014 once, at the door \u2014 is what decides which of the model\u2019s '
+        + 'two system prompts it gets, which price band it is on, and what the request '
+        + 'row says. High puts those callers on the Default prompt, with off, minimal '
+        + 'and low left to the No thinking box.',
+    }),
+    h('hr'),
     h('label.switch', { style: { marginBottom: '12px' } }, i.defRenameModel,
       h('span', { text: 'Report the public alias as "model" in responses' })),
     field('Reasoning traces', i.defReasoning),
@@ -481,6 +500,7 @@ export async function settingsView(ctx) {
               ...(i.orToken.value ? { token: i.orToken.value } : {}),
             },
             defaults: {
+              effort: i.defEffort.value,
               responseTransform: {
                 renameModel: i.defRenameModel.checked,
                 reasoning: i.defReasoning.value,

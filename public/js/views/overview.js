@@ -1,6 +1,7 @@
 import { api } from '../api.js';
-import { h, card, stat, table, pill, fmtNum, fmtMs, fmtUsd, live, clear } from '../ui.js';
+import { h, card, stat, table, pill, fmtNum, fmtMs, fmtUsd, live, clear, toast } from '../ui.js';
 import { lineChart, barChart } from '../charts.js';
+import { restartRelay, updateRelay } from '../relay.js';
 
 const RANGES = [['24h', 'Last 24h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['365d', 'All time']];
 
@@ -89,7 +90,9 @@ export async function overviewView(ctx) {
   drawChart(ctx.store.metric ?? 'requests');
 
   // Requirement 4: the numbers keep themselves current.
-  live(ctx, 5000, () => ctx.rerender());
+  const stopLive = live(ctx, 5000, () => ctx.rerender());
+
+  root.append(relayControls(root, stopLive));
 
   root.append(card('Per model', table(
     [{ label: 'Alias' }, { label: 'Requests', num: true }, { label: 'Users', num: true },
@@ -124,6 +127,49 @@ export async function overviewView(ctx) {
   )));
 
   return root;
+}
+
+/**
+ * Ending this process from the screen everyone lands on.
+ *
+ * The same two buttons as the Setup tab, put where they are actually reached
+ * for: restarting the relay after a settings change, or moving it onto the
+ * commits that were pushed since it started, should not need three taps and a
+ * scroll past the install checklist.
+ *
+ * Both take over the page while they run, because neither leaves anything else
+ * on it worth looking at.
+ */
+function relayControls(root, stopLive) {
+  const run = (fn) => async (ev) => {
+    const button = ev.currentTarget;
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Working…';
+    // The five-second refresh would rebuild this page out from under the
+    // progress log the moment it appeared.
+    stopLive();
+    try {
+      await fn(root);
+    } catch (err) {
+      toast(err.message, 'err');
+      button.disabled = false;
+      button.textContent = label;
+    }
+  };
+
+  return card('Relay', h('div', {},
+    h('p.small.muted', {
+      text: 'Update & restart pulls the latest commits, builds them and restarts into '
+        + 'the result \u2014 minutes on a phone, and the relay keeps answering until the '
+        + 'new binary is ready. Restart re-runs the binary already on disk, which takes '
+        + 'seconds and changes no code.',
+    }),
+    h('div.row', {},
+      h('button.primary.sm', { onclick: run(updateRelay) }, 'Update & restart'),
+      h('button.sm', { onclick: run(restartRelay) }, 'Restart'),
+    ),
+  ));
 }
 
 function shortDay(day) {

@@ -1,7 +1,8 @@
 import { api } from '../api.js';
 import {
-  h, card, pill, toast, clear, copy, mount, confirmDialog,
+  h, card, pill, toast, clear, copy, confirmDialog,
 } from '../ui.js';
+import { restartRelay, updateRelay, waitForRelay } from '../relay.js';
 
 /**
  * The first screen, and the one that replaces the Termux session.
@@ -85,11 +86,11 @@ export async function setupView(ctx) {
       /* ---- the buttons that end this process ---- */
       h('div.row', { style: { marginTop: '12px' } },
         h('button.primary.sm', {
-          onclick: (ev) => busy(ev.currentTarget, async () => {
-            const res = await api.serviceAction('restart');
-            toast(res.message, 'ok');
-            await waitForRelay();
-          }),
+          onclick: (ev) => busy(ev.currentTarget, () => updateRelay(body)),
+          title: 'git pull, build what it pulled, then restart into it',
+        }, 'Update & restart'),
+        h('button.sm', {
+          onclick: (ev) => busy(ev.currentTarget, () => restartRelay(body)),
         }, 'Restart relay'),
         h('button.sm', {
           onclick: (ev) => busy(ev.currentTarget, async () => {
@@ -111,6 +112,15 @@ export async function setupView(ctx) {
           + 'relay is back. Stopping cannot be undone from here: nothing served by the '
           + 'relay can start the relay.',
       }),
+      h('p.small.muted', {
+        text: 'Update & restart runs git pull in the checkout, builds what it pulled, '
+          + 'and only then restarts \u2014 the dashboard and the relay are one binary, so '
+          + 'pulling without building changes nothing. Five to fifteen minutes on a '
+          + 'phone, and the relay keeps serving the whole time; if the pull or the '
+          + 'build fails, nothing is replaced and it says why. Restart relay skips the '
+          + 'pull and re-executes the binary already on disk.',
+      }),
+      gitLine(s.update),
 
       /* ---- the keeper ---- */
       h('hr'),
@@ -136,7 +146,7 @@ export async function setupView(ctx) {
             onclick: (ev) => busy(ev.currentTarget, async () => {
               const res = await api.serviceAction('hand-over');
               toast(res.message, 'ok');
-              await waitForRelay();
+              await waitForRelay(body);
             }),
           }, 'Hand over to the keeper')
           : null,
@@ -265,37 +275,33 @@ export async function setupView(ctx) {
     )));
   }
 
-  /**
-   * Poll until the relay answers again, then reload the page.
-   *
-   * A restart is an exec: same port, same address, a second or two of nothing.
-   * Reloading is simpler than rebuilding the view against a state that changed
-   * underneath it.
-   */
-  async function waitForRelay() {
-    const notice = card('Restarting', h('p.muted', { text: 'Waiting for the relay to come back…' }));
-    clear(body).append(notice);
-    for (let i = 0; i < 40; i += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => { setTimeout(r, 750); });
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        await api.session();
-        location.reload();
-        return;
-      } catch {
-        /* still down — that is what we are waiting for */
-      }
-    }
-    mount(clear(body), card('Still down', h('div', {},
-      h('p.muted', { text: 'The relay has not come back after 30 seconds.' }),
-      h('p.small.muted', {
-        text: 'Check Termux, or start it from the chtting-relay-start shortcut.',
-      }),
-      h('button', { onclick: () => location.reload() }, 'Reload'),
-    )));
-  }
-
   await paint();
   return root;
+}
+
+/**
+ * What an update would be updating: the checkout it would pull, and whether the
+ * two tools it needs are installed. Said here rather than discovered halfway
+ * through a five-minute build.
+ */
+function gitLine(update) {
+  if (!update) return null;
+  if (!update.repo) {
+    return h('p.small', {
+      style: { color: 'var(--warn)' },
+      text: 'No git checkout found above the working directory, so Update & restart has '
+        + 'nothing to pull. Start the relay from the directory it was cloned into.',
+    });
+  }
+  const missing = [!update.git && 'git', !update.cargo && 'cargo'].filter(Boolean);
+  return h('div', {},
+    h('p.small.muted.mono', { text: update.repo }),
+    missing.length
+      ? h('p.small', {
+        style: { color: 'var(--warn)' },
+        text: `${missing.join(' and ')} not installed — Update & restart needs both. `
+          + 'Install with: pkg install git rust clang binutils pkg-config',
+      })
+      : null,
+  );
 }

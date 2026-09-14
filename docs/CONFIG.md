@@ -29,7 +29,7 @@ to the code.
 | `models` | `[]` | public aliases |
 | `keys` | `[]` | client API keys |
 | `systemPrompts` | `[]` | reusable prompt library |
-| `defaults` | see below | inherited by every model |
+| `defaults` | see below | inherited by every model, and what an unspecified thinking effort means |
 | `pricing` | see below | what a request costs and what it sells for |
 | `tokenizer` | see below | counting rules |
 | `logging` | see below | what is recorded and for how long |
@@ -278,29 +278,40 @@ A model is written to two audiences and, most of the time, no more: the caller
 who asked it to think, and the caller who did not. So the dashboard offers two
 boxes rather than a rule editor.
 
+There are four efforts a caller can ask for — off, low, high and max — and the
+two boxes split them down the middle.
+
 **Default** is the model's plain `systemPrompt`. It answers for every caller who
-asked the model to think — `low`, `medium`, `high`, `max` — and for everyone at
+asked the model to think properly — `medium`, `high`, `max` — and for everyone at
 all while the second box is left at `none`.
 
 **No thinking** is one `systemPrompts[]` rule, written under the reserved id
-`sp-non-thinking`, with `efforts: ["none", "minimal", "default"]`:
+`sp-non-thinking`, with `efforts: ["none", "minimal", "low"]`:
 
 ```json
 "systemPrompts": [
   { "id": "sp-non-thinking", "name": "No thinking", "enabled": true,
-    "efforts": ["none", "minimal", "default"],
+    "efforts": ["none", "minimal", "low"],
     "prompt": { "mode": "replace", "text": "Answer directly." } }
 ]
 ```
 
-Those are the same three efforts the **no-thinking price band** covers, and they
-are meant to stay that way: silence is not a choice to think, so it should
-neither be answered as one nor billed as one. A request told one thing and
-billed as another is the one bug nobody reading either screen can see.
+The id is reserved, and with it the efforts: the relay rewrites that list on
+every load and save, so a config written when the split was somewhere else is
+brought forward rather than left answering to a spelling nobody remembers
+choosing. Your own rules, under any other id, are left exactly as you wrote them.
 
-Leave the mode at `none` and the rule is not written at all, rather than written
-as a rule that matches and injects nothing — those callers then fall through to
-Default, which is what "I did not fill this in" should mean.
+A caller who named no effort at all is not on this list, because they never
+reach it: silence is resolved into a real effort first, by
+[`defaults.effort`](#defaults), which ships as `high`. That one value decides the
+prompt, the price band and what the request row records, so a request is never
+told one thing and billed as another.
+
+Leave the mode at `none` and the rule is saved *disabled* — the relay skips
+disabled rules, so those callers fall through to Default exactly as if it were
+not there, and the text you wrote is still in the box the next time you open the
+model. (It used to be dropped outright, which meant a prompt typed into a box
+whose mode was still `none` vanished behind a "Saved" toast.)
 
 ### A prompt per thinking effort, for anything narrower
 
@@ -580,7 +591,7 @@ effort the caller asked for and nothing else:
 |---|---|---|
 | standard | `low`, `medium`, `high` | `inputUsdPerM`, `cachedInputUsdPerM`, `outputUsdPerM` |
 | max thinking | `max` (and a thinking budget over 32K) | `maxThinking` |
-| no thinking | `none`, `minimal`, **and a caller who said nothing** | `nonThinking` |
+| no thinking | `none`, `minimal` | `nonThinking` |
 
 ```json
 "inputUsdPerM": 0.35,
@@ -596,8 +607,11 @@ than nothing — so a band that only moves output says so in one number. Reasoni
 tokens are output tokens at the band's own output rate unless the band prices
 them apart.
 
-Silence is billed as no thinking on purpose: a caller who never mentioned
-thinking did not choose to buy it, and should not pay for it.
+A caller who never mentioned thinking is billed on the band for whatever
+[`defaults.effort`](#defaults) resolves their silence to — `high`, and so the
+standard band, unless you changed it. Set it to `none` and they are on the
+no-thinking band instead; set it to `default` and silence stays outside the
+scale, which is what the relay did before that setting existed.
 
 The band is settled before any tier is read, so a tier can never stop the chain
 early and leave a maximum-effort request paying the standard rate. The band that
@@ -986,3 +1000,24 @@ through would be a lie OpenRouter acts on.
 
 Same shape as a model's `systemPrompt`, `requestTransform` and
 `responseTransform`. Every model inherits these and may override any part.
+
+| Field | Default | What it does |
+|---|---|---|
+| `effort` | `"high"` | what a request that named no effort is taken to have asked for |
+
+Most clients never send `reasoning_effort` at all. `effort` is where that silence
+is resolved — once, at the door, before anything reads the effort — so the system
+prompt that goes out, the price band that is charged and the `reasoning_effort`
+on the request row all say the same thing.
+
+```json
+"defaults": { "effort": "high" }
+```
+
+`high` is the shipped answer: a client that simply never learned to send the
+field should get the model at its best, not the prompt written for callers who
+asked it not to think. `none` reads silence as thinking turned off. `default`
+leaves it unresolved, which is what the relay did before this setting existed:
+silence then matches no ranked rule and no band, and falls through to the model's
+plain `systemPrompt`. Anything unspellable falls back to `high` rather than
+quietly meaning "unresolved".

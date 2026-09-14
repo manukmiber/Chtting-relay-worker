@@ -14,4 +14,5 @@ pub mod store;
 pub mod system;
 pub mod tokenizer;
 pub mod tunnel;
+pub mod update;
 pub mod util;
