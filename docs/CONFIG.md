@@ -96,6 +96,15 @@ fails to start — a missing binary, a port it cannot take — the old instance
 keeps running exactly as it was and tries again at the next tick. A missed
 rotation is a non-event; a rotation that took the relay down would not be.
 
+The same `SO_REUSEPORT` that makes step 2 legal means a second relay started by
+hand does **not** fail to bind: it listens on the same port and the kernel
+splits new connections between the two. The older process then answers out of
+the config it started with, which is why a key minted after it started comes
+back as `invalid API key` on some requests and works on others. `start`
+therefore claims `data/run/serving.pid` and refuses to run while a live relay
+holds it. A rotation successor carries a generation number and is exempt;
+anything started by hand needs `--replace` to take the ports over.
+
 `workerThreads` is read before the async runtime starts, so it only takes effect
 on restart. Lower it to leave cores for other Termux processes.
 
