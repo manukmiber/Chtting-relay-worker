@@ -236,7 +236,7 @@ token:</p>
 
 <p>Keys are the literal prefix <code>Kunci-Zeiko-</code> followed by 32 characters mixing digits,
 lower case, upper case and symbols. A key sent bare, with no <code>Bearer</code> scheme in front of
-it, is also accepted — some clients send it that way.</p>
+it, is also accepted, because some clients send it that way.</p>
 
 <p>Your key is issued to you directly. Keep it server-side: anyone holding it can spend against
 your account. If you believe it has been exposed, ask us for a replacement and the old one stops
@@ -244,7 +244,7 @@ working immediately.</p>
 
 <div class="note"><p><strong>The model catalogue needs the key too.</strong>
 <code>GET /v1/models</code> is authenticated. A client that fetches the model list before it has
-been given credentials gets <code>401</code>, not an empty list — the usual cause of a mysterious
+been given credentials gets <code>401</code>, not an empty list. That is the usual cause of a mysterious
 401 on an otherwise working setup.</p></div>
 
 <!-- ==================================================================== -->
@@ -271,10 +271,10 @@ required: <code>model</code> and <code>messages</code>.</p>
 <tr><td><code>model</code></td><td><strong>Required.</strong> One of the ids from <code>/v1/models</code>. Matched exactly and case-sensitively.</td></tr>
 <tr><td><code>messages</code></td><td><strong>Required.</strong> The usual <code>role</code> / <code>content</code> array.</td></tr>
 <tr><td><code>stream</code></td><td><code>true</code> returns SSE, <code>false</code> a single JSON body. Every model supports both.</td></tr>
-<tr><td><code>user_id</code></td><td>Who this request is for. <strong>See section 4 — read it.</strong></td></tr>
+<tr><td><code>user_id</code></td><td>Who this request is for. <strong>See section 4: read it.</strong></td></tr>
 <tr><td><code>max_tokens</code><br><code>max_completion_tokens</code></td><td>Clamped <em>down</em> to the model's <code>max_completion_tokens</code>, never refused for being too large. Whichever name you send is the one kept. Omit them and the model's own ceiling applies.</td></tr>
 <tr><td><code>stop</code></td><td>Up to four entries, as OpenAI.</td></tr>
-<tr><td><code>reasoning_effort</code></td><td><code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>max</code> — on models whose catalogue entry has a <code>reasoning</code> block. It can change the price; see <code>pricing</code> in section 7. Also read from <code>reasoning.effort</code>, <code>thinking.effort</code>, the boolean <code>enable_thinking</code>, and a budget in <code>thinking.budget_tokens</code>.</td></tr>
+<tr><td><code>reasoning_effort</code></td><td><code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>max</code>, on models whose catalogue entry has a <code>reasoning</code> block. It can change the price; see <code>pricing</code> in section 7. Also read from <code>reasoning.effort</code>, <code>thinking.effort</code>, the boolean <code>enable_thinking</code>, and a budget in <code>thinking.budget_tokens</code>.</td></tr>
 <tr><td><code>reasoning.exclude</code><br><code>include_reasoning</code></td><td>Leave the reasoning trace out of the reply. Either can only <em>remove</em> a trace; neither turns on one a model does not expose.</td></tr>
 <tr><td><code>temperature</code>, <code>top_p</code>, <code>top_k</code>, <code>min_p</code>, <code>presence_penalty</code>, <code>frequency_penalty</code>, <code>repetition_penalty</code>, <code>seed</code>, <code>logit_bias</code>, <code>logprobs</code>, <code>top_logprobs</code></td><td>Standard sampling and scoring parameters.</td></tr>
 <tr><td><code>response_format</code>, <code>tools</code>, <code>tool_choice</code></td><td>JSON mode and tool calling, on models that list them.</td></tr>
@@ -284,7 +284,7 @@ required: <code>model</code> and <code>messages</code>.</p>
 
 <div class="note"><p><strong>Check <code>supported_parameters</code> before relying on a
 parameter.</strong> Each model's catalogue entry lists exactly what it accepts. Sending something
-not on that list is not an error — it simply has no effect.</p></div>
+not on that list is not an error; it simply has no effect.</p></div>
 
 <h3>Other endpoints</h3>
 
@@ -305,7 +305,7 @@ identifier for the person the request is for.</p>
 }</code></pre>
 
 <p>That is the whole integration. There is nothing else to set, no header to add, and nothing to
-configure on your side — we take that one value and handle everything downstream of it.</p>
+configure on your side. We take that one value and handle everything downstream of it.</p>
 
 <h3>Why it matters</h3>
 
@@ -315,7 +315,7 @@ worth money:</p>
 <ul>
   <li><strong>Isolation.</strong> Requests carrying different <code>user_id</code> values can never
       reuse each other's cached prompt prefix. Without the field, everyone on your API key shares a
-      single partition — one customer's prefix becomes reusable by another customer's request.</li>
+      single partition, so one customer's prefix becomes reusable by another customer's request.</li>
   <li><strong>Cost and speed.</strong> A cached prefix is billed at the cache-read rate, a small
       fraction of the fresh-input rate, and it removes most of the time-to-first-token on a long
       system prompt. A <code>user_id</code> that changes between requests throws every cache hit
@@ -337,7 +337,7 @@ response once a prefix is being reused, and is absent while it is not.</p>
 </tbody>
 </table>
 
-<p>Omitting <code>user_id</code> is allowed and the request still succeeds — you simply get no
+<p>Omitting <code>user_id</code> is allowed and the request still succeeds. You simply get no
 isolation and, in practice, far fewer cache hits.</p>
 
 <!-- ==================================================================== -->
@@ -373,7 +373,7 @@ isolation and, in practice, far fewer cache hits.</p>
 <table>
 <thead><tr><th style="width:34%">Field</th><th style="width:12%">Type</th><th>Meaning</th></tr></thead>
 <tbody>
-<tr><td><code>id</code></td><td>string</td><td>A UUIDv4 for this request, also returned as the <code>X-Request-Id</code> response header and repeated on every frame of a stream. <strong>Log it</strong> — quoting it lets us find the exact request.</td></tr>
+<tr><td><code>id</code></td><td>string</td><td>A UUIDv4 for this request, also returned as the <code>X-Request-Id</code> response header and repeated on every frame of a stream. <strong>Log it:</strong> quoting it lets us find the exact request.</td></tr>
 <tr><td><code>object</code></td><td>string</td><td><code>"chat.completion"</code>, or <code>"chat.completion.chunk"</code> on a stream frame.</td></tr>
 <tr><td><code>created</code></td><td>integer</td><td>Unix seconds, stamped when the request arrived.</td></tr>
 <tr><td><code>model</code></td><td>string</td><td>The model id you asked for.</td></tr>
@@ -397,7 +397,7 @@ arrived. Anything added on your behalf is not charged to you, so the figure matc
 <tr><td><code>usage.total_tokens</code></td><td>integer</td><td>The two above, added.</td></tr>
 <tr><td><code>usage.prompt_tokens_details.cached_tokens</code></td><td>integer</td><td>Cache-hit portion of the input. Never larger than <code>prompt_tokens</code>. <strong>Absent when zero.</strong></td></tr>
 <tr><td><code>usage.completion_tokens_details.reasoning_tokens</code></td><td>integer</td><td>Reasoning portion of the output. Absent when zero.</td></tr>
-<tr><td><code>usage.cost</code></td><td>number</td><td>What this request cost, in USD, to nine decimal places. Also repeated as <code>usage.usage</code> for clients that read that name — one number, never two prices.</td></tr>
+<tr><td><code>usage.cost</code></td><td>number</td><td>What this request cost, in USD, to nine decimal places. Also repeated as <code>usage.usage</code> for clients that read that name. One number, never two prices.</td></tr>
 </tbody>
 </table>
 
@@ -455,8 +455,8 @@ and every frame ends with a blank line.)</p>
 <tr><td><strong>Content frames</strong></td><td><code>delta.content</code> is a string fragment; concatenate in arrival order. A reasoning trace, where a model exposes one, arrives as <code>delta.reasoning_content</code> alongside it.</td></tr>
 <tr><td><strong>Tool calls</strong></td><td><code>delta.tool_calls</code> arrives as partial fragments keyed by <code>index</code>: accumulate <code>function.arguments</code> across frames before parsing.</td></tr>
 <tr><td><strong>Comment lines</strong></td><td>A line beginning with <code>:</code> is an SSE comment sent to hold the connection open during a quiet moment. <strong>Discard it.</strong> A compliant SSE parser already does; a hand-rolled one that only reads lines starting <code>data:</code> is also fine. Never try to JSON-parse it.</td></tr>
-<tr><td><strong>Final usage frame</strong></td><td>Has an <strong>empty <code>choices</code> array</strong> and carries <code>usage</code>. It always arrives. A client that assumes <code>choices[0]</code> exists on every frame will crash here — guard it.</td></tr>
-<tr><td><strong>Error frame</strong></td><td>If a request fails part-way through, a frame carrying <code>{"error":{"message":…,"type":"server_error"}}</code> is sent before <code>[DONE]</code>, so a stream that has started never just ends in silence. The HTTP status stays <code>200</code> — it was sent before anything went wrong.</td></tr>
+<tr><td><strong>Final usage frame</strong></td><td>Has an <strong>empty <code>choices</code> array</strong> and carries <code>usage</code>. It always arrives. A client that assumes <code>choices[0]</code> exists on every frame will crash here, so guard it.</td></tr>
+<tr><td><strong>Error frame</strong></td><td>If a request fails part-way through, a frame carrying <code>{"error":{"message":…,"type":"server_error"}}</code> is sent before <code>[DONE]</code>, so a stream that has started never just ends in silence. The HTTP status stays <code>200</code>, because it was sent before anything went wrong.</td></tr>
 <tr><td><code>data: [DONE]</code></td><td>The terminator. Always last, and not JSON.</td></tr>
 </tbody>
 </table>
@@ -493,7 +493,7 @@ and every frame ends with a blank line.)</p>
       exact and case-sensitive.</li>
   <li><strong>Re-fetch periodically.</strong> The catalogue reflects what is currently offered and
       can change; do not cache it for the lifetime of a process.</li>
-  <li><strong>Prices are decimal strings in USD per single token</strong> — not JSON numbers, and
+  <li><strong>Prices are decimal strings in USD per single token</strong>, not JSON numbers, and
       not per million. <code>"0.000000003"</code> loses its last digits through a float.</li>
   <li><strong>A missing <code>pricing</code> object means no published price</strong>, not a free
       model.</li>
@@ -555,11 +555,11 @@ and every frame ends with a blank line.)</p>
 <tr><td><code>architecture</code></td><td>What the model takes in and gives back. <code>modality</code> is the two arrays joined, e.g. <code>"text-&gt;text"</code>.</td></tr>
 <tr><td><code>pricing.prompt</code></td><td>Fresh input, USD per token, as a decimal string.</td></tr>
 <tr><td><code>pricing.completion</code></td><td>Output, USD per token.</td></tr>
-<tr><td><code>pricing.input_cache_read</code></td><td>Cache-hit input. Absent means a cache hit is <strong>not</strong> discounted — not that it is free.</td></tr>
+<tr><td><code>pricing.input_cache_read</code></td><td>Cache-hit input. Absent means a cache hit is <strong>not</strong> discounted, not that it is free.</td></tr>
 <tr><td><code>pricing.input_cache_write</code></td><td>Cache write, where one is charged.</td></tr>
 <tr><td><code>pricing.internal_reasoning</code></td><td>Reasoning tokens. Absent means they bill at the output rate.</td></tr>
 <tr><td><code>pricing.request</code></td><td>A flat per-request amount, where there is one.</td></tr>
-<tr><td><code>pricing.overrides[]</code></td><td><strong>Time-of-day pricing.</strong> Optional <code>utc_days</code> (lowercase weekday names) and optional <code>utc_start</code>/<code>utc_end</code> as <code>HHMM</code> integers in UTC — <code>100</code> is 01:00, <code>1430</code> is 14:30. Half-open: start inclusive, end exclusive; an end before its start wraps midnight; no times means all day. <strong>Each override publishes a complete price</strong>, not only the fields it moves.</td></tr>
+<tr><td><code>pricing.overrides[]</code></td><td><strong>Time-of-day pricing.</strong> Optional <code>utc_days</code> (lowercase weekday names) and optional <code>utc_start</code>/<code>utc_end</code> as <code>HHMM</code> integers in UTC: <code>100</code> is 01:00, <code>1430</code> is 14:30. Half-open: start inclusive, end exclusive; an end before its start wraps midnight; no times means all day. <strong>Each override publishes a complete price</strong>, not only the fields it moves.</td></tr>
 <tr><td><code>supported_parameters</code></td><td>Exactly what this model accepts, sorted.</td></tr>
 <tr><td><code>default_parameters</code></td><td>Applied when you do not send them. Override any of them freely.</td></tr>
 <tr><td><code>reasoning</code></td><td>Present <strong>only on models that reason</strong>. <code>supported_efforts</code> is the menu <code>reasoning_effort</code> accepts; <code>default_effort</code> is what you get by naming none. Its absence is how you detect a non-reasoning model.</td></tr>
@@ -595,7 +595,7 @@ standing rates otherwise.</p>
 <table>
 <thead><tr><th style="width:11%">Status</th><th style="width:26%">code</th><th>When</th></tr></thead>
 <tbody>
-<tr><td><code>400</code></td><td>—</td><td>Malformed JSON, a missing or empty <code>model</code>, or a body this model will not accept.</td></tr>
+<tr><td><code>400</code></td><td>none</td><td>Malformed JSON, a missing or empty <code>model</code>, or a body this model will not accept.</td></tr>
 <tr><td><code>401</code></td><td><code>invalid_api_key</code></td><td>Missing or unknown key. Also what an unauthenticated <code>GET /v1/models</code> gets.</td></tr>
 <tr><td><code>403</code></td><td><code>invalid_api_key</code></td><td>The key is disabled.</td></tr>
 <tr><td><code>403</code></td><td><code>model_forbidden</code></td><td>Your key is not entitled to that model.</td></tr>
@@ -612,10 +612,10 @@ standing rates otherwise.</p>
 <h3>Retry policy</h3>
 
 <ul>
-  <li><code>429</code>, <code>503</code> — honour <code>Retry-After</code> when present, otherwise
+  <li><code>429</code> and <code>503</code>: honour <code>Retry-After</code> when present, otherwise
       exponential backoff from about one second.</li>
-  <li><code>502</code>, <code>504</code> — retry two or three times with backoff.</li>
-  <li><code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>, <code>413</code> — do
+  <li><code>502</code> and <code>504</code>: retry two or three times with backoff.</li>
+  <li><code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>, <code>413</code>: do
       not retry. Fix the request or the credentials.</li>
 </ul>
 
@@ -637,7 +637,7 @@ standing rates otherwise.</p>
 
 <p>There is no message-count limit of its own: a conversation is bounded by the model's
 <code>context_length</code> and by the body size above. Your per-key rate limits and quotas are
-part of your agreement with us — ask if you need them raised.</p>
+part of your agreement with us. Ask if you need them raised.</p>
 
 <!-- ==================================================================== -->
 <h2 id="s10">10. Examples</h2>

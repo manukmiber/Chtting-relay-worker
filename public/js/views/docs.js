@@ -5,8 +5,8 @@ import {
 /**
  * The integration guide, written from the service's own configuration.
  *
- * Every figure on this page — base URL, model ids, token ceilings, per-key
- * rate limits, prices — is read from the running config rather than typed into
+ * Every figure on this page (base URL, model ids, token ceilings, per-key
+ * rate limits, prices) is read from the running config rather than typed into
  * a document that would start drifting the moment a setting changed. The same
  * model renders twice: once as this page, once as Markdown, so the text an
  * operator pastes into an email is the text they were just looking at.
@@ -33,7 +33,7 @@ export async function docsView(ctx) {
     card('API documentation', h('div', {},
       h('p.small.muted', {
         text: 'Everything an integrator needs, generated from this service’s live configuration. '
-            + 'Copy it as Markdown to send on — it stays accurate because nothing here is hard-coded.',
+            + 'Copy it as Markdown to send on; it stays accurate because nothing here is hard-coded.',
       }),
       actions,
       doc.warnings.length
@@ -63,7 +63,7 @@ function buildDoc(state) {
   const keyPlaceholder = 'Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
 
   const warnings = [];
-  if (!tunnelUrl) warnings.push('No tunnel is up — the base URL below is local only');
+  if (!tunnelUrl) warnings.push('No tunnel is up, so the base URL below is local only');
   if (!models.length) warnings.push('No models are enabled yet');
   if (!keys.length) warnings.push('No client keys exist yet');
 
@@ -127,7 +127,7 @@ function authSection(security, keys, keyPlaceholder) {
   const blocks = [
     { p: 'Every endpoint except `/health` and preflight takes your API key as a bearer token.' },
     { code: `Authorization: Bearer ${keyPlaceholder}`, lang: 'http' },
-    { p: 'Keys are the literal prefix `Kunci-Zeiko-` followed by 32 characters mixing digits, lower case, upper case and symbols. A key sent bare, without the `Bearer` scheme, is also accepted \u2014 some clients send it that way.' },
+    { p: 'Keys are the literal prefix `Kunci-Zeiko-` followed by 32 characters mixing digits, lower case, upper case and symbols. A key sent bare, without the `Bearer` scheme, is also accepted, because some clients send it that way.' },
   ];
   if (security.requireClientKey === false) {
     blocks.push({ note: 'This service currently accepts requests **without** a key (`security.requireClientKey` is off). Turn it on before handing the URL out.' });
@@ -147,7 +147,7 @@ function authSection(security, keys, keyPlaceholder) {
         limitText(k.quota?.tokensPerDay),
       ]),
     });
-    blocks.push({ note: 'Key values are never shown here. Reveal one on the Keys tab and send it over a channel you trust \u2014 not in the same message as this guide.' });
+    blocks.push({ note: 'Key values are never shown here. Reveal one on the Keys tab and send it over a channel you trust, not in the same message as this guide.' });
   }
   return { title: 'Authentication', blocks };
 }
@@ -163,8 +163,8 @@ function modelSection(models, cfg) {
       columns: ['Model id', 'Aliases', 'Context', 'Max output', 'Stream cap'],
       rows: models.map((m) => [
         `\`${m.id}\``,
-        (m.aliases ?? []).length ? (m.aliases ?? []).map((a) => `\`${a}\``).join(', ') : '—',
-        m.contextLength ? `${exact(m.contextLength)} tokens` : '—',
+        (m.aliases ?? []).length ? (m.aliases ?? []).map((a) => `\`${a}\``).join(', ') : 'none',
+        m.contextLength ? `${exact(m.contextLength)} tokens` : 'not set',
         m.limits?.maxOutputTokens ? `${exact(m.limits.maxOutputTokens)} tokens` : 'model default',
         m.maxTokensPerSecond > 0 ? `${m.maxTokensPerSecond} tok/s` : 'full speed',
       ]),
@@ -189,8 +189,8 @@ function modelSection(models, cfg) {
           `\`${m.id}\``,
           rate(p.input), rate(p.cachedInput), rate(p.output),
           rate(p.maxThinking.output), rate(p.nonThinking.output),
-          p.requestUsd ? `$${p.requestUsd}` : '—',
-          p.refusalUsd ? `$${trimZeros(p.refusalUsd)}` : '—',
+          p.requestUsd ? `$${p.requestUsd}` : 'none',
+          p.refusalUsd ? `$${trimZeros(p.refusalUsd)}` : 'none',
         ];
       }),
     });
@@ -204,13 +204,13 @@ function modelSection(models, cfg) {
         .map(([name, b]) => `\`${m.id}\` on ${name}: input ${rate(b.input || p.input)}, cache read ${rate(b.cachedInput || p.cachedInput)}`);
     });
     if (bandInputs.length) {
-      blocks.push({ note: `Input and cache read also change by band — ${bandInputs.join('; ')}.` });
+      blocks.push({ note: `Input and cache read also change by band: ${bandInputs.join('; ')}.` });
     }
     const refusing = models.some((m) => resolvePricing(cfg.pricing ?? {}, m.pricing ?? {}).refusalUsd > 0);
     if (refusing) {
       blocks.push({
         note: 'A reply that declines the request is billed at the flat "Refused" price instead of its '
-          + 'tokens — it still arrives as a normal `200`, and `usage.usage` carries that price.',
+          + 'tokens. It still arrives as a normal `200`, and `usage.usage` carries that price.',
       });
     }
     const tiers = [...(cfg.pricing?.tiers ?? []), ...models.flatMap((m) => m.pricing?.tiers ?? [])]
@@ -234,19 +234,19 @@ function chatSection(sample, models) {
     for (const f of Object.keys(m.forceParams ?? {})) forced.add(f);
   }
   const blocks = [
-    { p: '`POST /v1/chat/completions` takes the OpenAI request body. Whether a given parameter has an effect depends on the model \u2014 each model\u2019s `supported_parameters` in the catalogue is the authority.' },
+    { p: '`POST /v1/chat/completions` takes the OpenAI request body. Whether a given parameter has an effect depends on the model; each model\u2019s `supported_parameters` in the catalogue is the authority.' },
     {
       columns: ['Parameter', 'Notes'],
       rows: [
         ['`model`', 'Required. One of the ids above.'],
         ['`messages`', 'Required. The usual `role` / `content` array.'],
         ['`stream`', '`true` returns SSE, `false` one JSON body. Both are supported on every model.'],
-        ['`user_id`', 'Who the request is for \u2014 the prompt-cache partition key. See below.'],
+        ['`user_id`', 'Who the request is for: the prompt-cache partition key. See below.'],
         ['`max_tokens` / `max_completion_tokens`', 'Clamped down to the model\u2019s ceiling; whichever field you send is the one kept.'],
         ['`stop`', 'Up to four entries, as OpenAI.'],
         ['`reasoning_effort`', '`none`, `minimal`, `low`, `medium`, `high`, `max`. Also read from `reasoning.effort`, `thinking.effort`, `thinking.budget_tokens` and `enable_thinking`. Can move the price.'],
         ['`stream_options`', 'Ignored: usage always arrives on the final chunk, so `include_usage` is not needed.'],
-        ['`reasoning.exclude`, `include_reasoning`', 'Leave the reasoning trace out of this reply. Only ever removes one \u2014 neither can turn on a trace the model keeps off.'],
+        ['`reasoning.exclude`, `include_reasoning`', 'Leave the reasoning trace out of this reply. Only ever removes one; neither can turn on a trace the model keeps off.'],
         ['`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed`', 'Standard sampling and scoring parameters.'],
         ['`response_format` (JSON mode), `tools`, `tool_choice`', 'JSON mode and tool calling, on models that list them.'],
       ],
@@ -299,7 +299,7 @@ function streamSection(server, sample) {
       },
       {
         list: [
-          `Lines beginning with \`:\` are SSE comments \u2014 keep-alive only, ${every ? `sent after about ${every} ms of quiet` : 'currently switched off'}. Discard them; a compliant SSE client already does.`,
+          `Lines beginning with \`:\` are SSE comments, keep-alive only, ${every ? `sent after about ${every} ms of quiet` : 'currently switched off'}. Discard them; a compliant SSE client already does.`,
           'The final data frame has an empty `choices` array and carries `usage`. It arrives whether or not `stream_options.include_usage` was sent.',
           '`id` is a UUIDv4 for this request, stable across every frame of one response.',
           '`model` is always the public id the caller asked for.',
@@ -315,7 +315,7 @@ function usageSection(cfg) {
   return {
     title: 'Usage and billing fields',
     blocks: [
-      { p: 'These are the exact paths to bill from. Prompt tokens count the caller\u2019s own messages as they arrived \u2014 anything added on their behalf is **not** charged, so the figure matches what they sent.' },
+      { p: 'These are the exact paths to bill from. Prompt tokens count the caller\u2019s own messages as they arrived, so anything added on their behalf is **not** charged, so the figure matches what they sent.' },
       {
         columns: ['Field', 'Type', 'Meaning'],
         rows: [
@@ -347,8 +347,8 @@ function usageSection(cfg) {
 /**
  * One field, and what it buys.
  *
- * This used to publish the whole resolution order — two body spellings, four
- * headers — and then describe, field by field, what each one was rewritten
+ * This used to publish the whole resolution order (two body spellings, four
+ * headers) and then describe, field by field, what each one was rewritten
  * into on the way out. All of that is still true and none of it is a
  * customer's to think about: they send one value, and the translation is ours.
  * Every extra spelling printed here was one more way for an integrator to send
@@ -358,22 +358,22 @@ function identitySection() {
   return {
     title: 'Identifying your end users',
     blocks: [
-      { p: 'Send one field, `user_id`, on every request. It is a stable, opaque identifier for the person the request is for \u2014 and it is the prompt-cache partition key.' },
+      { p: 'Send one field, `user_id`, on every request. It is a stable, opaque identifier for the person the request is for, and it is the prompt-cache partition key.' },
       { code: JSON.stringify({
         model: 'your-model-id',
         messages: ['\u2026'],
         user_id: 'tenant-42:user-9f3c1ab7',
       }, null, 2).replace('"\u2026"', '\u2026'), lang: 'json' },
-      { p: 'That is the whole integration \u2014 there is nothing else to set and no header to add.' },
+      { p: 'That is the whole integration: there is nothing else to set and no header to add.' },
       {
         list: [
           '**Isolation.** Requests carrying different `user_id` values can never reuse each other\u2019s cached prompt prefix. Without the field, everyone on one API key shares a single partition.',
           '**Cost and speed.** A cached prefix is billed at the cache-read rate, a fraction of the fresh-input rate, and removes most of the time-to-first-token on a long system prompt.',
-          '**Stable, unique, opaque.** The same person gets the same string every time, two people never share one, and it is a hash or an internal id \u2014 never an email address, a username or a real name. Up to 120 characters.',
+          '**Stable, unique, opaque.** The same person gets the same string every time, two people never share one, and it is a hash or an internal id, never an email address, a username or a real name. Up to 120 characters.',
           '`usage.prompt_tokens_details.cached_tokens` appears on the response once a prefix is being reused, and is absent while it is not. That is how you check it is working.',
         ],
       },
-      { p: 'Omitting it is allowed and the request still succeeds \u2014 you simply get no isolation, and in practice far fewer cache hits.' },
+      { p: 'Omitting it is allowed and the request still succeeds. You simply get no isolation, and in practice far fewer cache hits.' },
       { note: 'Nothing about a prompt is retained beyond the truncated preview on the Requests tab.' },
     ],
   };
@@ -423,7 +423,7 @@ function errorSection() {
       {
         columns: ['Status', 'Code', 'When'],
         rows: [
-          ['400', '—', 'Malformed JSON, no `model` field, or parameters this model will not accept.'],
+          ['400', 'none', 'Malformed JSON, no `model` field, or parameters this model will not accept.'],
           ['401', '`invalid_api_key`', 'Missing, unknown or disabled API key.'],
           ['403', '`model_forbidden`', 'The key is not entitled to that model.'],
           ['404', '`model_not_found`', 'Unknown model id, or a path that does not exist.'],
@@ -503,7 +503,7 @@ function spread(values, unit = '') {
 }
 
 function rate(value) {
-  return value > 0 ? `$${trimZeros(value)}` : '—';
+  return value > 0 ? `$${trimZeros(value)}` : 'none';
 }
 
 function trimZeros(n) {
@@ -617,8 +617,8 @@ function renderBlock(block) {
 }
 
 /**
- * The small Markdown subset the document is written in — `code`, **bold**,
- * _italic_ — as HTML. Everything is escaped first, so a model id with an angle
+ * The small Markdown subset the document is written in (`code`, **bold**,
+ * _italic_) as HTML. Everything is escaped first, so a model id with an angle
  * bracket in it cannot become markup.
  */
 function inline(text) {
@@ -669,6 +669,6 @@ function download(doc) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch {
-    toast('Could not build the file — copy it as Markdown instead', 'err');
+    toast('Could not build the file; copy it as Markdown instead', 'err');
   }
 }
