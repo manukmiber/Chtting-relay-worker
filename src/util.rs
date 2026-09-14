@@ -343,24 +343,46 @@ pub fn obj(value: &Value) -> Option<&Map<String, Value>> {
 
 /// Write a file so a phone losing power mid-save cannot corrupt it: write a
 /// temp file, fsync it, then rename over the target.
+///
+/// Two details matter beyond the atomicity, because what goes through here is
+/// `config.json` — backend API keys, client keys, the dashboard password.
+///
+/// * **The mode is set before the bytes, not after.** Creating the temp file
+///   under the process umask (0644 on Android) and chmod-ing it once the
+///   secrets were already in it left a window in which every other app on the
+///   phone could read them. `OpenOptions::mode` applies at `open(2)`, so the
+///   file is never readable by anyone else, not even briefly.
+/// * **The temp name is unique to this write.** `with_extension("tmp")` maps
+///   every file in a directory onto one name per stem, so two saves landing
+///   together would write the same temp file and one would rename away the
+///   other's half-written bytes.
 pub async fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = tokio::fs::File::create(&tmp).await?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", random_hex(6)));
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let write = async {
+        let mut file = options.open(&tmp).await?;
         file.write_all(contents.as_bytes()).await?;
         file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // The file holds backend API keys and client keys.
-        let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await;
+    .await;
+
+    if write.is_err() {
+        // Do not leave a temp file holding a copy of the secrets behind.
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
-    tokio::fs::rename(&tmp, path).await
+    write
 }
 
 #[cfg(test)]
@@ -467,6 +489,70 @@ mod tests {
         assert_eq!(jakarta.hour, 3);
         assert_ne!(utc.weekday, jakarta.weekday);
         assert!(jakarta.stamp.ends_with("+07:00"), "{}", jakarta.stamp);
+    }
+
+    /// `config.json` holds backend API keys, client keys and the dashboard
+    /// password, and every app on an Android phone can read a world-readable
+    /// file.
+    ///
+    /// The window this closed — the file existing at 0644 between the write and
+    /// the chmod — is not something a test can observe from the outside, so
+    /// this pins what it can: the mode is right afterwards, rewriting keeps it
+    /// right, and nothing holding a copy of the old secrets is left lying in
+    /// the directory. `write_atomic`'s own doc says why the mode is set at
+    /// `open(2)` rather than after.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_written_config_is_not_readable_by_anyone_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("config.json");
+        write_atomic(&file, "{\"apiKey\": \"sk-secret\"}")
+            .await
+            .expect("the write lands");
+
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"apiKey\": \"sk-secret\"}"
+        );
+
+        // Rewriting keeps both the contents and the mode, and leaves nothing
+        // behind holding a copy of the old secrets.
+        write_atomic(&file, "{\"apiKey\": \"sk-next\"}")
+            .await
+            .expect("the second write lands");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+
+        let left_behind: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name != "config.json")
+            .collect();
+        assert!(left_behind.is_empty(), "{left_behind:?}");
+    }
+
+    /// The temp file used to be named after the target's stem, so two files
+    /// saved together in one directory wrote to the same scratch path and one
+    /// renamed the other's half-finished bytes into place.
+    #[tokio::test]
+    async fn two_files_saved_at_once_do_not_write_over_each_other() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (a, b) = (dir.path().join("state.json"), dir.path().join("state.yml"));
+        let (one, two) = tokio::join!(
+            write_atomic(&a, "first"),
+            write_atomic(&b, "second longer contents"),
+        );
+        one.expect("a lands");
+        two.expect("b lands");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "second longer contents"
+        );
     }
 
     #[test]

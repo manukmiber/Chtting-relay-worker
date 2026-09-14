@@ -95,9 +95,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 lto = "thin"
 codegen-units = 4
 strip = true
-# Never `abort`. A panic in one request's handler is caught at the task boundary
-# and answered as a 500; aborting would take the other few hundred callers down
-# with it, and on a phone that nobody is watching it would stay down.
+# Never `abort`. A panic in one request's handler unwinds into the middleware in
+# `server::catch_panics`, which logs it and answers the caller 500; aborting
+# would take the other few hundred callers down with it, and on a phone that
+# nobody is watching it would stay down.
 panic = "unwind"
 
 # A build on the phone itself, where the constraint is RAM rather than time: one

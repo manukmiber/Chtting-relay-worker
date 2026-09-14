@@ -480,6 +480,80 @@ async fn a_password_locks_the_dashboard_until_you_sign_in() {
     assert_eq!(dash.get("/api/state").await.status(), 401);
 }
 
+/// A constant-time compare stops the password being read a character at a time.
+/// It does nothing about guessing it whole, and loopback is not a boundary on a
+/// phone — every app on the device can POST here as fast as it likes. So a run
+/// of wrong passwords has to stop being answered.
+#[tokio::test]
+async fn guessing_the_password_over_and_over_stops_being_answered() {
+    let dash = Dash::start(|cfg| {
+        cfg.dashboard.password = "hunter2".into();
+    })
+    .await;
+
+    let mut locked_out = false;
+    for attempt in 1..=12 {
+        let response = dash.post("/api/login", json!({"password": "wrong"})).await;
+        if response.status() == 429 {
+            assert!(
+                response.headers().contains_key("retry-after"),
+                "a lockout has to say how long it lasts"
+            );
+            locked_out = true;
+            break;
+        }
+        assert_eq!(response.status(), 401, "attempt {attempt}");
+    }
+    assert!(locked_out, "a dozen wrong passwords were all answered");
+
+    // And the lockout is not something a correct password walks past while it
+    // is in force.
+    let response = dash
+        .post("/api/login", json!({"password": "hunter2"}))
+        .await;
+    assert_eq!(response.status(), 429);
+    assert_eq!(dash.get("/api/state").await.status(), 401);
+}
+
+/// The throttle must not stand between an operator and their own dashboard: a
+/// few typos followed by the right password signs them in, and clears the
+/// count behind them.
+#[tokio::test]
+async fn a_few_typos_do_not_lock_the_operator_out() {
+    let dash = Dash::start(|cfg| {
+        cfg.dashboard.password = "hunter2".into();
+    })
+    .await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            dash.post("/api/login", json!({"password": "hunter1"}))
+                .await
+                .status(),
+            401
+        );
+    }
+    assert_eq!(
+        dash.post("/api/login", json!({"password": "hunter2"}))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(dash.get("/api/state").await.status(), 200);
+
+    // The slate is clean: another run of wrong guesses gets the full allowance
+    // rather than the one attempt the earlier typos left.
+    for attempt in 1..=4 {
+        assert_eq!(
+            dash.post("/api/login", json!({"password": "nope"}))
+                .await
+                .status(),
+            401,
+            "attempt {attempt}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn without_a_password_the_dashboard_is_open_on_loopback() {
     let dash = Dash::start(|_| {}).await;

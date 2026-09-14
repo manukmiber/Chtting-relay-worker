@@ -56,6 +56,28 @@ pub struct Config {
     pub tunnel: TunnelConfig,
     pub openrouter: OpenRouterConfig,
     pub billing: BillingConfig,
+
+    /// `timezone`, already parsed, worked out once when the config is
+    /// published.
+    ///
+    /// `Tz::from_str` is a lookup over the six hundred-odd IANA names, and a
+    /// single chat request asks for it three times — the day bucket, the hour
+    /// bucket, and the local parts a price rule reads — plus once more for the
+    /// daily quota. Parsing the same unchanging string four times per request,
+    /// on a phone, is work the config already knows the answer to.
+    ///
+    /// Never serialised: it is a derived value, and writing it into
+    /// `config.json` would invite somebody to edit it out of step with the
+    /// name beside it. `None` means nobody has normalised this `Config` — only
+    /// ever one built by hand in a test — and [`Config::tz`] parses in that
+    /// case, exactly as it always did.
+    ///
+    /// Public only so a `Config` can still be built with `..Default::default()`
+    /// from outside this module. Do not set it: [`normalize`] owns it, and
+    /// every path that publishes a config goes through there. Read it through
+    /// [`Config::tz`], which falls back to parsing the name when it is unset.
+    #[serde(skip)]
+    pub parsed_tz: Option<chrono_tz::Tz>,
 }
 
 impl Default for Config {
@@ -77,6 +99,7 @@ impl Default for Config {
             tunnel: TunnelConfig::default(),
             openrouter: OpenRouterConfig::default(),
             billing: BillingConfig::default(),
+            parsed_tz: None,
         }
     }
 }
@@ -1091,7 +1114,10 @@ impl Config {
     }
 
     pub fn tz(&self) -> chrono_tz::Tz {
-        crate::util::parse_tz(&self.timezone)
+        match self.parsed_tz {
+            Some(tz) => tz,
+            None => crate::util::parse_tz(&self.timezone),
+        }
     }
 }
 
@@ -1699,6 +1725,10 @@ pub fn normalize(mut cfg: Config) -> Config {
     if cfg.timezone.trim().is_empty() {
         cfg.timezone = "Asia/Jakarta".into();
     }
+    // Last, so it is parsed from the name as it finally stands. Every path that
+    // publishes a config comes through here, so the request path never has to
+    // look an IANA name up again.
+    cfg.parsed_tz = Some(crate::util::parse_tz(&cfg.timezone));
     cfg
 }
 
@@ -2112,6 +2142,50 @@ mod tests {
             ..Default::default()
         });
         cfg
+    }
+
+    /// `tz()` is asked for several times on every request, so the answer is
+    /// worked out once when the config is published. It has to be the same
+    /// answer parsing the name would give, and it has to follow the name when
+    /// the name changes.
+    #[test]
+    fn the_timezone_is_parsed_once_and_stays_in_step_with_its_name() {
+        let jakarta = normalize(Config::default());
+        assert_eq!(jakarta.parsed_tz, Some(chrono_tz::Asia::Jakarta));
+        assert_eq!(jakarta.tz(), crate::util::parse_tz(&jakarta.timezone));
+
+        let moved = normalize(Config {
+            timezone: "Europe/Berlin".into(),
+            ..Config::default()
+        });
+        assert_eq!(moved.tz(), chrono_tz::Europe::Berlin);
+
+        // A name nothing recognises still lands on UTC rather than failing.
+        let nonsense = normalize(Config {
+            timezone: "Mars/Olympus_Mons".into(),
+            ..Config::default()
+        });
+        assert_eq!(nonsense.tz(), chrono_tz::UTC);
+
+        // A config nobody normalised has no cached answer, and parses instead
+        // of quietly reporting the wrong zone.
+        let raw = Config {
+            timezone: "Europe/Berlin".into(),
+            ..Config::default()
+        };
+        assert_eq!(raw.parsed_tz, None);
+        assert_eq!(raw.tz(), chrono_tz::Europe::Berlin);
+    }
+
+    /// The cached zone is derived, so it must not be written into config.json
+    /// where somebody could edit it out of step with the name beside it.
+    #[test]
+    fn the_parsed_timezone_is_never_written_to_disk() {
+        let cfg = normalize(Config::default());
+        let written = serde_json::to_value(&cfg).unwrap();
+        assert!(written.get("parsedTz").is_none(), "{written}");
+        assert!(written.get("parsed_tz").is_none(), "{written}");
+        assert_eq!(written["timezone"], "Asia/Jakarta");
     }
 
     #[test]

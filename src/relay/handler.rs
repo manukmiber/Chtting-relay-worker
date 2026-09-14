@@ -358,6 +358,10 @@ pub async fn handle_chat(
     endpoint: &str,
     body: Value,
 ) -> Response {
+    // Shared from here on. The caller's body is read by the tokenizer on
+    // another thread, and it is the one object in a request that can be
+    // megabytes, so it is never copied to get there.
+    let body = Arc::new(body);
     let cfg = state.config.current();
     let started = Instant::now();
     let started_wall = now_ms();
@@ -402,8 +406,7 @@ pub async fn handle_chat(
     };
 
     let asked_for = record.public_model.clone();
-    trace.phase(
-        "in",
+    trace.phase("in", || {
         format!(
             "{} model={asked_for} key={} ({}) user={} effort={} stream={} bytes={} ip={}",
             local.stamp,
@@ -420,8 +423,8 @@ pub async fn handle_chat(
                 .unwrap_or(false),
             record.bytes_in,
             record.ip,
-        ),
-    );
+        )
+    });
 
     let Some(route) = cfg.find_model(&asked_for).filter(|m| m.enabled).cloned() else {
         let message = format!("model \"{asked_for}\" is not available on this relay");
@@ -542,11 +545,12 @@ pub async fn handle_chat(
     record.prompt_id = prompt_rule_id.clone();
 
     let injecting = Instant::now();
-    let mut upstream_body = transform_request(&body, &route, &cfg, &rt, prompt_spec);
+    // Shared rather than owned outright: the counter below needs both bodies on
+    // another thread, and an `Arc` is what lets it have them without a deep
+    // copy of the whole conversation each.
+    let mut upstream_body = Arc::new(transform_request(&body, &route, &cfg, &rt, prompt_spec));
     record.inject_ms = round(injecting.elapsed().as_secs_f64() * 1000.0, 3);
-    trace.timed(
-        "inj",
-        record.inject_ms,
+    trace.timed("inj", record.inject_ms, || {
         format!(
             "rule={} mode={}",
             if prompt_rule_id.is_empty() {
@@ -555,8 +559,8 @@ pub async fn handle_chat(
                 &prompt_rule_id
             },
             prompt_spec.mode,
-        ),
-    );
+        )
+    });
 
     let resolved = state.counter.resolve(
         &cfg,
@@ -568,8 +572,8 @@ pub async fn handle_chat(
     let input = state
         .counter
         .count_prompt(
-            &body,
-            &upstream_body,
+            body.clone(),
+            upstream_body.clone(),
             &resolved,
             &cfg.tokenizer.image_defaults,
         )
@@ -583,17 +587,15 @@ pub async fn handle_chat(
     } else {
         input.user as u64
     };
-    trace.timed(
-        "tok",
-        record.tokenize_ms,
+    trace.timed("tok", record.tokenize_ms, || {
         format!(
             "{} caller / {} upstream  {} {}",
             crate::relay::trace::grouped(user_local as i64),
             crate::relay::trace::grouped(input.billed as i64),
             input.tokenizer,
             if input.exact { "exact" } else { "estimated" },
-        ),
-    );
+        )
+    });
     record.local_prompt = input.billed as i64;
     record.billed_prompt_tokens = input.billed as i64;
     record.user_prompt_tokens = user_local as i64;
@@ -645,7 +647,9 @@ pub async fn handle_chat(
 
     let backend_cfg = cfg.find_backend(&route.backend).cloned();
 
-    if let Some(map) = upstream_body.as_object_mut() {
+    // The counter's own reference is gone by now, so this is the only holder
+    // and `make_mut` hands back the body itself rather than a copy of it.
+    if let Some(map) = Arc::make_mut(&mut upstream_body).as_object_mut() {
         // Requirement 22: the caller's own id goes upstream, because a backend
         // that keys its prompt cache by user needs it to keep one caller's
         // cache out of another's. It is the one thing about the caller that
@@ -1100,7 +1104,7 @@ async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Respo
     let rules = compile_text_rules(&ctx.transform.replace);
     let body_text = match &rules {
         Some(r) => r.apply(&pumped.text),
-        None => pumped.text.clone(),
+        None => std::borrow::Cow::Borrowed(pumped.text.as_str()),
     };
     let content = format!(
         "{}{body_text}{}",
@@ -1303,7 +1307,7 @@ async fn finalise_usage(ctx: &Ctx, pumped: &Pumped, streaming_to_client: bool) -
         let rules = compile_text_rules(&ctx.transform.replace);
         let body = match &rules {
             Some(r) => r.apply(&pumped.text),
-            None => pumped.text.clone(),
+            None => std::borrow::Cow::Borrowed(pumped.text.as_str()),
         };
         format!("{}{body}{}", ctx.transform.prefix, ctx.transform.suffix)
     };
@@ -1460,11 +1464,9 @@ fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
     match out.trace.filter(|t| t.enabled()) {
         Some(trace) => {
             if out.first_token_at.is_some() {
-                trace.timed("ttft", record.ttft_ms, "");
+                trace.timed("ttft", record.ttft_ms, String::new);
             }
-            trace.timed(
-                "done",
-                record.total_ms,
+            trace.timed("done", record.total_ms, || {
                 format!(
                     "status={} {}{}",
                     record.status,
@@ -1478,9 +1480,9 @@ fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
                     } else {
                         format!(" err={}", truncate(out.error, 160))
                     },
-                ),
-            );
-            trace.phase("sum", summary_line(&record));
+                )
+            });
+            trace.phase("sum", || summary_line(&record));
         }
         None => state.logger.info(format!(
             "{tag} {} -> {} {}in/{}out ttft={}ms total={}ms tps={} key={}{}",

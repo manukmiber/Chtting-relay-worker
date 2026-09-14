@@ -49,6 +49,12 @@ pub fn router(state: Arc<AppState>) -> Router {
     router
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(limit))
+        // Outermost, so it covers the routes, the fallback and the body limit
+        // alike: a panic anywhere under here is answered rather than dropped.
+        .layer(axum::middleware::from_fn_with_state(
+            state.logger.clone(),
+            super::catch_panics,
+        ))
         .with_state(state)
 }
 
@@ -124,11 +130,11 @@ async fn not_found() -> Response {
 /// error variant would make every successful authentication carry its weight.
 fn require_key(
     state: &AppState,
+    cfg: &crate::config::Config,
     headers: &HeaderMap,
 ) -> Result<Arc<crate::config::ClientKey>, Box<Response>> {
-    let cfg = state.config.current();
     let keys = state.config.keys();
-    match handler::authenticate(&cfg, &keys, bearer_token(headers)) {
+    match handler::authenticate(cfg, &keys, bearer_token(headers)) {
         Auth::Ok(key) => Ok(key),
         Auth::Denied { status, message } => Err(Box::new(error_response(
             status,
@@ -139,38 +145,63 @@ fn require_key(
     }
 }
 
-fn blocked(state: &AppState, ip: &str) -> Option<Response> {
-    state
-        .config
-        .current()
-        .security
+fn blocked(cfg: &crate::config::Config, ip: &str) -> Option<Response> {
+    cfg.security
         .blocked_ips
         .iter()
         .any(|b| b == ip)
         .then(|| error_response(403, "blocked", "forbidden", None))
 }
 
-async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let response = match require_key(&state, &headers) {
-        Err(denied) => *denied,
-        Ok(_) => Json(super::catalog::document(&state.config.current())).into_response(),
+async fn models(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let cfg = state.config.current();
+    let response = match refuse_listing(&state, &cfg, &headers, peer) {
+        Some(denied) => denied,
+        None => Json(super::catalog::document(&cfg)).into_response(),
     };
     with_cors(&state, &headers, response)
 }
 
+/// The block list and the key, for the two routes that only read the catalogue.
+///
+/// Not the full [`admit`]: a listing reaches no backend and spends nothing, so
+/// holding it to a per-minute limit or a daily token quota would refuse a
+/// caller for asking what they are allowed to call. `blockedIps` is a different
+/// claim though — it says this address is not served, not that it is not billed
+/// — so an address on it is refused here as well.
+fn refuse_listing(
+    state: &AppState,
+    cfg: &crate::config::Config,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Option<Response> {
+    let ip = client_ip(headers, peer, cfg.security.trust_proxy_headers);
+    blocked(cfg, &ip).or_else(|| require_key(state, cfg, headers).err().map(|r| *r))
+}
+
 async fn model_by_id(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let response = match require_key(&state, &headers) {
-        Err(denied) => *denied,
-        Ok(_) => {
-            let listed = super::catalog::document(&state.config.current());
-            let found = listed["data"]
-                .as_array()
-                .and_then(|a| a.iter().find(|m| m["id"] == id.as_str()))
-                .cloned();
+    let cfg = state.config.current();
+    let response = match refuse_listing(&state, &cfg, &headers, peer) {
+        Some(denied) => denied,
+        None => {
+            // The model is found first and only then written out. Building the
+            // whole catalogue — every enabled model, its architecture, its
+            // price windows — to throw all but one entry away made asking about
+            // one model cost as much as listing them all.
+            let found = cfg
+                .models
+                .iter()
+                .find(|m| m.enabled && m.id == id)
+                .map(|m| super::catalog::model_document(m, &cfg));
             match found {
                 Some(model) => Json(model).into_response(),
                 None => error_response(
@@ -203,6 +234,54 @@ async fn completions(
     chat_inner(state, connect, headers, body, "v1/completions").await
 }
 
+/// Everything that has to hold before a request is allowed to cost anything:
+/// the block list, a usable key, the per-minute limit and the daily quota.
+///
+/// One function, because every endpoint that reaches a backend has to apply
+/// the same four. `/v1/embeddings` used to apply none of them — it read the
+/// caller's address and then never looked at `blockedIps`, never took a slot
+/// off the rate limiter and never asked whether the key had spent its day — so
+/// a blocked address or an exhausted key could still spend upstream tokens
+/// just by asking for an embedding instead of a completion.
+///
+/// The refusal is boxed for the same reason [`require_key`] boxes its own: it
+/// is the rare path, and an unboxed `Response` would make every admitted
+/// request carry a `Response`-sized error variant.
+fn admit(
+    state: &Arc<AppState>,
+    cfg: &crate::config::Config,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<(Arc<crate::config::ClientKey>, String), Box<Response>> {
+    let ip = client_ip(headers, peer, cfg.security.trust_proxy_headers);
+    if let Some(refused) = blocked(cfg, &ip) {
+        return Err(Box::new(refused));
+    }
+
+    let key = require_key(state, cfg, headers)?;
+
+    // Rate limit before doing any work, so a hammering key costs nothing.
+    if let Err(retry_after) = state.limiter.check(&key.id, key.quota.requests_per_minute) {
+        let message = format!("rate limit reached ({}/min)", key.quota.requests_per_minute);
+        return Err(Box::new(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", retry_after.to_string())],
+                Json(serde_json::json!({
+                    "error": {"message": message, "type": "invalid_request_error", "code": "rate_limit_exceeded"}
+                })),
+            )
+                .into_response(),
+        ));
+    }
+
+    if let Some(response) = daily_quota_refusal(state, cfg, &key) {
+        return Err(Box::new(response));
+    }
+
+    Ok((key, ip))
+}
+
 async fn chat_inner(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -211,33 +290,10 @@ async fn chat_inner(
     endpoint: &str,
 ) -> Response {
     let cfg = state.config.current();
-    let ip = client_ip(&headers, peer, cfg.security.trust_proxy_headers);
-    if let Some(refused) = blocked(&state, &ip) {
-        return with_cors(&state, &headers, refused);
-    }
-
-    let key = match require_key(&state, &headers) {
-        Ok(key) => key,
+    let (key, ip) = match admit(&state, &cfg, &headers, peer) {
+        Ok(admitted) => admitted,
         Err(denied) => return with_cors(&state, &headers, *denied),
     };
-
-    // Rate limit before doing any work, so a hammering key costs nothing.
-    if let Err(retry_after) = state.limiter.check(&key.id, key.quota.requests_per_minute) {
-        let message = format!("rate limit reached ({}/min)", key.quota.requests_per_minute);
-        let response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", retry_after.to_string())],
-            Json(serde_json::json!({
-                "error": {"message": message, "type": "invalid_request_error", "code": "rate_limit_exceeded"}
-            })),
-        )
-            .into_response();
-        return with_cors(&state, &headers, response);
-    }
-
-    if let Some(response) = daily_quota_refusal(&state, &key) {
-        return with_cors(&state, &headers, response);
-    }
 
     if body
         .get("model")
@@ -262,12 +318,16 @@ async fn chat_inner(
 }
 
 /// Daily quotas are answered from memory, not from a query per request.
-fn daily_quota_refusal(state: &Arc<AppState>, key: &crate::config::ClientKey) -> Option<Response> {
+fn daily_quota_refusal(
+    state: &Arc<AppState>,
+    cfg: &crate::config::Config,
+    key: &crate::config::ClientKey,
+) -> Option<Response> {
     let quota = &key.quota;
     if quota.requests_per_day == 0 && quota.tokens_per_day == 0 {
         return None;
     }
-    let today = state.today();
+    let today = crate::util::day_key(now_ms(), &cfg.tz());
     let used = state.quotas.get(&key.id, &today);
 
     let message = if quota.requests_per_day > 0 && used.requests >= quota.requests_per_day {
@@ -295,9 +355,10 @@ async fn embeddings(
     Json(body): Json<Value>,
 ) -> Response {
     let cfg = state.config.current();
-    let ip = client_ip(&headers, peer, cfg.security.trust_proxy_headers);
-    let key = match require_key(&state, &headers) {
-        Ok(key) => key,
+    // The same four checks chat makes, in the same order. An endpoint that can
+    // reach a backend is an endpoint that can be made to spend money.
+    let (key, ip) = match admit(&state, &cfg, &headers, peer) {
+        Ok(admitted) => admitted,
         Err(denied) => return with_cors(&state, &headers, *denied),
     };
 
@@ -362,15 +423,10 @@ async fn embeddings(
         &route.tokenizer,
         &route.chat_profile,
     );
-    let mut local_prompt = 0usize;
-    let mut exact = true;
-    let mut tokenizer_name = String::new();
-    for text in &inputs {
-        let (n, is_exact, name) = state.counter.count_text(text, &resolved).await;
-        local_prompt += n;
-        exact &= is_exact;
-        tokenizer_name = name;
-    }
+    // One hand-off to the blocking pool for the whole array, not one per item:
+    // a batch of a hundred short inputs is still one short encode's worth of
+    // work, and paying a round trip to the pool for each of them is all cost.
+    let (local_prompt, exact, tokenizer_name) = state.counter.count_texts(inputs, &resolved).await;
 
     let mut upstream_body = body.clone();
     if let Some(map) = upstream_body.as_object_mut() {
@@ -412,11 +468,20 @@ async fn embeddings(
         local_prompt as i64
     };
 
+    let day = day_key(started_wall, &tz);
+    // The daily quota is answered from these counters, so a request that does
+    // not record itself is a request that does not count against the day. Chat
+    // does this from `finish`; embeddings writes its own row and has to do the
+    // same, or the quota it is now checked against never moves.
+    state
+        .quotas
+        .record(&key.id, &day, prompt_tokens.max(0) as u64);
+
     state.store.insert(RequestRecord {
         id: crate::util::new_uuid_v4(),
         ts: started_wall,
-        day: day_key(started_wall, &tz),
         hour: hour_key(started_wall, &tz),
+        day,
         key_id: key.id.clone(),
         key_label: key.display_name().to_string(),
         key_kind: key.kind,

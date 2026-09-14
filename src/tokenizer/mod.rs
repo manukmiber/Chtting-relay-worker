@@ -98,16 +98,20 @@ impl TokenCounter {
     ///
     /// One tokenizer over one conversation, so adding and subtracting here is
     /// exact.
+    /// Both bodies arrive behind an `Arc` rather than by reference, and that is
+    /// not an ornament. The work has to move to another thread, which means it
+    /// has to own what it reads; taking references and cloning here deep-copied
+    /// the caller's entire conversation *twice* on every request, so a 200 KB
+    /// thread cost 400 KB of allocation and memcpy before a single token was
+    /// counted. Sharing the bodies costs two pointer bumps instead.
     pub async fn count_prompt(
         &self,
-        original: &Value,
-        upstream: &Value,
+        original: Arc<Value>,
+        upstream: Arc<Value>,
         resolved: &Resolved,
         images: &ImageDefaults,
     ) -> PromptSplit {
         let encoder = self.encoder_for(resolved).await;
-        let original = original.clone();
-        let upstream = upstream.clone();
         let profile = resolved.profile.clone();
         let images = images.clone();
 
@@ -133,14 +137,25 @@ impl TokenCounter {
     }
 
     pub async fn count_text(&self, text: &str, resolved: &Resolved) -> (usize, bool, String) {
+        self.count_texts(vec![text.to_string()], resolved).await
+    }
+
+    /// Count a batch of independent strings, and report the total.
+    ///
+    /// One hand-off to the blocking pool for the whole batch. The embeddings
+    /// endpoint takes an array of inputs and used to count them one at a time,
+    /// so a hundred-item batch paid a hundred round trips to the pool — a
+    /// hundred channel sends and thread wake-ups — to count text that together
+    /// adds up to one short encode.
+    pub async fn count_texts(
+        &self,
+        texts: Vec<String>,
+        resolved: &Resolved,
+    ) -> (usize, bool, String) {
         let encoder = self.encoder_for(resolved).await;
-        let text = text.to_string();
         run_maybe_blocking(move || {
-            (
-                encoder.count(&text),
-                encoder.exact(),
-                encoder.name().to_string(),
-            )
+            let total = texts.iter().map(|t| encoder.count(t)).sum();
+            (total, encoder.exact(), encoder.name().to_string())
         })
         .await
     }
@@ -187,10 +202,17 @@ impl TokenCounter {
     }
 }
 
-/// Short work runs inline; anything big enough to matter goes to the blocking
-/// pool. Always spawning would add scheduling overhead to the common case of a
-/// few hundred tokens; never spawning would let one 200 KB prompt block a
-/// worker thread that other users' streams are running on.
+/// Every encode goes to the blocking pool.
+///
+/// A BPE merge loop is CPU-bound with no await points in it, so running one on
+/// an async worker stalls every other caller's stream that thread is driving
+/// until it finishes — and a long conversation is not a short stall. The
+/// hand-off costs tens of microseconds, which is worth paying unconditionally
+/// rather than guessing per call which side of the line a body falls on and
+/// being wrong on the bodies that matter.
+///
+/// So the batching is done by the callers instead: they hand over everything
+/// one encode needs, and pay for the hand-off once.
 async fn run_maybe_blocking<T, F>(work: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,
