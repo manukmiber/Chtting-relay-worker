@@ -474,7 +474,13 @@ fn find_quick_url(line: &str) -> Option<String> {
 /// Never print a tunnel token into the log buffer the dashboard shows.
 fn redact_arg(arg: &str) -> String {
     if arg.len() > 24 && arg.starts_with("ey") {
-        return format!("{}…<redacted>", &arg[..6]);
+        // By characters, never by bytes: `&arg[..6]` panics the moment byte 6
+        // lands inside a multi-byte character, and a token is whatever the
+        // operator pasted into the config rather than something guaranteed
+        // ASCII. Taking the connector down over the way its own log line is
+        // written is not a trade worth making.
+        let head: String = arg.chars().take(6).collect();
+        return format!("{head}…<redacted>");
     }
     arg.to_string()
 }
@@ -722,5 +728,12 @@ mod tests {
         assert!(!redacted.contains("ZGVhZGJlZWY"));
         assert!(redacted.contains("redacted"));
         assert_eq!(redact_arg("--protocol"), "--protocol");
+
+        // A token that is not ASCII used to take the whole connector down:
+        // slicing six *bytes* off it lands inside a character and panics.
+        let multibyte = format!("ey{}", "日本語のトークン".repeat(4));
+        assert!(multibyte.len() > 24);
+        assert!(redact_arg(&multibyte).ends_with("…<redacted>"));
+        assert!(!redact_arg(&multibyte).contains("トークン"));
     }
 }

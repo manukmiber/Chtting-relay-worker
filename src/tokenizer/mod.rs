@@ -18,10 +18,14 @@ use chat::{
 use registry::{Encoder, Registry};
 
 /// What vocabulary and chat profile a given call should be counted with.
+///
+/// `Arc<str>` rather than `String`: the counter has to *own* these to read
+/// them on the blocking pool, so every request cloned two strings on the way
+/// in. Shared, that is two refcount bumps.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    pub tokenizer: String,
-    pub profile: String,
+    pub tokenizer: Arc<str>,
+    pub profile: Arc<str>,
 }
 
 pub struct TokenCounter {
@@ -48,16 +52,40 @@ impl TokenCounter {
     ) -> Resolved {
         let (matched_tok, matched_prof) = Registry::match_rules(&cfg.tokenizer, model);
         Resolved {
-            tokenizer: if override_tokenizer.is_empty() {
-                matched_tok
+            tokenizer: Arc::from(if override_tokenizer.is_empty() {
+                matched_tok.as_str()
             } else {
-                override_tokenizer.to_string()
-            },
-            profile: if override_profile.is_empty() {
-                matched_prof
+                override_tokenizer
+            }),
+            profile: Arc::from(if override_profile.is_empty() {
+                matched_prof.as_str()
             } else {
-                override_profile.to_string()
+                override_profile
+            }),
+        }
+    }
+
+    /// The same answer for a route, read straight off the config.
+    ///
+    /// The rules were already walked once when the config was published, so
+    /// this is two refcount bumps instead of a glob over every rule in the
+    /// list — which is what a request used to pay to find out which
+    /// vocabulary to count with. See [`crate::config::Model::resolved_tokenizer`].
+    ///
+    /// A `Model` nobody normalised has no answer stored, which only happens in
+    /// a test that built one by hand; that falls back to working it out.
+    pub fn resolve_route(&self, cfg: &Config, route: &crate::config::Model) -> Resolved {
+        match (&route.resolved_tokenizer, &route.resolved_profile) {
+            (Some(tokenizer), Some(profile)) => Resolved {
+                tokenizer: tokenizer.clone(),
+                profile: profile.clone(),
             },
+            _ => self.resolve(
+                cfg,
+                &route.upstream_model,
+                &route.tokenizer,
+                &route.chat_profile,
+            ),
         }
     }
 
@@ -98,16 +126,20 @@ impl TokenCounter {
     ///
     /// One tokenizer over one conversation, so adding and subtracting here is
     /// exact.
+    /// Both bodies arrive behind an `Arc` rather than by reference, and that is
+    /// not an ornament. The work has to move to another thread, which means it
+    /// has to own what it reads; taking references and cloning here deep-copied
+    /// the caller's entire conversation *twice* on every request, so a 200 KB
+    /// thread cost 400 KB of allocation and memcpy before a single token was
+    /// counted. Sharing the bodies costs two pointer bumps instead.
     pub async fn count_prompt(
         &self,
-        original: &Value,
-        upstream: &Value,
+        original: Arc<Value>,
+        upstream: Arc<Value>,
         resolved: &Resolved,
         images: &ImageDefaults,
     ) -> PromptSplit {
         let encoder = self.encoder_for(resolved).await;
-        let original = original.clone();
-        let upstream = upstream.clone();
         let profile = resolved.profile.clone();
         let images = images.clone();
 
@@ -133,14 +165,25 @@ impl TokenCounter {
     }
 
     pub async fn count_text(&self, text: &str, resolved: &Resolved) -> (usize, bool, String) {
+        self.count_texts(vec![text.to_string()], resolved).await
+    }
+
+    /// Count a batch of independent strings, and report the total.
+    ///
+    /// One hand-off to the blocking pool for the whole batch. The embeddings
+    /// endpoint takes an array of inputs and used to count them one at a time,
+    /// so a hundred-item batch paid a hundred round trips to the pool — a
+    /// hundred channel sends and thread wake-ups — to count text that together
+    /// adds up to one short encode.
+    pub async fn count_texts(
+        &self,
+        texts: Vec<String>,
+        resolved: &Resolved,
+    ) -> (usize, bool, String) {
         let encoder = self.encoder_for(resolved).await;
-        let text = text.to_string();
         run_maybe_blocking(move || {
-            (
-                encoder.count(&text),
-                encoder.exact(),
-                encoder.name().to_string(),
-            )
+            let total = texts.iter().map(|t| encoder.count(t)).sum();
+            (total, encoder.exact(), encoder.name().to_string())
         })
         .await
     }
@@ -187,10 +230,17 @@ impl TokenCounter {
     }
 }
 
-/// Short work runs inline; anything big enough to matter goes to the blocking
-/// pool. Always spawning would add scheduling overhead to the common case of a
-/// few hundred tokens; never spawning would let one 200 KB prompt block a
-/// worker thread that other users' streams are running on.
+/// Every encode goes to the blocking pool.
+///
+/// A BPE merge loop is CPU-bound with no await points in it, so running one on
+/// an async worker stalls every other caller's stream that thread is driving
+/// until it finishes — and a long conversation is not a short stall. The
+/// hand-off costs tens of microseconds, which is worth paying unconditionally
+/// rather than guessing per call which side of the line a body falls on and
+/// being wrong on the bodies that matter.
+///
+/// So the batching is done by the callers instead: they hand over everything
+/// one encode needs, and pay for the hand-off once.
 async fn run_maybe_blocking<T, F>(work: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,
@@ -858,7 +908,7 @@ mod tests {
         )));
         // Without a pin, the backend name drives the rules.
         assert_eq!(
-            counter
+            &*counter
                 .resolve(&cfg, "Deepseek-v4-flash-0731", "", "")
                 .tokenizer,
             "deepseek"
@@ -867,11 +917,62 @@ mod tests {
         // against was feeding "cl100k_base" back in as if it were a model name,
         // which fell through to the catch-all rule and silently used o200k.
         assert_eq!(
-            counter
+            &*counter
                 .resolve(&cfg, "Deepseek-v4-flash-0731", "cl100k_base", "")
                 .tokenizer,
             "cl100k_base"
         );
+    }
+
+    /// The same answers, read off the config instead of re-globbed. The point
+    /// of the precomputation is that it changes nothing but the cost, so a
+    /// route must resolve to exactly what working it out live would give.
+    #[test]
+    fn a_normalised_route_resolves_without_walking_the_rules() {
+        let counter = TokenCounter::new(Arc::new(Registry::new(
+            std::path::PathBuf::from("/nonexistent"),
+            crate::logging::Logger::console(crate::logging::Level::Silent),
+        )));
+
+        let routes = [
+            // (upstreamModel, pinned tokenizer, pinned profile)
+            ("Deepseek-v4-flash-0731", "", ""),
+            ("Deepseek-v4-flash-0731", "cl100k_base", ""),
+            ("qwen3-coder", "", "chatml"),
+            ("gpt-4o-mini", "", ""),
+            ("something-nothing-matches", "", ""),
+        ];
+
+        for (upstream, tokenizer, profile) in routes {
+            let cfg = crate::config::normalize(Config {
+                models: vec![crate::config::Model {
+                    id: "public".into(),
+                    upstream_model: upstream.into(),
+                    tokenizer: tokenizer.into(),
+                    chat_profile: profile.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let route = &cfg.models[0];
+            let live = counter.resolve(&cfg, upstream, tokenizer, profile);
+            let stored = counter.resolve_route(&cfg, route);
+            assert_eq!(stored.tokenizer, live.tokenizer, "{upstream}");
+            assert_eq!(stored.profile, live.profile, "{upstream}");
+            assert!(
+                route.resolved_tokenizer.is_some(),
+                "normalising must decide it: {upstream}"
+            );
+        }
+
+        // A route nobody normalised still answers, by working it out.
+        let cfg = Config::default();
+        let raw = crate::config::Model {
+            upstream_model: "Deepseek-v4-flash-0731".into(),
+            ..Default::default()
+        };
+        assert!(raw.resolved_tokenizer.is_none());
+        assert_eq!(&*counter.resolve_route(&cfg, &raw).tokenizer, "deepseek");
     }
 }
 

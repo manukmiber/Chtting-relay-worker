@@ -126,6 +126,7 @@ pub const SSE_HEADERS: [(&str, &str); 4] = [
 /* -------------------------------------------------------- rewriting -- */
 
 use crate::relay::transform::CompiledRules;
+use std::sync::Arc;
 
 /// Applies text rewrites to a stream without letting a pattern that straddles
 /// two chunks slip through.
@@ -135,13 +136,13 @@ use crate::relay::transform::CompiledRules;
 /// also pulled back behind any match that straddles it, leaving that text
 /// buffered until the rest of it arrives.
 pub struct StreamRewriter {
-    rules: Option<CompiledRules>,
+    rules: Option<Arc<CompiledRules>>,
     lookbehind: usize,
     pending: String,
 }
 
 impl StreamRewriter {
-    pub fn new(rules: Option<CompiledRules>, lookbehind: usize) -> Self {
+    pub fn new(rules: Option<Arc<CompiledRules>>, lookbehind: usize) -> Self {
         Self {
             rules,
             lookbehind: lookbehind.max(1),
@@ -161,9 +162,12 @@ impl StreamRewriter {
         if cut == 0 {
             return String::new();
         }
-        let safe: String = self.pending[..cut].to_string();
+        // Rewrite straight out of the buffer, so the safe prefix is copied
+        // once on its way out rather than once into a scratch string and again
+        // into the result.
+        let safe = rules.apply(&self.pending[..cut]).into_owned();
         self.pending.drain(..cut);
-        rules.apply(&safe)
+        safe
     }
 
     pub fn flush(&mut self) -> String {
@@ -172,7 +176,7 @@ impl StreamRewriter {
         }
         let rest = std::mem::take(&mut self.pending);
         match &self.rules {
-            Some(rules) => rules.apply(&rest),
+            Some(rules) => rules.apply(&rest).into_owned(),
             None => rest,
         }
     }
@@ -228,7 +232,7 @@ mod tests {
     use crate::config::TextRule;
     use crate::relay::transform::compile_text_rules;
 
-    fn rules(pattern: &str, replacement: &str) -> CompiledRules {
+    fn rules(pattern: &str, replacement: &str) -> Arc<CompiledRules> {
         compile_text_rules(&[TextRule {
             pattern: pattern.into(),
             flags: Some("gi".into()),

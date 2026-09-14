@@ -800,6 +800,110 @@ async fn embeddings_get_the_same_translation_and_accounting() {
     assert_eq!(row["prompt_tokens"], 7, "the backend's own count wins");
 }
 
+/// The hole this closes: every limit the relay has was written on the chat
+/// path, and `/v1/embeddings` reached a backend without consulting a single one
+/// of them. A key that had spent its minute, spent its day, or was calling from
+/// an address on the block list could keep spending upstream tokens simply by
+/// asking for an embedding instead of a completion.
+#[tokio::test]
+async fn embeddings_are_held_to_the_same_limits_as_chat() {
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.keys[0].quota.requests_per_minute = 2;
+    })
+    .await;
+
+    let embed = || {
+        h.post(
+            "/v1/embeddings",
+            json!({"model": "manukmiberai/creative-writer", "input": "embed this"}),
+        )
+    };
+
+    assert_eq!(embed().await.status(), 200);
+    assert_eq!(embed().await.status(), 200);
+
+    let refused = embed().await;
+    assert_eq!(
+        refused.status(),
+        429,
+        "the third call is over the key's per-minute limit"
+    );
+    assert!(
+        refused.headers().contains_key("retry-after"),
+        "a refusal has to say how long to wait"
+    );
+    assert_eq!(
+        h.backend.request_count(),
+        2,
+        "a refused call must never reach the backend"
+    );
+}
+
+/// The other half of the same hole: a quota is only a quota if what it governs
+/// counts against it. Embeddings write their own metrics row and so have to
+/// record their own usage, or the daily counters never move and the check added
+/// above never fires.
+#[tokio::test]
+async fn an_embedding_counts_against_the_day_it_was_made_on() {
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.keys[0].quota.requests_per_day = 1;
+    })
+    .await;
+
+    let embed = || {
+        h.post(
+            "/v1/embeddings",
+            json!({"model": "manukmiberai/creative-writer", "input": "embed this"}),
+        )
+    };
+
+    assert_eq!(embed().await.status(), 200);
+    assert_eq!(
+        embed().await.status(),
+        429,
+        "the first embedding used the day's only request"
+    );
+
+    // And the day is shared with chat rather than kept in a pocket of its own.
+    let chat = h
+        .post(
+            "/v1/chat/completions",
+            json!({"model": "manukmiberai/creative-writer",
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(chat.status(), 429);
+}
+
+/// `blockedIps` is checked against the address the relay decided the caller is
+/// at, and it has to be checked on every endpoint that can reach a backend.
+#[tokio::test]
+async fn a_blocked_address_is_refused_on_every_route_that_serves_it() {
+    let h = harness(MockConfig::default(), |cfg| {
+        cfg.security.blocked_ips.push("127.0.0.1".into());
+    })
+    .await;
+
+    let response = h
+        .post(
+            "/v1/embeddings",
+            json!({"model": "manukmiberai/creative-writer", "input": "embed this"}),
+        )
+        .await;
+    assert_eq!(response.status(), 403);
+    assert_eq!(h.backend.request_count(), 0);
+
+    // The catalogue is not served to a blocked address either: the setting says
+    // this address is not served, not that it is not billed.
+    assert_eq!(h.get("/v1/models").await.status(), 403);
+    assert_eq!(
+        h.get("/v1/models/manukmiberai/creative-writer")
+            .await
+            .status(),
+        403
+    );
+}
+
 /* -------------------------------------------------------- concurrency -- */
 
 #[tokio::test]

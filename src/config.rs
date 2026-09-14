@@ -56,6 +56,28 @@ pub struct Config {
     pub tunnel: TunnelConfig,
     pub openrouter: OpenRouterConfig,
     pub billing: BillingConfig,
+
+    /// `timezone`, already parsed, worked out once when the config is
+    /// published.
+    ///
+    /// `Tz::from_str` is a lookup over the six hundred-odd IANA names, and a
+    /// single chat request asks for it three times — the day bucket, the hour
+    /// bucket, and the local parts a price rule reads — plus once more for the
+    /// daily quota. Parsing the same unchanging string four times per request,
+    /// on a phone, is work the config already knows the answer to.
+    ///
+    /// Never serialised: it is a derived value, and writing it into
+    /// `config.json` would invite somebody to edit it out of step with the
+    /// name beside it. `None` means nobody has normalised this `Config` — only
+    /// ever one built by hand in a test — and [`Config::tz`] parses in that
+    /// case, exactly as it always did.
+    ///
+    /// Public only so a `Config` can still be built with `..Default::default()`
+    /// from outside this module. Do not set it: [`normalize`] owns it, and
+    /// every path that publishes a config goes through there. Read it through
+    /// [`Config::tz`], which falls back to parsing the name when it is unset.
+    #[serde(skip)]
+    pub parsed_tz: Option<chrono_tz::Tz>,
 }
 
 impl Default for Config {
@@ -77,6 +99,7 @@ impl Default for Config {
             tunnel: TunnelConfig::default(),
             openrouter: OpenRouterConfig::default(),
             billing: BillingConfig::default(),
+            parsed_tz: None,
         }
     }
 }
@@ -366,6 +389,29 @@ pub struct Model {
     /// This model's own price list, layered over the global one.
     pub pricing: Pricing,
     pub openrouter: OpenRouterModel,
+
+    /// Which vocabulary and chat profile this route counts with, decided once
+    /// when the config is published.
+    ///
+    /// The answer is a pure function of the config — `upstreamModel` against
+    /// `tokenizer.rules`, with this model's own `tokenizer`/`chatProfile`
+    /// overriding — and yet it was being worked out again on every request:
+    /// a walk of the rule list, and `glob_match` lower-casing and collecting
+    /// both the model name *and* the pattern into a `Vec<char>` at each rule.
+    /// Fourteen rules in the default config, so tens of allocations per
+    /// request to re-answer a question whose inputs had not moved.
+    ///
+    /// `Arc<str>`, so handing it to the counter — which has to own it to read
+    /// it on the blocking pool — is a refcount bump rather than two `String`
+    /// allocations of its own.
+    ///
+    /// Set by [`normalize`] and never serialised. `None` means nobody
+    /// normalised this `Model`, which is only ever one built by hand in a
+    /// test; the counter then works it out live, exactly as it always did.
+    #[serde(skip)]
+    pub resolved_tokenizer: Option<Arc<str>>,
+    #[serde(skip)]
+    pub resolved_profile: Option<Arc<str>>,
 }
 
 impl Default for Model {
@@ -394,6 +440,8 @@ impl Default for Model {
             max_tokens_per_second: 0.0,
             pricing: Pricing::default(),
             openrouter: OpenRouterModel::default(),
+            resolved_tokenizer: None,
+            resolved_profile: None,
         }
     }
 }
@@ -1158,7 +1206,10 @@ impl Config {
     }
 
     pub fn tz(&self) -> chrono_tz::Tz {
-        crate::util::parse_tz(&self.timezone)
+        match self.parsed_tz {
+            Some(tz) => tz,
+            None => crate::util::parse_tz(&self.timezone),
+        }
     }
 }
 
@@ -1784,7 +1835,49 @@ pub fn normalize(mut cfg: Config) -> Config {
     if cfg.timezone.trim().is_empty() {
         cfg.timezone = "Asia/Jakarta".into();
     }
+    // Last, so it is parsed from the name as it finally stands. Every path that
+    // publishes a config comes through here, so the request path never has to
+    // look an IANA name up again.
+    cfg.parsed_tz = Some(crate::util::parse_tz(&cfg.timezone));
+    resolve_tokenizers(&mut cfg);
     cfg
+}
+
+/// Decide each route's vocabulary and chat profile once, here, rather than on
+/// every request that uses it.
+///
+/// Worked out in two passes because the answer depends on `cfg.tokenizer`
+/// while the place it is written is `cfg.models`, and the borrow checker is
+/// right to object to holding both at once.
+fn resolve_tokenizers(cfg: &mut Config) {
+    let decided: Vec<(Arc<str>, Arc<str>)> = cfg
+        .models
+        .iter()
+        .map(|m| {
+            let (rule_tokenizer, rule_profile) = crate::tokenizer::registry::Registry::match_rules(
+                &cfg.tokenizer,
+                &m.upstream_model,
+            );
+            // A route that names a vocabulary outright means it; feeding that
+            // name back through the rules would send it to the catch-all.
+            let tokenizer = if m.tokenizer.is_empty() {
+                rule_tokenizer
+            } else {
+                m.tokenizer.clone()
+            };
+            let profile = if m.chat_profile.is_empty() {
+                rule_profile
+            } else {
+                m.chat_profile.clone()
+            };
+            (Arc::from(tokenizer.as_str()), Arc::from(profile.as_str()))
+        })
+        .collect();
+
+    for (model, (tokenizer, profile)) in cfg.models.iter_mut().zip(decided) {
+        model.resolved_tokenizer = Some(tokenizer);
+        model.resolved_profile = Some(profile);
+    }
 }
 
 fn normalize_billing(billing: &mut BillingConfig) {
@@ -2197,6 +2290,50 @@ mod tests {
             ..Default::default()
         });
         cfg
+    }
+
+    /// `tz()` is asked for several times on every request, so the answer is
+    /// worked out once when the config is published. It has to be the same
+    /// answer parsing the name would give, and it has to follow the name when
+    /// the name changes.
+    #[test]
+    fn the_timezone_is_parsed_once_and_stays_in_step_with_its_name() {
+        let jakarta = normalize(Config::default());
+        assert_eq!(jakarta.parsed_tz, Some(chrono_tz::Asia::Jakarta));
+        assert_eq!(jakarta.tz(), crate::util::parse_tz(&jakarta.timezone));
+
+        let moved = normalize(Config {
+            timezone: "Europe/Berlin".into(),
+            ..Config::default()
+        });
+        assert_eq!(moved.tz(), chrono_tz::Europe::Berlin);
+
+        // A name nothing recognises still lands on UTC rather than failing.
+        let nonsense = normalize(Config {
+            timezone: "Mars/Olympus_Mons".into(),
+            ..Config::default()
+        });
+        assert_eq!(nonsense.tz(), chrono_tz::UTC);
+
+        // A config nobody normalised has no cached answer, and parses instead
+        // of quietly reporting the wrong zone.
+        let raw = Config {
+            timezone: "Europe/Berlin".into(),
+            ..Config::default()
+        };
+        assert_eq!(raw.parsed_tz, None);
+        assert_eq!(raw.tz(), chrono_tz::Europe::Berlin);
+    }
+
+    /// The cached zone is derived, so it must not be written into config.json
+    /// where somebody could edit it out of step with the name beside it.
+    #[test]
+    fn the_parsed_timezone_is_never_written_to_disk() {
+        let cfg = normalize(Config::default());
+        let written = serde_json::to_value(&cfg).unwrap();
+        assert!(written.get("parsedTz").is_none(), "{written}");
+        assert!(written.get("parsed_tz").is_none(), "{written}");
+        assert_eq!(written["timezone"], "Asia/Jakarta");
     }
 
     #[test]

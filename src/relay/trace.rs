@@ -16,16 +16,46 @@
 //! writes to stderr, which is what Termux shows, and to `relay.log`, which is
 //! what the dashboard's Logs tab reads. There is no second, quieter channel.
 
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::logging::Logger;
 
-/// Resident memory of this process, in MiB.
+/// Resident memory of this process, in MiB, refreshed at most once a second.
 ///
+/// Every finished request puts this on its row, and the underlying read is a
+/// blocking `open`/`read`/`close` of a ~1 KB procfs file plus a scan for the
+/// line that matters — done straight on an async worker thread, so under load
+/// it is hundreds of synchronous file reads a second stealing time from the
+/// streams sharing that thread.
+///
+/// What it answers is "roughly how much memory is this phone using", which does
+/// not move meaningfully inside a second. So it is read on a timer and every
+/// request in between reads the number that was already there: the log line and
+/// the dashboard say the same thing they said before, for none of the cost.
+pub fn rss_mb() -> f64 {
+    // Bits of an f64 and a millisecond stamp, so reading is two relaxed loads
+    // and no lock on the path that every request takes.
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    static READ_AT: AtomicI64 = AtomicI64::new(i64::MIN);
+    const TTL_MS: i64 = 1_000;
+
+    let now = crate::util::now_ms();
+    let read_at = READ_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(read_at) < TTL_MS {
+        return f64::from_bits(CACHED.load(Ordering::Relaxed));
+    }
+    // A race here costs one extra read of the same file, never a wrong answer.
+    READ_AT.store(now, Ordering::Relaxed);
+    let fresh = read_rss_mb();
+    CACHED.store(fresh.to_bits(), Ordering::Relaxed);
+    fresh
+}
+
 /// `/proc/self/status` rather than `statm`: the former is already in kB, while
 /// the latter is in pages and would need the page size, which is not always
 /// 4 KiB on arm64. Returns 0 where there is no procfs.
-pub fn rss_mb() -> f64 {
+fn read_rss_mb() -> f64 {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return 0.0;
     };
@@ -96,22 +126,31 @@ impl Trace {
     }
 
     /// One phase line. `phase` is padded so the columns line up in a terminal.
-    pub fn phase(&self, phase: &str, detail: impl AsRef<str>) {
+    ///
+    /// The detail arrives as a closure rather than a string, and that is the
+    /// whole point: these lines are off by default, and taking a `String` meant
+    /// every caller built one — a `format!` with a dozen fields, token counts
+    /// grouped into their own allocations — and handed it over to be dropped
+    /// unread. Three of those on every single request, for output nobody asked
+    /// for. A closure is not called at all when the trace is off.
+    pub fn phase(&self, phase: &str, detail: impl FnOnce() -> String) {
         if !self.on {
             return;
         }
         self.logger
-            .info(format!("req {} {phase:<5} {}", self.short, detail.as_ref()));
+            .info(format!("req {} {phase:<5} {}", self.short, detail()));
     }
 
     /// A millisecond figure, always with one decimal so the column is stable.
-    pub fn timed(&self, phase: &str, ms: f64, detail: impl AsRef<str>) {
+    pub fn timed(&self, phase: &str, ms: f64, detail: impl FnOnce() -> String) {
         if !self.on {
             return;
         }
-        let detail = detail.as_ref();
-        let gap = if detail.is_empty() { "" } else { "  " };
-        self.phase(phase, format!("{ms:>9.1}ms{gap}{detail}"));
+        self.phase(phase, || {
+            let detail = detail();
+            let gap = if detail.is_empty() { "" } else { "  " };
+            format!("{ms:>9.1}ms{gap}{detail}")
+        });
     }
 }
 

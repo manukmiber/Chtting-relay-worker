@@ -53,15 +53,64 @@ impl Sessions {
     }
 }
 
+/// How many wrong passwords in a row before sign-in stops answering, and for
+/// how long.
+///
+/// A constant-time compare stops the password being *read* a character at a
+/// time; it does nothing at all about guessing it whole. Loopback is not a
+/// boundary here — every app on the phone can POST `/api/login` — so without a
+/// delay an attacker gets as many guesses per second as the CPU allows, which
+/// for the short password somebody actually types is the whole game.
+///
+/// Ten is past any real typo, and thirty seconds costs a locked-out operator
+/// almost nothing while cutting a guessing run to a rate no password falls to.
+/// The counter is cleared by a correct password, so getting it right is the
+/// way out rather than waiting.
+const LOGIN_ATTEMPTS: u32 = 10;
+const LOGIN_LOCKOUT_MS: i64 = 30_000;
+
+/// Wrong sign-ins so far, and when the current lockout ends.
+#[derive(Default)]
+struct LoginGuard {
+    state: parking_lot::Mutex<(u32, i64)>,
+}
+
+impl LoginGuard {
+    /// `Err(seconds)` while locked out, `Ok(())` when a guess may be made.
+    fn check(&self) -> Result<(), i64> {
+        let (_, until) = *self.state.lock();
+        let now = crate::util::now_ms();
+        if until > now {
+            return Err(((until - now) / 1000).max(1));
+        }
+        Ok(())
+    }
+
+    fn failed(&self) {
+        let mut state = self.state.lock();
+        state.0 += 1;
+        if state.0 >= LOGIN_ATTEMPTS {
+            state.0 = 0;
+            state.1 = crate::util::now_ms() + LOGIN_LOCKOUT_MS;
+        }
+    }
+
+    fn succeeded(&self) {
+        *self.state.lock() = (0, 0);
+    }
+}
+
 pub struct Dashboard {
     pub state: Arc<AppState>,
     sessions: Sessions,
+    logins: LoginGuard,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     let dash = Arc::new(Dashboard {
         state,
         sessions: Sessions::default(),
+        logins: LoginGuard::default(),
     });
 
     Router::new()
@@ -117,6 +166,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/playground", post(playground))
         .fallback(static_files)
         .layer(middleware::from_fn_with_state(dash.clone(), guard))
+        // Outside the guard, so a panic in the guard itself is answered too.
+        .layer(middleware::from_fn_with_state(
+            dash.state.logger.clone(),
+            crate::server::catch_panics,
+        ))
         .with_state(dash)
 }
 
@@ -203,15 +257,16 @@ fn authed(dash: &Dashboard, headers: &HeaderMap) -> bool {
         return false;
     };
     let now = crate::util::now_ms();
-    let mut tokens = dash.sessions.tokens.write();
-    match tokens.get(&token) {
-        Some(expiry) if *expiry > now => true,
-        Some(_) => {
-            tokens.remove(&token);
-            false
-        }
-        None => false,
+    // A read lock on the path every request takes; the write is only for the
+    // rare case of a token that has actually run out, which happens once per
+    // session rather than once per call.
+    match dash.sessions.tokens.read().get(&token) {
+        Some(expiry) if *expiry > now => return true,
+        None => return false,
+        Some(_) => {}
     }
+    dash.sessions.tokens.write().remove(&token);
+    false
 }
 
 /// Everything except sign-in itself needs a session when a password is set,
@@ -243,9 +298,23 @@ async fn login(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> R
     let cfg = dash.state.config.current();
     let expected = &cfg.dashboard.password;
     let given = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-    if !expected.is_empty() && !safe_equal(given, expected) {
-        return error(401, "wrong password");
+    if !expected.is_empty() {
+        if let Err(wait) = dash.logins.check() {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, wait.to_string())],
+                Json(json!({ "error": {
+                    "message": format!("too many wrong passwords — try again in {wait}s"),
+                } })),
+            )
+                .into_response();
+        }
+        if !safe_equal(given, expected) {
+            dash.logins.failed();
+            return error(401, "wrong password");
+        }
     }
+    dash.logins.succeeded();
 
     let token = random_hex(24);
     let ttl = cfg.dashboard.session_ttl_ms.max(60_000);
@@ -1585,8 +1654,8 @@ async fn tokenizer_count(State(dash): State<Arc<Dashboard>>, Json(body): Json<Va
             "breakdown": counted.breakdown,
             "exact": counted.exact,
             "tokenizer": counted.tokenizer,
-            "profile": resolved.profile,
-            "resolved": {"tokenizer": resolved.tokenizer, "profile": resolved.profile},
+            "profile": &*resolved.profile,
+            "resolved": {"tokenizer": &*resolved.tokenizer, "profile": &*resolved.profile},
         }))
         .into_response();
     }
@@ -1602,7 +1671,7 @@ async fn tokenizer_count(State(dash): State<Arc<Dashboard>>, Json(body): Json<Va
         map.insert("mode".into(), Value::String("text".into()));
         map.insert(
             "resolved".into(),
-            json!({"tokenizer": resolved.tokenizer, "profile": resolved.profile}),
+            json!({"tokenizer": &*resolved.tokenizer, "profile": &*resolved.profile}),
         );
     }
     Json(detail).into_response()

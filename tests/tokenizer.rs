@@ -181,7 +181,7 @@ async fn counting_a_chat_request_charges_template_overhead_on_top_of_the_text() 
     });
 
     let resolved = counter.resolve(&cfg, "gpt-4o-mini", "", "");
-    assert_eq!(resolved.tokenizer, "o200k_base");
+    assert_eq!(&*resolved.tokenizer, "o200k_base");
 
     let counted = counter
         .count_request(&body, &resolved, &ImageDefaults::default())

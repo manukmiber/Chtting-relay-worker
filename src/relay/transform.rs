@@ -11,6 +11,8 @@
 
 use fancy_regex::Regex;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::config::{
     Config, Model, ResolvedRequestTransform, ResolvedResponseTransform, SystemPromptRule,
@@ -25,25 +27,24 @@ pub struct CompiledRules {
     rules: Vec<(Regex, String)>,
 }
 
-impl Clone for CompiledRules {
-    fn clone(&self) -> Self {
-        // fancy_regex::Regex is not Clone; recompiling from the source is
-        // cheap next to an LLM call and keeps call sites simple.
-        Self {
-            rules: self
-                .rules
-                .iter()
-                .filter_map(|(re, rep)| Regex::new(re.as_str()).ok().map(|r| (r, rep.clone())))
-                .collect(),
-        }
-    }
-}
-
 impl CompiledRules {
-    pub fn apply(&self, text: &str) -> String {
-        let mut out = text.to_string();
+    /// Rewrite `text`, borrowing it unchanged when no rule matches.
+    ///
+    /// The old shape allocated a `String` per rule *and* one for the input,
+    /// whether or not anything matched — so a route with three rules that
+    /// never fire still copied every reply three times. `replace_all` already
+    /// hands back a `Cow::Borrowed` when it changed nothing; passing that
+    /// through means the common case allocates nothing at all.
+    pub fn apply<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let mut out: Cow<'a, str> = Cow::Borrowed(text);
         for (re, replacement) in &self.rules {
-            out = re.replace_all(&out, replacement.as_str()).into_owned();
+            // Each rule runs over what the last one produced, not over `text`,
+            // so the rules still compose exactly as they did.
+            let next = match re.replace_all(out.as_ref(), replacement.as_str()) {
+                Cow::Borrowed(_) => continue,
+                Cow::Owned(next) => next,
+            };
+            out = Cow::Owned(next);
         }
         out
     }
@@ -58,11 +59,81 @@ impl CompiledRules {
     }
 }
 
+/// Rule sets already compiled, so a regex is built once rather than per call.
+///
+/// The relay was calling [`compile_text_rules`] two or three times on every
+/// request — once on the way out, once for the stream rewriter, once more when
+/// the reply was reassembled — for a rule set that only ever changes when
+/// somebody edits the config. `Regex::new` on a handful of patterns is tens of
+/// microseconds of pure repetition, on a phone, per request.
+///
+/// Keyed by the rules themselves: a config change misses once and then the
+/// steady state compiles nothing at all. The hash is only the bucket — the
+/// rules stored beside it are compared for real, so a collision cannot hand
+/// back somebody else's patterns.
+type RuleCache = parking_lot::RwLock<
+    std::collections::HashMap<u64, Vec<(Vec<TextRule>, Option<Arc<CompiledRules>>)>>,
+>;
+
+fn rule_cache() -> &'static RuleCache {
+    static CACHE: std::sync::OnceLock<RuleCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Distinct rule sets to remember before starting over.
+///
+/// A relay serves one config at a time, so the live set is one or two entries;
+/// the rest are what editing left behind. Clearing rather than evicting the
+/// oldest keeps this to a few lines — the cost of a miss is one compile.
+const RULE_CACHE_MAX: usize = 64;
+
+fn rules_hash(rules: &[TextRule]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rules.len().hash(&mut hasher);
+    for rule in rules {
+        rule.pattern.hash(&mut hasher);
+        rule.flags.hash(&mut hasher);
+        rule.replacement.hash(&mut hasher);
+        rule.literal.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Compile `[{pattern, flags, replacement, literal}]` into one rewriter.
 ///
 /// An invalid rule is skipped rather than taking the relay down: a typo in the
 /// dashboard should cost that one rule, not every request.
-pub fn compile_text_rules(rules: &[TextRule]) -> Option<CompiledRules> {
+///
+/// The result is shared and cached; [`compile_text_rules_uncached`] is the
+/// compile itself, for the one caller that wants to measure it.
+pub fn compile_text_rules(rules: &[TextRule]) -> Option<Arc<CompiledRules>> {
+    // An empty rule set is the overwhelmingly common case and needs no cache
+    // entry, no hash and no lock.
+    if rules.iter().all(|r| r.pattern.is_empty()) {
+        return None;
+    }
+    let key = rules_hash(rules);
+
+    if let Some(bucket) = rule_cache().read().get(&key) {
+        if let Some((_, compiled)) = bucket.iter().find(|(stored, _)| stored == rules) {
+            return compiled.clone();
+        }
+    }
+
+    let compiled = compile_text_rules_uncached(rules).map(Arc::new);
+    let mut cache = rule_cache().write();
+    if cache.len() >= RULE_CACHE_MAX {
+        cache.clear();
+    }
+    let bucket = cache.entry(key).or_default();
+    if !bucket.iter().any(|(stored, _)| stored == rules) {
+        bucket.push((rules.to_vec(), compiled.clone()));
+    }
+    compiled
+}
+
+pub fn compile_text_rules_uncached(rules: &[TextRule]) -> Option<CompiledRules> {
     let mut compiled = Vec::new();
     for rule in rules {
         if rule.pattern.is_empty() {
@@ -357,7 +428,10 @@ fn rewrite_message(msg: &Value, rules: &CompiledRules) -> Value {
     };
     match map.get("content").cloned() {
         Some(Value::String(text)) => {
-            map.insert("content".into(), Value::String(rules.apply(&text)));
+            map.insert(
+                "content".into(),
+                Value::String(rules.apply(&text).into_owned()),
+            );
         }
         Some(Value::Array(parts)) => {
             let parts: Vec<Value> = parts
@@ -367,7 +441,7 @@ fn rewrite_message(msg: &Value, rules: &CompiledRules) -> Value {
                         if let Some(obj) = p.as_object_mut() {
                             let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
                             let rewritten = rules.apply(text);
-                            obj.insert("text".into(), Value::String(rewritten));
+                            obj.insert("text".into(), Value::String(rewritten.into_owned()));
                         }
                     }
                     p
@@ -510,7 +584,7 @@ pub fn transform_response(
                     if let Some(Value::String(text)) = choice.get("text") {
                         out.insert(
                             "text".into(),
-                            Value::String(apply_text(text, transform, &rules)),
+                            Value::String(apply_text(text, transform, &rules).into_owned()),
                         );
                     }
                     let finish_reason = finish_reason_of(choice);
@@ -541,7 +615,7 @@ pub fn transform_response(
 fn transform_message(
     message: &Map<String, Value>,
     transform: &ResolvedResponseTransform,
-    rules: &Option<CompiledRules>,
+    rules: &Option<Arc<CompiledRules>>,
 ) -> Value {
     let mut m = only(message, &MESSAGE_KEYS);
     m.entry("role".to_string())
@@ -585,26 +659,32 @@ fn transform_message(
     if let Some(Value::String(content)) = m.get("content").cloned() {
         m.insert(
             "content".into(),
-            Value::String(apply_text(&content, transform, rules)),
+            Value::String(apply_text(&content, transform, rules).into_owned()),
         );
     }
     Value::Object(m)
 }
 
-fn apply_text(
-    text: &str,
+/// Rewrite one piece of text and wrap it in the route's prefix and suffix.
+///
+/// Borrowed all the way through when there is nothing to do — no rules, no
+/// prefix, no suffix — which is what the great majority of routes look like.
+fn apply_text<'a>(
+    text: &'a str,
     transform: &ResolvedResponseTransform,
-    rules: &Option<CompiledRules>,
-) -> String {
-    let mut out = match rules {
+    rules: &Option<Arc<CompiledRules>>,
+) -> Cow<'a, str> {
+    let rewritten = match rules {
         Some(r) => r.apply(text),
-        None => text.to_string(),
+        None => Cow::Borrowed(text),
     };
-    if !transform.prefix.is_empty() {
-        out.insert_str(0, &transform.prefix);
+    if transform.prefix.is_empty() && transform.suffix.is_empty() {
+        return rewritten;
     }
-    out.push_str(&transform.suffix);
-    out
+    Cow::Owned(format!(
+        "{}{rewritten}{}",
+        transform.prefix, transform.suffix
+    ))
 }
 
 /// Carries the open/closed state of an inlined reasoning block across chunks.
@@ -782,6 +862,53 @@ pub fn collect_tool_calls(map: &mut Map<String, Value>, deltas: &[Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compiling the same rules twice must hand back the same object, because
+    /// the whole point is that a request does not pay for a regex build that
+    /// has already happened. Different rules must not collide with them.
+    #[test]
+    fn a_rule_set_is_compiled_once_and_then_shared() {
+        let rules = |pattern: &str| {
+            vec![TextRule {
+                pattern: pattern.into(),
+                flags: Some("gi".into()),
+                replacement: "Writer".into(),
+                literal: false,
+            }]
+        };
+
+        let first = compile_text_rules(&rules("DeepSeek")).expect("compiles");
+        let again = compile_text_rules(&rules("DeepSeek")).expect("compiles");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the second call rebuilt the same rules"
+        );
+
+        let other = compile_text_rules(&rules("Qwen")).expect("compiles");
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(first.apply("ask DeepSeek"), "ask Writer");
+        assert_eq!(other.apply("ask DeepSeek"), "ask DeepSeek");
+
+        // A rule set that compiles to nothing is remembered as nothing rather
+        // than retried on every request.
+        assert!(compile_text_rules(&[]).is_none());
+        assert!(compile_text_rules(&rules("")).is_none());
+    }
+
+    /// Text no rule touches comes back borrowed, not copied.
+    #[test]
+    fn text_that_matches_nothing_is_not_copied() {
+        let rules = compile_text_rules(&[TextRule {
+            pattern: "DeepSeek".into(),
+            replacement: "Writer".into(),
+            ..Default::default()
+        }])
+        .expect("compiles");
+
+        let untouched = "nothing here matches";
+        assert!(matches!(rules.apply(untouched), Cow::Borrowed(_)));
+        assert!(matches!(rules.apply("ask DeepSeek"), Cow::Owned(_)));
+    }
     use crate::config::{Backend, ResponseTransform, SystemPrompt};
 
     fn identity(model: &str) -> Identity {
