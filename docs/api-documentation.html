@@ -232,11 +232,12 @@ the same handler, so neither setup is wrong.</p>
 <p>Every endpoint except <code>/health</code> and CORS preflight takes your API key as a bearer
 token:</p>
 
-<pre><code>Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</code></pre>
+<pre><code>Authorization: Bearer Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx</code></pre>
 
-<p>Keys are the literal prefix <code>Kunci-Zeiko-</code> followed by 32 characters mixing digits,
-lower case, upper case and symbols. A key sent bare, with no <code>Bearer</code> scheme in front of
-it, is also accepted, because some clients send it that way.</p>
+<p>Keys are the literal prefix <code>Kunci-Zeiko-</code> followed by a version-4 UUID, so a key is
+only ever hex digits and hyphens and can be pasted anywhere without being mangled. A key sent bare,
+with no <code>Bearer</code> scheme in front of it, is also accepted, because some clients send it
+that way.</p>
 
 <p>Your key is issued to you directly. Keep it server-side: anyone holding it can spend against
 your account. If you believe it has been exposed, ask us for a replacement and the old one stops
@@ -483,7 +484,7 @@ and every frame ends with a blank line.)</p>
 <code>/v1/models/{id}</code> returns a single entry.</p>
 
 <pre><code>curl https://ai.zeiko.biz.id/v1/models \
-  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</code></pre>
+  -H "Authorization: Bearer Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"</code></pre>
 
 <h3>Before you call it</h3>
 
@@ -644,7 +645,7 @@ part of your agreement with us. Ask if you need them raised.</p>
 
 <h3>Streaming, curl</h3>
 <pre><code>curl -N https://ai.zeiko.biz.id/v1/chat/completions \
-  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" \
+  -H "Authorization: Bearer Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Wissangeni-512B-V1",
@@ -658,7 +659,7 @@ part of your agreement with us. Ask if you need them raised.</p>
 
 client = OpenAI(
     base_url="https://ai.zeiko.biz.id/v1",
-    api_key="Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    api_key="Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx",
 )
 
 reply = client.chat.completions.create(
@@ -697,7 +698,7 @@ print("\n", usage)</code></pre>
 <pre class="long"><code>const res = await fetch("https://ai.zeiko.biz.id/v1/chat/completions", {
   method: "POST",
   headers: {
-    "Authorization": "Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "Authorization": "Bearer Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx",
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
@@ -740,7 +741,7 @@ while (true) {
 
 <h3>Listing models</h3>
 <pre><code>curl https://ai.zeiko.biz.id/v1/models \
-  -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</code></pre>
+  -H "Authorization: Bearer Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"</code></pre>
 
 <div class="note" style="margin-top:8mm;">
 <p><strong>Support.</strong> Every response carries an <code>X-Request-Id</code> header, repeated as
