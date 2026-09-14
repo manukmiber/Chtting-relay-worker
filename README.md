@@ -804,6 +804,20 @@ Yang perlu diketahui:
 
 - Invoice tidak bisa dibatalkan penerbitannya. **Void** menandainya batal dan
   mengembalikan periodenya, jadi invoice berikutnya menagih dua periode.
+- **Hanya invoice terbaru yang boleh di-void.** Periode itu rentang `seq`, dan
+  awal periode berikutnya dibaca dari invoice terbaru yang masih berlaku.
+  Kalau yang di tengah di-void, rentangnya tidak tercakup siapa pun — tidak
+  ditagih, tidak muncul sebagai belum-ditagih, uangnya hilang begitu saja dari
+  pembukuan. Void dari yang terbaru dulu, baru yang sebelumnya, lalu terbitkan
+  ulang; penolakannya menyebutkan invoice mana yang harus di-void duluan.
+- **Tidak ada kolom `paid` di tiap request.** Baris mana masuk invoice mana
+  dihitung saat dibaca — satu invoice mencakup rentang `seq`, dan satu key
+  punya puluhan invoice berbanding jutaan baris, jadi join-nya kecil. Menulis
+  jawabannya ke tiap baris berarti menulis ulang semua baris belum-ditagih tiap
+  kali invoice terbit: di ratusan ribu request per minggu itu jutaan baris,
+  ditulis ulang persis saat relay sedang mencatat trafik yang jalan — antrean
+  writer-nya yang jebol duluan. Tab Usage tetap menampilkan nomor invoice dan
+  status `unbilled` / `issued` / `paid` per baris.
 - Request yang masih jalan saat invoice terbit masuk ke invoice berikutnya.
   Harganya baru diketahui saat jawabannya selesai, dan memang belum ditagih.
 - `billing.minimumUsd` **menahan** periode kecil supaya tetap terbuka, bukan

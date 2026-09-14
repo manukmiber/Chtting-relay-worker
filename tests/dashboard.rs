@@ -1066,3 +1066,128 @@ async fn the_billing_routes_need_a_session_too() {
     d.post("/api/login", json!({"password": "hunter2"})).await;
     assert_eq!(d.get("/api/invoices").await.status(), 200);
 }
+
+/// A ledger row says which invoice covers it — worked out on read, so issuing
+/// an invoice never has to write to the rows it bills.
+#[tokio::test]
+async fn a_ledger_row_says_which_invoice_it_is_billed_on() {
+    let d = Dash::start(|cfg| {
+        cfg.pricing.enabled = true;
+        cfg.pricing.input_usd_per_m = 30.0;
+        cfg.pricing.output_usd_per_m = 60.0;
+    })
+    .await;
+
+    d.relay_call().await;
+    d.relay.state.store.flush().await;
+
+    // Before any invoice, every row is unbilled and says so.
+    let rows = d.get_json("/api/usage/ledger?limit=50").await;
+    let rows = rows.as_array().unwrap();
+    assert!(!rows.is_empty());
+    for row in rows {
+        assert!(row["invoiceNumber"].is_null());
+        assert_eq!(row["billingStatus"], "unbilled");
+    }
+
+    let issued: Value = d
+        .post("/api/invoices", json!({"keyId": "key_test"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let number = issued["invoice"]["number"].as_str().unwrap().to_string();
+    let id = issued["invoice"]["id"].as_str().unwrap().to_string();
+
+    // The same rows now name the invoice, with nothing written to them.
+    let rows = d.get_json("/api/usage/ledger?limit=50").await;
+    for row in rows.as_array().unwrap() {
+        assert_eq!(row["invoiceNumber"], number.as_str());
+        assert_eq!(row["billingStatus"], "issued");
+    }
+
+    // Marking it paid moves what the rows report, still without touching them.
+    d.post(
+        &format!("/api/invoices/{id}/status"),
+        json!({"status": "paid"}),
+    )
+    .await;
+    let rows = d.get_json("/api/usage/ledger?limit=50").await;
+    assert_eq!(rows.as_array().unwrap()[0]["billingStatus"], "paid");
+
+    // A row after the invoice belongs to the open period again.
+    d.relay_call().await;
+    d.relay.state.store.flush().await;
+    let rows = d.get_json("/api/usage/ledger?limit=50").await;
+    assert_eq!(rows.as_array().unwrap()[0]["billingStatus"], "unbilled");
+
+    // And the ledger is still append-only after all of that.
+    assert_eq!(d.get_json("/api/usage/verify").await["ok"], true);
+}
+
+/// Voiding out of order is refused over the API too, with a message that says
+/// what to void first rather than a bare 400.
+#[tokio::test]
+async fn the_api_refuses_to_void_an_invoice_that_is_not_the_newest() {
+    let d = Dash::start(|cfg| {
+        cfg.pricing.enabled = true;
+        cfg.pricing.input_usd_per_m = 30.0;
+        cfg.pricing.output_usd_per_m = 60.0;
+    })
+    .await;
+
+    let mut invoices = Vec::new();
+    for _ in 0..2 {
+        d.relay_call().await;
+        d.relay.state.store.flush().await;
+        let issued: Value = d
+            .post("/api/invoices", json!({"keyId": "key_test"}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        invoices.push(issued["invoice"].clone());
+    }
+
+    let older = invoices[0]["id"].as_str().unwrap();
+    let newer_number = invoices[1]["number"].as_str().unwrap();
+
+    let refused = d
+        .post(
+            &format!("/api/invoices/{older}/status"),
+            json!({"status": "void"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 400);
+    let body: Value = refused.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(newer_number),
+        "the refusal should name what to void first, got: {message}"
+    );
+
+    // Newest first works, and then the older one does too.
+    let newer = invoices[1]["id"].as_str().unwrap();
+    assert_eq!(
+        d.post(
+            &format!("/api/invoices/{newer}/status"),
+            json!({"status": "void"})
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        d.post(
+            &format!("/api/invoices/{older}/status"),
+            json!({"status": "void"})
+        )
+        .await
+        .status(),
+        200
+    );
+
+    // Both periods are billable again — nothing was lost on the way.
+    let usage = d.get_json("/api/keys/key_test/usage").await;
+    assert_eq!(usage["current"]["requests"], 2);
+}

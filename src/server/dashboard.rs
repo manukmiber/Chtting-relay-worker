@@ -1129,11 +1129,24 @@ async fn usage_ledger(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQ
         .store
         .read(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT seq, request_id, phase, ts, day, key_id, public_model, status,
-                        requests, input_tokens, billed_input_tokens, output_tokens,
-                        cached_tokens, cache_hit, ttft_ms, gen_ms, total_ms, queued_ms,
-                        tokens_per_sec, row_hash, user_id, key_kind, proxy_usd, backend_usd
-                 FROM usage_ledger ORDER BY seq DESC LIMIT ?1",
+                // Which invoice a row is on is derived here rather than stored
+                // on the row. Storing it would mean an UPDATE across every
+                // unbilled row of a key each time an invoice is issued — at
+                // this relay's volumes, millions of rows rewritten while the
+                // writer is trying to record live traffic. A key has dozens of
+                // invoices, not millions, so the join is small; and it is done
+                // over the page being shown, never the whole history.
+                "SELECT l.seq, l.request_id, l.phase, l.ts, l.day, l.key_id, l.public_model,
+                        l.status, l.requests, l.input_tokens, l.billed_input_tokens,
+                        l.output_tokens, l.cached_tokens, l.cache_hit, l.ttft_ms, l.gen_ms,
+                        l.total_ms, l.queued_ms, l.tokens_per_sec, l.row_hash, l.user_id,
+                        l.key_kind, l.proxy_usd, l.backend_usd,
+                        i.number, i.status
+                 FROM (SELECT * FROM usage_ledger ORDER BY seq DESC LIMIT ?1) AS l
+                 LEFT JOIN invoices i
+                        ON i.key_id = l.key_id AND i.status != 'void'
+                       AND l.seq > i.from_seq AND l.seq <= i.to_seq
+                 ORDER BY l.seq DESC",
             )?;
             let rows: Vec<Value> = stmt
                 .query_map([limit], |r| {
@@ -1164,6 +1177,11 @@ async fn usage_ledger(State(dash): State<Arc<Dashboard>>, Query(q): Query<RangeQ
                         "keyKind": r.get::<_, String>(21)?,
                         "proxyUsd": round(r.get::<_, f64>(22)?, 9),
                         "backendUsd": round(r.get::<_, f64>(23)?, 9),
+                        // Null until an invoice covers this row, which is
+                        // exactly what "unbilled" means.
+                        "invoiceNumber": r.get::<_, Option<String>>(24)?,
+                        "billingStatus": r.get::<_, Option<String>>(25)?
+                            .unwrap_or_else(|| "unbilled".into()),
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
