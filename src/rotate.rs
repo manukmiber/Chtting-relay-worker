@@ -64,6 +64,11 @@ fn tunnel_lock(state: &AppState) -> PathBuf {
     run_dir(state).join("tunnel.lock")
 }
 
+/// The pidfile naming the instance that owns the listening sockets.
+fn serve_lock(state: &AppState) -> PathBuf {
+    run_dir(state).join("serving.pid")
+}
+
 /// This process's generation, from the environment. 0 for one started by hand.
 pub fn generation() -> u64 {
     std::env::var(GENERATION_ENV)
@@ -89,6 +94,80 @@ pub async fn announce_ready(state: &Arc<AppState>) {
             .logger
             .warn(format!("could not write the readiness marker: {err}"));
     }
+}
+
+/// Refuse to become a second relay on ports that already have one.
+///
+/// `SO_REUSEPORT` is what makes the rotation in this module possible, and it is
+/// also why nothing else catches this: the bind *succeeds*. Two instances then
+/// listen on the same port and the kernel hands each new connection to one of
+/// them at random, so the relay answers out of whichever config that process
+/// happens to hold. A key minted in one of them is unknown to the other, and
+/// the caller sees `invalid API key` on a fraction of requests exactly equal to
+/// the stale instance's share of the sockets.
+///
+/// A rotation is the one case where two instances on one port is correct, and
+/// it is told apart by its generation: a successor is spawned with one and
+/// takes the lock over, because the predecessor is on its way out. Anything
+/// started by hand is generation 0 and has to say so with `--replace`.
+///
+/// The lock is advisory and deliberately cheap to recover from: a pid that no
+/// longer exists, or one that has been recycled by an unrelated process, does
+/// not hold anything.
+pub async fn claim_serving(state: &Arc<AppState>, replace: bool) -> Result<()> {
+    let lock = serve_lock(state);
+    if let Some(dir) = lock.parent() {
+        let _ = tokio::fs::create_dir_all(dir).await;
+    }
+
+    if generation() == 0 && !replace {
+        if let Some(pid) = live_owner(&lock).await.filter(|p| is_this_relay(*p)) {
+            bail!(
+                "this relay is already running as pid {pid}.\n\
+                 Starting a second copy would not fail on the port — SO_REUSEPORT lets \
+                 both bind it — it would split the traffic between them, and the older \
+                 process would answer out of the config it started with. That is what \
+                 makes a freshly minted key come back \"invalid API key\" on some \
+                 requests and work on others.\n\
+                 Stop pid {pid} first, or pass --replace to take the port over."
+            );
+        }
+    }
+
+    tokio::fs::write(&lock, std::process::id().to_string()).await?;
+    Ok(())
+}
+
+/// Give the serve lock up, but only if it is still ours: a successor that
+/// already took over must not have its claim deleted by the instance it
+/// replaced.
+pub async fn release_serving(state: &Arc<AppState>) {
+    let lock = serve_lock(state);
+    if let Ok(owner) = tokio::fs::read_to_string(&lock).await {
+        if owner.trim() == std::process::id().to_string() {
+            let _ = tokio::fs::remove_file(&lock).await;
+        }
+    }
+}
+
+/// Is this pid one of ours, or a number Linux has since handed to something
+/// else? Refusing to start because an unrelated process inherited the pid
+/// would be a worse failure than the duplicate this is guarding against.
+fn is_this_relay(pid: u32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    // /proc separates argv with NULs; argv[0] is the path the binary was run
+    // from, which may be absolute, relative, or a bare name.
+    cmdline
+        .split(|b| *b == 0)
+        .next()
+        .and_then(|argv0| std::str::from_utf8(argv0).ok())
+        .is_some_and(|argv0| {
+            std::path::Path::new(argv0)
+                .file_name()
+                .is_some_and(|n| n == env!("CARGO_PKG_NAME"))
+        })
 }
 
 /// Take the tunnel lock, waiting a bounded time for a predecessor to drop it.
@@ -132,19 +211,21 @@ pub async fn release_tunnel(state: &Arc<AppState>) {
 /// that waited on a dead process's lock would wait the full ninety seconds for
 /// nothing.
 async fn held_by_a_live_process(lock: &Path) -> bool {
-    let Ok(contents) = tokio::fs::read_to_string(lock).await else {
-        return false;
-    };
-    let Ok(pid) = contents.trim().parse::<u32>() else {
-        return false;
-    };
+    live_owner(lock).await.is_some()
+}
+
+/// The pid in a lock file, if it is not ours and still exists.
+async fn live_owner(lock: &Path) -> Option<u32> {
+    let contents = tokio::fs::read_to_string(lock).await.ok()?;
+    let pid: u32 = contents.trim().parse().ok()?;
     if pid == std::process::id() {
-        return false;
+        return None;
     }
     // No kill(0) without libc; /proc answers the same question on Android.
     tokio::fs::try_exists(format!("/proc/{pid}"))
         .await
         .unwrap_or(false)
+        .then_some(pid)
 }
 
 /// Delete markers left by instances that are long gone.
@@ -276,6 +357,38 @@ mod tests {
         // Garbage rather than a pid.
         tokio::fs::write(&lock, "not a pid").await.unwrap();
         assert!(!held_by_a_live_process(&lock).await);
+    }
+
+    #[tokio::test]
+    async fn a_serve_lock_names_its_owner_only_while_that_owner_lives() {
+        let dir = std::env::temp_dir().join(crate::util::new_id("rot"));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let lock = dir.join("serving.pid");
+
+        // A pid that cannot exist: Linux caps at 2^22 and this is past it.
+        tokio::fs::write(&lock, "4194305").await.unwrap();
+        assert_eq!(live_owner(&lock).await, None, "a dead claim holds nothing");
+
+        tokio::fs::write(&lock, std::process::id().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            live_owner(&lock).await,
+            None,
+            "our own claim is not somebody else holding the port"
+        );
+
+        tokio::fs::remove_file(&lock).await.unwrap();
+        assert_eq!(live_owner(&lock).await, None, "nor is no file at all");
+    }
+
+    #[test]
+    fn a_pid_that_belongs_to_something_else_does_not_block_a_start() {
+        // pid 1 exists on every Linux box and is never this binary. Refusing to
+        // start because an unrelated process inherited a recycled pid would be
+        // a worse failure than the duplicate instance being guarded against.
+        assert!(!is_this_relay(1));
+        assert!(!is_this_relay(4_194_305), "and one that cannot exist");
     }
 
     #[test]

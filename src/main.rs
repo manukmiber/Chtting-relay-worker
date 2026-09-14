@@ -40,6 +40,10 @@ enum Command {
         /// Do not start the dashboard.
         #[arg(long)]
         no_dashboard: bool,
+        /// Start even though another copy is already serving, and take the
+        /// ports over from it. Without this a duplicate is refused.
+        #[arg(long)]
+        replace: bool,
     },
     /// Check the install and print what is and is not ready.
     Doctor,
@@ -183,8 +187,13 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
     match cli.command.unwrap_or(Command::Start {
         port: None,
         no_dashboard: false,
+        replace: false,
     }) {
-        Command::Start { port, no_dashboard } => start(paths, port, no_dashboard).await,
+        Command::Start {
+            port,
+            no_dashboard,
+            replace,
+        } => start(paths, port, no_dashboard, replace).await,
         Command::Doctor => doctor(paths).await,
         Command::Setup {
             no_service,
@@ -201,7 +210,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
 
 /* -------------------------------------------------------------- start -- */
 
-async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()> {
+async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: bool) -> Result<()> {
     // A console logger first, so config problems are reported before the
     // file logger's destination is even known.
     let boot = Logger::console(Level::Info);
@@ -258,12 +267,21 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
         ));
     }
 
+    // Before anything binds: a second instance would not be refused by the
+    // kernel, because SO_REUSEPORT is what the rotation above depends on. It
+    // would quietly serve half the traffic out of its own config instead.
+    // A duplicate is an operator mistake with a known remedy, not a crash, so
+    // it is reported the way every other startup message is and exits quietly.
+    if let Err(err) = rotate::claim_serving(&state, replace).await {
+        logger.error(err.to_string());
+        std::process::exit(1);
+    }
+
     // The public, tunnel-facing server. `retire` is what stops it accepting
     // without dropping the requests it already has.
     let relay_addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
-    let relay = listen(relay_addr).map_err(|err| {
-        anyhow::anyhow!("cannot bind {relay_addr}: {err} — is another copy already running?")
-    })?;
+    let relay =
+        listen(relay_addr).map_err(|err| anyhow::anyhow!("cannot bind {relay_addr}: {err}"))?;
     let relay_bound = relay.local_addr()?;
     logger.info(format!("relay listening on http://{relay_bound}"));
 
@@ -361,6 +379,7 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool) -> Result<()
         _ = shutdown_signal() => {
             logger.info("shutting down");
             let _ = retire.send(true);
+            rotate::release_serving(&state).await;
             rotate::release_tunnel(&state).await;
             let _ = state.tunnel.stop().await;
             state.host.release_wake_lock().await;
@@ -480,6 +499,9 @@ fn rotate_on_a_clock(state: Arc<AppState>, retire: tokio::sync::watch::Sender<bo
             // The successor is waiting on this before starting its cloudflared.
             let _ = state.tunnel.stop().await;
             rotate::release_tunnel(&state).await;
+            // A successor that is already up owns the lock by now, so this
+            // only fires when the handover never happened.
+            rotate::release_serving(&state).await;
             state.store.flush().await;
             state.logger.info("retired");
             std::process::exit(0);

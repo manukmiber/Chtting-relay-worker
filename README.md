@@ -114,6 +114,20 @@ menerima koneksi dan menyelesaikan request yang masih jalan.
   baru                │ bind │████████████ melayani ████████████ …
 ```
 
+Yang bikin serah terima ini mulus juga bikin satu jebakan: karena
+`SO_REUSEPORT`, **bind ke port yang sudah dipakai itu berhasil, bukan gagal**.
+Dua relay yang dijalankan sendiri-sendiri akan sama-sama mendengarkan di port
+yang sama, dan kernel membagi koneksi baru ke salah satunya secara acak. Yang
+lama menjawab pakai config yang ia pegang sejak start — jadi key yang baru
+dibuat lewat dashboard tidak dikenal olehnya, dan pemanggil melihat
+`invalid API key` di sebagian request dan sukses di sebagian lain.
+
+Makanya `start` menulis `data/run/serving.pid` dan menolak jalan kalau pid di
+situ masih hidup dan masih relay ini. Rotasi dikecualikan — successor-nya punya
+nomor generasi, jadi tumpang tindihnya memang disengaja. Yang dijalankan
+manual tidak punya itu dan harus bilang `--replace` kalau memang mau
+mengambil alih port-nya.
+
 Tidak ada request yang putus dan tidak ada koneksi yang ditolak, karena selalu
 ada yang mendengarkan. Kalau salinan barunya gagal naik, yang lama jalan terus
 seperti biasa dan mencoba lagi jam berikutnya. Atur di **Settings → Staying
@@ -202,6 +216,39 @@ Diverifikasi lewat test terhadap fixture yang dibuat pakai `tiktoken` dan
 `tokenizers` Python asli — jalankan `cargo test`.
 
 **Vocabulary OpenAI tidak perlu diunduh sama sekali**; ikut di dalam binary.
+
+### Menghitung ulang yang sudah pernah dihitung
+
+Klien chat mengirim ulang seluruh transkrip tiap giliran: giliran ke-N membawa
+semua pesan giliran ke-(N-1) persis byte per byte, plus satu pesan baru.
+Encoding adalah bagian mahal dari menghitung — puluhan milidetik begitu satu
+scene roleplay memanjang — dan hampir semuanya adalah pekerjaan yang sudah
+pernah dikerjakan proses ini.
+
+Jadi tiap vocabulary mengingat jumlah token per potongan teks, dikunci dengan
+SHA-256. Hash-nya sengaja kriptografis, bukan hash cepat: nilainya menentukan
+tagihan, jadi tabrakan bukan cuma jalur lambat melainkan invoice yang salah —
+dan hashing tetap sekitar tiga orde lebih murah daripada BPE-nya sendiri.
+
+Batasnya per generasi, bukan LRU (yang butuh write lock tiap *baca*): begitu
+map panas penuh ia jadi map dingin dan map baru menggantikan. Memori berhenti
+di dua generasi, dan percakapan yang masih hidup naik lagi ke map panas pada
+lookup berikutnya. Ingatannya ikut mati bersama encoder-nya, jadi vocabulary
+yang dimuat ulang tidak pernah mewarisi hitungan vocabulary lama.
+
+Diukur pada transkrip yang tumbuh satu pertukaran per giliran (cl100k, x86):
+
+| pesan | token | tanpa ingatan | dengan ingatan |
+|------:|------:|--------------:|---------------:|
+| 41 | 3 328 | 2,75 ms | 0,20 ms |
+| 121 | 9 128 | 6,66 ms | 0,39 ms |
+| 201 | 14 928 | 10,30 ms | 0,70 ms |
+| 281 | 20 728 | 14,63 ms | 0,76 ms |
+
+Angkanya sendiri tergantung mesin dan vocabulary; yang bisa dipegang adalah
+bentuknya — biaya per giliran berhenti tumbuh mengikuti panjang percakapan dan
+mengikuti panjang pesan baru saja. Jalankan sendiri dengan
+`cargo test --release -- --ignored --nocapture growing_roleplay`.
 
 ### Pasang vocabulary model terbuka
 
@@ -533,6 +580,13 @@ menggantikan hitungan tokennya:
 Penolakan dikenali dari jawabannya sendiri — penolakan itu `200` yang sukses,
 bukan error — dengan mencocokkan kalimat di `refusalPhrases` di mana pun di
 dalam jawaban, tanpa peduli huruf besar-kecil atau di mana barisnya dipotong.
+Yang dicocokkan cuma bagian yang **diucapkan**: blok `<think>...</think>` yang
+sebagian backend kirim sebagai `content` biasa dibuang dulu, karena penalaran
+model rutin mengutip kalimat penolakan justru waktu ia memutuskan *tidak*
+menolak — dan membacanya sebagai jawaban berarti menagih request yang dilayani
+dengan harga penolakan. Penekanan markdown juga diabaikan, jadi
+`**I cannot do that.** I only provide AI roleplay.` tetap terbaca sebagai
+penolakan.
 Barisnya tetap membawa `backend_usd` apa adanya, jadi ongkos mengatakan tidak
 kelihatan sebagai rugi, bukan hilang dari pembukuan. `price_tiers` di baris itu
 berbunyi `refusal`.
@@ -942,7 +996,7 @@ Semua ini juga ada di tab **Setup** dashboard. CLI-nya dipertahankan buat
 scripting dan buat kalau dashboard-nya sendiri yang bermasalah.
 
 ```
-chtting-relay start [--port N] [--no-dashboard]
+chtting-relay start [--port N] [--no-dashboard] [--replace]
 chtting-relay setup                     keeper + shortcut + hook boot
 chtting-relay doctor                    periksa lingkungan dan konfigurasi
 chtting-relay config path|show

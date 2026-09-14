@@ -16,6 +16,8 @@
 
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,17 +81,94 @@ impl Inner {
     }
 }
 
+/// How many distinct strings one vocabulary remembers the count of.
+///
+/// Two maps of this size is the ceiling, so roughly half a megabyte for a
+/// 4096-entry generation — small next to the tens of milliseconds it saves,
+/// and small next to the 30-55 MB the relay already occupies.
+const MEMO_CAP: usize = 4096;
+
+/// Token counts this process has already paid for.
+///
+/// A chat client resends the whole transcript every turn: turn N carries every
+/// message of turn N-1 byte for byte, plus one more. Encoding is the expensive
+/// half of counting — tens of milliseconds once a roleplay scene is long — and
+/// all but the newest message of it is work already done once.
+///
+/// Keyed by SHA-256 rather than by a fast hash on purpose. The value decides
+/// what a caller is billed, so a collision would not be a slow path, it would
+/// be a wrong invoice; 256 bits puts that out of reach, and hashing runs some
+/// three orders of magnitude faster than BPE, so the key costs far less than
+/// the answer it stands in for.
+///
+/// Bounded by generation rather than by LRU bookkeeping, which would need a
+/// write lock on every *read*: when the hot map fills it becomes the cold one
+/// and a fresh map takes over. Memory is capped at twice [`MEMO_CAP`], and a
+/// conversation that is still live is promoted back on its next lookup.
+#[derive(Default)]
+struct Memo {
+    state: RwLock<MemoState>,
+}
+
+#[derive(Default)]
+struct MemoState {
+    hot: FxHashMap<[u8; 32], u32>,
+    cold: FxHashMap<[u8; 32], u32>,
+}
+
+impl Memo {
+    fn digest(text: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        hasher.finalize().into()
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<u32> {
+        // The read guard is dropped before `insert` takes the write lock:
+        // `parking_lot`'s RwLock is not reentrant, and promoting under a read
+        // guard would deadlock the thread against itself.
+        let promoted = {
+            let state = self.state.read();
+            if let Some(hit) = state.hot.get(key) {
+                return Some(*hit);
+            }
+            state.cold.get(key).copied()
+        };
+        if let Some(count) = promoted {
+            self.insert(*key, count);
+        }
+        promoted
+    }
+
+    fn insert(&self, key: [u8; 32], count: u32) {
+        let mut state = self.state.write();
+        if state.hot.len() >= MEMO_CAP {
+            state.cold = std::mem::take(&mut state.hot);
+        }
+        state.hot.insert(key, count);
+    }
+}
+
 pub struct Encoder {
     name: String,
     inner: Inner,
+    /// Per-vocabulary, because the same string counts differently under a
+    /// different one. Dropped with the encoder, so reloading a vocabulary
+    /// cannot leave counts from the old one behind.
+    memo: Memo,
 }
 
 impl Encoder {
-    pub fn estimator() -> Self {
+    fn new(name: impl Into<String>, inner: Inner) -> Self {
         Self {
-            name: "estimate".into(),
-            inner: Inner::Estimate,
+            name: name.into(),
+            inner,
+            memo: Memo::default(),
         }
+    }
+
+    pub fn estimator() -> Self {
+        Self::new("estimate", Inner::Estimate)
     }
 
     pub fn name(&self) -> &str {
@@ -131,6 +210,23 @@ impl Encoder {
         if text.is_empty() {
             return 0;
         }
+        // The estimator is arithmetic over the bytes it was handed; hashing
+        // them to look the answer up would cost more than working it out.
+        if matches!(self.inner, Inner::Estimate) {
+            return estimate(text);
+        }
+        let key = Memo::digest(text);
+        if let Some(hit) = self.memo.get(&key) {
+            return hit as usize;
+        }
+        let count = self.encode_len(text);
+        self.memo.insert(key, count as u32);
+        count
+    }
+
+    /// The encode itself, with nothing remembered. Every caller should go
+    /// through [`Encoder::count`] instead.
+    fn encode_len(&self, text: &str) -> usize {
         match &self.inner {
             Inner::Builtin(bpe) => bpe.encode_ordinary(text).len(),
             Inner::Loaded(bpe) => bpe.encode_ordinary(text).len(),
@@ -458,10 +554,7 @@ fn load(dir: &Path, name: &str) -> Result<Encoder> {
         if path.exists() {
             let tk = tokenizers::Tokenizer::from_file(&path)
                 .map_err(|e| anyhow!("{}: {e}", path.display()))?;
-            return Ok(Encoder {
-                name: name.to_string(),
-                inner: Inner::Hf(Box::new(tk)),
-            });
+            return Ok(Encoder::new(name, Inner::Hf(Box::new(tk))));
         }
     }
 
@@ -470,10 +563,7 @@ fn load(dir: &Path, name: &str) -> Result<Encoder> {
 
 /// An encoder for a vocabulary compiled into the binary, without touching disk.
 pub fn builtin_encoder(name: &str) -> Option<Encoder> {
-    builtin(name).map(|bpe| Encoder {
-        name: name.to_string(),
-        inner: Inner::Builtin(bpe),
-    })
+    builtin(name).map(|bpe| Encoder::new(name, Inner::Builtin(bpe)))
 }
 
 fn builtin(name: &str) -> Option<&'static CoreBPE> {
@@ -532,10 +622,7 @@ fn load_tiktoken_file(name: &str, path: &Path) -> Result<Encoder> {
     };
     let bpe = CoreBPE::new(ranks, rustc_hash::FxHashMap::default(), pattern)
         .map_err(|e| anyhow!("{}: {e}", path.display()))?;
-    Ok(Encoder {
-        name: name.to_string(),
-        inner: Inner::Loaded(Box::new(bpe)),
-    })
+    Ok(Encoder::new(name, Inner::Loaded(Box::new(bpe))))
 }
 
 /// Rules a route may override; kept next to the rule matching it drives.

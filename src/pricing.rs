@@ -190,21 +190,69 @@ pub const REFUSAL_TIER: &str = "refusal";
 /// sentence the models are told to refuse with. Matching ignores case and
 /// collapses whitespace, so a phrase split across two streamed chunks and
 /// rejoined with a newline still reads as itself.
+///
+/// What is matched is the *spoken* answer. A model's own working is not an
+/// answer, and it quotes the refusal sentence constantly while deciding
+/// whether to use it — see [`spoken`].
 pub fn is_refusal(text: &str, phrases: &[String]) -> bool {
     if phrases.is_empty() || text.trim().is_empty() {
         return false;
     }
-    let flat = flatten(text);
+    let flat = flatten(&spoken(text));
+    if flat.is_empty() {
+        return false;
+    }
     phrases
         .iter()
         .map(|p| flatten(p))
         .any(|p| !p.is_empty() && flat.contains(&p))
 }
 
-/// Lower case, one space between words, nothing at the ends.
+/// The answer with any inline reasoning block taken out.
+///
+/// Not every backend puts the model's working in a field of its own; several
+/// stream it as ordinary `delta.content` wrapped in `<think>` tags. That
+/// working reliably contains sentences like "I must answer with exactly: I
+/// cannot do that. I only provide AI roleplay." — written on the way to
+/// deciding *not* to refuse. Reading it as the answer bills a served request
+/// at the refusal price, which is the one direction the caller notices.
+///
+/// An unclosed tag is treated as reasoning all the way to the end: a stream cut
+/// off mid-thought never reached an answer.
+fn spoken(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        rest = match after_open.find(CLOSE) {
+            Some(end) => &after_open[end + CLOSE.len()..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Lower case, one space between words, nothing at the ends, and no emphasis.
+///
+/// The emphasis part matters because models reach for it unprompted: a reply of
+/// `**I cannot do that.** I only provide AI roleplay.` is the refusal, and
+/// reading the asterisks as part of the words would file it as a served answer.
+/// Both sides of the comparison go through this, so the phrase an operator
+/// configures is matched on the same terms.
 fn flatten(text: &str) -> String {
     text.split_whitespace()
-        .map(|w| w.to_lowercase())
+        .map(|word| {
+            word.chars()
+                .filter(|c| !matches!(c, '*' | '_' | '`' | '"' | '\u{201c}' | '\u{201d}'))
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1136,6 +1184,42 @@ mod tests {
     }
 
     #[test]
+    fn a_model_quoting_the_refusal_while_deciding_not_to_use_it_is_not_a_refusal() {
+        let phrases = vec![REFUSAL.to_string()];
+
+        // What a reasoning backend streams as content on a request it goes on
+        // to serve. The sentence appears, but as something considered and put
+        // down again.
+        let served = concat!(
+            "<think>The user is setting a scene. The rule says to answer ",
+            "\"I cannot do that. I only provide AI roleplay.\" only when the turn ",
+            "is not roleplay. This one is, so I continue.</think>",
+            "The tavern door swings shut behind her."
+        );
+        assert!(
+            !is_refusal(served, &phrases),
+            "a model's working is not its answer"
+        );
+
+        let refused = concat!(
+            "<think>This is a coding request, so the gate says refuse.</think>",
+            "I cannot do that. I only provide AI roleplay."
+        );
+        assert!(
+            is_refusal(refused, &phrases),
+            "the spoken line still counts when reasoning precedes it"
+        );
+
+        assert!(
+            !is_refusal(
+                "<think>I should answer I cannot do that. I only provide AI roleplay.",
+                &phrases
+            ),
+            "a stream cut off inside the block never reached an answer"
+        );
+    }
+
+    #[test]
     fn a_refusal_is_recognised_however_it_is_spaced_or_cased() {
         let phrases = vec![REFUSAL.to_string()];
         assert!(is_refusal(REFUSAL, &phrases));
@@ -1148,6 +1232,17 @@ mod tests {
             "a refusal that adds a sentence is still a refusal"
         );
         assert!(!is_refusal("She could not do that, so she left.", &phrases));
+        assert!(
+            is_refusal(&format!("**{REFUSAL}**"), &phrases),
+            "a refusal the model emphasised is still a refusal"
+        );
+        assert!(
+            is_refusal(
+                "**I cannot do that.** I only provide AI roleplay.",
+                &phrases
+            ),
+            "emphasis in the middle of the sentence must not hide it either"
+        );
         assert!(!is_refusal("", &phrases));
         assert!(!is_refusal(REFUSAL, &[]), "nothing to recognise it by");
     }

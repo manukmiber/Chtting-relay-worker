@@ -77,7 +77,7 @@ pub fn profile(name: &str) -> Profile {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Breakdown {
     pub system: usize,
     pub user: usize,
@@ -487,6 +487,131 @@ mod tests {
     fn enc() -> Encoder {
         // Any exact vocabulary works; the assertions are about the accounting.
         builtin_encoder("cl100k_base").expect("cl100k is built in")
+    }
+
+    /// A transcript shaped like the ones the relay actually sees: a long
+    /// roleplay scene that grows by one exchange per turn.
+    fn conversation(system: &str, exchanges: usize) -> serde_json::Value {
+        let mut messages = vec![serde_json::json!({"role": "system", "content": system})];
+        for i in 0..exchanges {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "She turns the lantern down until the flame is a bead of orange, \
+                     and listens to the rain finding its way through the {i} gaps in \
+                     the roof. \"We should not have come this far north,\" she says, \
+                     and means something else entirely by it."
+                ),
+            }));
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": format!(
+                    "The floorboards answer before he does, a long complaint of old \
+                     timber settling under {i} winters of damp. He sets the kettle on \
+                     the hook and does not look at her. \"You said that in Varn, too,\" \
+                     he says. \"And in Ashkeep before it. One of these days I will ask \
+                     you what you are running from.\" Outside, the storm leans on the \
+                     shutters and finds them wanting."
+                ),
+            }));
+        }
+        serde_json::json!({ "messages": messages })
+    }
+
+    #[test]
+    fn remembering_a_count_never_changes_it() {
+        let encoder = enc();
+        let body = conversation("You are a roleplay model.", 40);
+
+        let first = count_chat_request(&body, &encoder, "openai", &ImageDefaults::default());
+        let second = count_chat_request(&body, &encoder, "openai", &ImageDefaults::default());
+        assert_eq!(
+            first.total, second.total,
+            "a remembered count is the same count"
+        );
+        assert_eq!(first.breakdown, second.breakdown);
+
+        // And the same as an encoder that has never seen any of it.
+        let cold = count_chat_request(&body, &enc(), "openai", &ImageDefaults::default());
+        assert_eq!(
+            first.total, cold.total,
+            "the memo is not a different answer"
+        );
+    }
+
+    #[test]
+    fn the_memo_stays_correct_once_it_has_turned_over() {
+        let encoder = enc();
+        // Comfortably more distinct strings than one generation holds, so the
+        // hot map is replaced several times over.
+        let texts: Vec<String> = (0..12_000)
+            .map(|i| format!("token run number {i}"))
+            .collect();
+
+        let first: Vec<usize> = texts.iter().map(|t| encoder.count(t)).collect();
+        let again: Vec<usize> = texts.iter().map(|t| encoder.count(t)).collect();
+        let reference: Vec<usize> = {
+            let fresh = enc();
+            texts.iter().map(|t| fresh.count(t)).collect()
+        };
+
+        assert_eq!(first, reference, "eviction must not change an answer");
+        assert_eq!(again, reference, "nor must a second pass over evicted keys");
+    }
+
+    /// Not a correctness test. It prints the numbers the memo exists for:
+    /// a chat client resends the whole transcript every turn, so all but the
+    /// newest exchange is work already done.
+    ///
+    /// `cargo test --release -- --ignored --nocapture growing_roleplay`
+    #[test]
+    #[ignore = "a benchmark, not an assertion"]
+    fn growing_roleplay_conversation_costs_only_its_newest_turn() {
+        use std::time::Instant;
+
+        let system = "You are a roleplay model. ".repeat(60);
+        let images = ImageDefaults::default();
+
+        println!("\n  turn   messages   tokens     cold (fresh encoder)   warm (memo)   saved");
+        for exchanges in [20, 60, 100, 140] {
+            let body = conversation(&system, exchanges);
+
+            // Cold: what every request costs today, with nothing remembered.
+            let cold_encoder = enc();
+            let started = Instant::now();
+            let counted = count_chat_request(&body, &cold_encoder, "openai", &images);
+            let cold = started.elapsed();
+
+            // Warm: the same transcript on the next turn, when only the newest
+            // exchange is new. The encoder is the one the registry keeps.
+            let warm_encoder = enc();
+            count_chat_request(&body, &warm_encoder, "openai", &images);
+            let next = conversation(&system, exchanges + 1);
+            let started = Instant::now();
+            let warm_count = count_chat_request(&next, &warm_encoder, "openai", &images);
+            let warm = started.elapsed();
+
+            assert!(warm_count.total > counted.total, "the next turn is longer");
+
+            // What `count_prompt` pays before it counts anything: both bodies
+            // are deep-cloned to be moved onto the blocking pool.
+            let started = Instant::now();
+            let (a, b) = (body.clone(), next.clone());
+            let cloned = started.elapsed();
+            std::hint::black_box((a, b));
+
+            println!(
+                "  {:>4}   {:>8}   {:>6}   {:>18.2?}   {:>11.2?}   {:>4.0}%",
+                exchanges,
+                exchanges * 2 + 1,
+                counted.total,
+                cold,
+                warm,
+                100.0 - (warm.as_secs_f64() / cold.as_secs_f64()) * 100.0,
+            );
+            println!("         (two-body deep clone on the same path: {cloned:.2?})");
+        }
+        println!();
     }
 
     #[test]
