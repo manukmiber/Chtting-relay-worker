@@ -51,7 +51,7 @@ use crate::relay::upstream::Sent;
 use crate::state::AppState;
 use crate::store::{LedgerEntry, Phase, RequestRecord};
 use crate::tokenizer::chat::flatten_content;
-use crate::tokenizer::{reconcile_usage, CacheCredit, LocalCount, Resolved, Usage};
+use crate::tokenizer::{reconcile_usage, CacheBasis, CacheCredit, LocalCount, Resolved, Usage};
 use crate::util::{day_key, hour_key, new_uuid_v4, now_ms, round, truncate};
 
 /// The outcome of an authentication attempt.
@@ -235,9 +235,8 @@ struct Ctx {
     client_wants_stream: bool,
     /// The relay's own count of the caller's own body. What they are charged.
     user_local: u64,
-    /// Whether the injected prefix comes off the backend's cache hit before any
-    /// of it is credited to the caller.
-    cache_credit: CacheCredit,
+    /// How the backend's cache hit divides between the relay and the caller.
+    cache_basis: CacheBasis,
     /// This route's price list, global and per-model already merged.
     pricing: Pricing,
     effort: Effort,
@@ -581,12 +580,16 @@ pub async fn handle_chat(
 
     // Charging for the injected prompt means treating the whole body as the
     // caller's.
-    let (user_local, cache_credit) = if cfg.tokenizer.bill_system_prompt_to_user {
+    let (user_local, credit) = if cfg.tokenizer.bill_system_prompt_to_user {
         // They are charged for the injected prompt, so a cache hit over it is
         // a discount on tokens they are paying for and travels whole.
         (input.billed as u64, CacheCredit::WholeBody)
     } else {
         (input.user as u64, CacheCredit::CallersBodyOnly)
+    };
+    let cache_basis = CacheBasis {
+        credit,
+        floor: cfg.tokenizer.cache_credit_min_tokens,
     };
     trace.timed(
         "tok",
@@ -799,7 +802,7 @@ pub async fn handle_chat(
                 started,
                 client_wants_stream,
                 user_local,
-                cache_credit,
+                cache_basis,
                 pricing: pricing::resolve(&cfg.pricing, &route),
                 effort,
                 trace: trace.clone(),
@@ -1052,7 +1055,7 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
     tokio::spawn(async move {
         let mut pumped = pump(response, &ctx, Some(&tx)).await;
         let billed = finalise_usage(&ctx, &pumped, true).await;
-        let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_credit);
+        let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_basis);
 
         if !pumped.disconnected {
             // Requirements 16 and 18: the closing frame carries the relay's own
@@ -1101,7 +1104,7 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
 async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Response {
     let mut pumped = pump(response, &ctx, None).await;
     let billed = finalise_usage(&ctx, &pumped, false).await;
-    let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_credit);
+    let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_basis);
 
     let rules = compile_text_rules(&ctx.transform.replace);
     let body_text = match &rules {
@@ -1248,7 +1251,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
         payload.get("usage"),
         ctx.cfg.tokenizer.prefer_upstream_usage,
     );
-    let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_credit);
+    let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_basis);
 
     if let Some(map) = shaped.as_object_mut() {
         map.insert("usage".into(), ctx.usage_json(&charged, &spoken));

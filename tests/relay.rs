@@ -1350,6 +1350,9 @@ async fn a_hit_on_the_injected_prompt_is_not_billed_to_the_caller_as_cache() {
     };
     let h = harness(mock, |cfg| {
         cfg.models[0].tokenizer = "o200k_base".into();
+        // The floor is off, so this exercises the offset rather than being
+        // answered by the short-prompt rule before the offset is reached.
+        cfg.tokenizer.cache_credit_min_tokens = 0;
         cfg.models[0].system_prompt = chtting_relay::config::SystemPromptSpec {
             mode: "prepend".into(),
             text: "You are Wissanggeni, a roleplay assistant. ".repeat(120),
@@ -1395,6 +1398,59 @@ async fn a_hit_on_the_injected_prompt_is_not_billed_to_the_caller_as_cache() {
     assert!(
         proxy >= fresh,
         "input billed at the cache rate: {proxy} < {fresh} in {row}"
+    );
+}
+
+#[tokio::test]
+async fn a_short_prompt_bills_as_fresh_input_however_much_the_backend_cached() {
+    // The floor, which answers before the offset is consulted: under it a hit
+    // is not passed on at all, so a short prompt never bills at the cache rate
+    // on the strength of a split drawn between two tokenizers' counts.
+    let mock = MockConfig {
+        usage: Some(json!({
+            "prompt_tokens": 900,
+            "completion_tokens": 8,
+            "total_tokens": 908,
+            // The backend calls the whole thing cached.
+            "prompt_tokens_details": {"cached_tokens": 900},
+        })),
+        ..Default::default()
+    };
+    let h = harness(mock, |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.tokenizer.cache_credit_min_tokens = 2_048;
+        cfg.pricing = chtting_relay::config::Pricing {
+            enabled: true,
+            backend_input_usd_per_m: 1_000.0,
+            backend_cached_input_usd_per_m: 1.0,
+            backend_output_usd_per_m: 1_000.0,
+            margin_percent: 100.0,
+            ..Default::default()
+        };
+    })
+    .await;
+
+    h.post("/v1/chat/completions", chat("hai")).await;
+    let row = h.last_row().await;
+
+    let user = row["prompt_tokens"].as_i64().unwrap();
+    assert!(
+        user > 0 && user < 2_048,
+        "this test needs a short prompt: {user}"
+    );
+    assert_eq!(row["billed_cached_tokens"].as_i64().unwrap(), 900);
+    assert_eq!(
+        row["cached_tokens"].as_i64().unwrap(),
+        0,
+        "under the floor a hit buys the caller nothing: {row}"
+    );
+    // Charged at the full input rate, not the cache rate three orders of
+    // magnitude below it.
+    let proxy = row["proxy_usd"].as_f64().unwrap();
+    let fresh = f64::from(u32::try_from(user).unwrap()) * 2_000.0 / 1_000_000.0;
+    assert!(
+        proxy >= fresh,
+        "a short prompt billed at the cache rate: {proxy} < {fresh} in {row}"
     );
 }
 

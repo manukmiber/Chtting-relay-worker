@@ -933,6 +933,22 @@ pub struct TokenizerConfig {
     /// billing them for it would be indefensible. The relay still records what
     /// the backend charged, so the margin stays visible.
     pub bill_system_prompt_to_user: bool,
+    /// Below this many tokens of the caller's own prompt, a backend cache hit
+    /// buys them nothing: their whole prompt bills as fresh input however much
+    /// of it the backend calls cached.
+    ///
+    /// The hit a backend reports covers the injected prefix as well as the
+    /// caller's body, and the two are told apart by subtraction, which carries
+    /// the drift between the backend's tokenizer and ours. On a short prompt
+    /// that drift is most of the answer, so the split is least trustworthy
+    /// exactly where the discount is worth least. Rounding those to fresh input
+    /// costs the caller a rounding error and takes the guesswork out of the
+    /// operator's margin.
+    ///
+    /// 2048 by default, which is at or above the minimum cacheable prefix the
+    /// major providers document. 0 turns the floor off and credits every hit
+    /// the offset leaves.
+    pub cache_credit_min_tokens: u64,
 }
 
 impl Default for TokenizerConfig {
@@ -943,6 +959,7 @@ impl Default for TokenizerConfig {
             rules: default_tokenizer_rules(),
             image_defaults: ImageDefaults::default(),
             bill_system_prompt_to_user: false,
+            cache_credit_min_tokens: 2048,
         }
     }
 }
