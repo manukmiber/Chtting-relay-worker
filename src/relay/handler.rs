@@ -589,6 +589,11 @@ pub async fn handle_chat(
     };
     let cache_basis = CacheBasis {
         credit,
+        // The relay's own measurement of what it put in front of the caller.
+        // Negative means the route replaced a longer system prompt of theirs
+        // with a shorter one: there is no relay prefix to discount then, and
+        // the subtraction in `caller_cached` is left to answer alone.
+        injected: input.injected.max(0) as u64,
         floor: cfg.tokenizer.cache_credit_min_tokens,
     };
     trace.timed(

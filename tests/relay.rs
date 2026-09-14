@@ -1355,7 +1355,11 @@ async fn a_hit_on_the_injected_prompt_is_not_billed_to_the_caller_as_cache() {
         cfg.tokenizer.cache_credit_min_tokens = 0;
         cfg.models[0].system_prompt = chtting_relay::config::SystemPromptSpec {
             mode: "prepend".into(),
-            text: "You are Wissanggeni, a roleplay assistant. ".repeat(120),
+            // ~3,697 tokens under o200k_base, so the mock's 3,941-token
+            // prompt and 3,712-token hit below are a body this injection
+            // could actually have produced: 3,697 injected + 7 of the
+            // caller's + the chat template's own overhead.
+            text: "You are Wissanggeni, a roleplay assistant. ".repeat(308),
             ..Default::default()
         };
         // A cache rate three orders of magnitude under the input rate, so
@@ -1377,8 +1381,12 @@ async fn a_hit_on_the_injected_prompt_is_not_billed_to_the_caller_as_cache() {
 
     let injected = row["system_prompt_tokens"].as_i64().unwrap();
     assert!(
-        injected > 500,
-        "this test needs an injection that dwarfs the caller's prompt: {injected}"
+        (3_000..4_200).contains(&injected),
+        "the injection and the mock's usage must describe one body: {injected}"
+    );
+    assert!(
+        injected < row["billed_prompt_tokens"].as_i64().unwrap(),
+        "the injection cannot exceed the body the backend charged for: {row}"
     );
     // The whole hit sat inside the injected prefix, so none of it was theirs.
     assert_eq!(row["billed_cached_tokens"].as_i64().unwrap(), 3_712);
