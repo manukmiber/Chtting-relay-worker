@@ -1076,7 +1076,7 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
             }
             if let Some(err) = &pumped.error {
                 let chunk = serde_json::json!({
-                    "error": {"message": err, "type": "upstream_error"}
+                    "error": {"message": err, "type": "server_error"}
                 });
                 emit_frame(&tx, &mut pumped, sse::format_sse(&chunk)).await;
             }
@@ -1097,7 +1097,7 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
         }
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
-        headers.insert("x-relay-request-id", value);
+        headers.insert("x-request-id", value);
     }
 
     (
@@ -1166,7 +1166,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
                     ..Default::default()
                 },
             );
-            return error_response(502, &message, "upstream_error", None);
+            return error_response(502, &message, "server_error", None);
         }
     };
     let bytes_upstream = raw.len() as u64;
@@ -1187,7 +1187,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
                     ..Default::default()
                 },
             );
-            return error_response(502, &message, "upstream_error", None);
+            return error_response(502, &message, "server_error", None);
         }
     };
 
@@ -1702,7 +1702,7 @@ fn ledger_final(state: &Arc<AppState>, record: &RequestRecord, ledgered: Option<
 fn json_with_id(request_id: &str, body: Value) -> Response {
     let mut response = axum::Json(body).into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(request_id) {
-        response.headers_mut().insert("x-relay-request-id", value);
+        response.headers_mut().insert("x-request-id", value);
     }
     response
 }

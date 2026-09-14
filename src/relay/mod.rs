@@ -61,10 +61,10 @@ pub fn upstream_failure(status: u16) -> Response {
         _ => (
             502,
             "the model is unavailable right now",
-            "upstream_unavailable",
+            "model_unavailable",
         ),
     };
-    error_response(status, message, "upstream_error", Some(code))
+    error_response(status, message, "server_error", Some(code))
 }
 
 #[cfg(test)]
@@ -87,7 +87,13 @@ mod tests {
                 "api key",
                 "authentication",
                 "backend",
-                "upstream \"",
+                // Not just in the prose: `type` and `code` are part of the
+                // body a caller pastes into an issue, and "upstream_error"
+                // says there is something upstream as plainly as a sentence
+                // would.
+                "upstream",
+                "relay",
+                "provider",
                 "http://",
                 "https://",
             ] {

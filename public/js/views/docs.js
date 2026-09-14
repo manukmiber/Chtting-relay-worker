@@ -3,13 +3,17 @@ import {
 } from '../ui.js';
 
 /**
- * The integration guide, written from the relay's own configuration.
+ * The integration guide, written from the service's own configuration.
  *
- * Every figure on this page — base URL, model ids, token ceilings, per-key
- * rate limits, prices — is read from the running config rather than typed into
+ * Every figure on this page (base URL, model ids, token ceilings, per-key
+ * rate limits, prices) is read from the running config rather than typed into
  * a document that would start drifting the moment a setting changed. The same
  * model renders twice: once as this page, once as Markdown, so the text an
  * operator pastes into an email is the text they were just looking at.
+ *
+ * It describes ONE service. Nothing here may name, imply or invite a question
+ * about what produces an answer: no second layer, no vendor, no capacity
+ * figures. This text goes to customers and gets copied around.
  */
 export async function docsView(ctx) {
   const doc = buildDoc(ctx.state ?? {});
@@ -28,8 +32,8 @@ export async function docsView(ctx) {
   mount(root,
     card('API documentation', h('div', {},
       h('p.small.muted', {
-        text: 'Everything an integrator needs, generated from this relay’s live configuration. '
-            + 'Copy it as Markdown to send on — it stays accurate because nothing here is hard-coded.',
+        text: 'Everything an integrator needs, generated from this service’s live configuration. '
+            + 'Copy it as Markdown to send on; it stays accurate because nothing here is hard-coded.',
       }),
       actions,
       doc.warnings.length
@@ -59,13 +63,13 @@ function buildDoc(state) {
   const keyPlaceholder = 'Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
 
   const warnings = [];
-  if (!tunnelUrl) warnings.push('No tunnel is up — the base URL below is local only');
+  if (!tunnelUrl) warnings.push('No tunnel is up, so the base URL below is local only');
   if (!models.length) warnings.push('No models are enabled yet');
   if (!keys.length) warnings.push('No client keys exist yet');
 
   return {
     baseUrl,
-    title: 'chtting-relay — API integration guide',
+    title: 'API integration guide',
     warnings,
     sections: [
       endpointSection(baseUrl, origin, localUrl, tunnelUrl, cfg),
@@ -74,7 +78,7 @@ function buildDoc(state) {
       chatSection(sample, models),
       streamSection(server, sample),
       usageSection(cfg),
-      identitySection(backends, keys),
+      identitySection(),
       limitSection(server, models, keys, backends, security),
       errorSection(),
       exampleSection(baseUrl, sample, keyPlaceholder),
@@ -84,8 +88,8 @@ function buildDoc(state) {
 
 function endpointSection(baseUrl, origin, localUrl, tunnelUrl, cfg) {
   const rows = [
-    ['GET', '/health', 'no', 'Liveness, version, how many models and backends are up.'],
-    ['GET', '/v1/models', 'yes', 'The model list: OpenAI\u2019s envelope, OpenRouter\u2019s model document inside it \u2014 `architecture`, `pricing` with its hour-and-day windows, `top_provider`, `supported_parameters`, `reasoning`.'],
+    ['GET', '/health', 'no', 'Liveness, and how many models are available.'],
+    ['GET', '/v1/models', 'yes', 'The model catalogue: `context_length`, `max_completion_tokens`, `architecture`, `pricing` with its hour-and-day windows, `supported_parameters`, `reasoning`.'],
     ['GET', '/models', 'yes', 'The same listing, for clients that omit `/v1`.'],
     ['GET', '/v1/models/{id}', 'yes', 'One model, or 404 with `model_not_found`. Ids containing a `/` work as written.'],
     ['GET', '/models/{id}', 'yes', 'The same, without the prefix.'],
@@ -93,15 +97,13 @@ function endpointSection(baseUrl, origin, localUrl, tunnelUrl, cfg) {
     ['POST', '/chat/completions', 'yes', 'The same handler, for clients that omit `/v1`.'],
     ['POST', '/v1/completions', 'yes', 'Legacy text completions, same routing and billing.'],
     ['POST', '/completions', 'yes', 'The same, without the prefix.'],
-    ['POST', '/v1/embeddings', 'yes', 'Embeddings, when the routed backend offers them.'],
+    ['POST', '/v1/embeddings', 'yes', 'Embeddings, on models that offer them.'],
     ['POST', '/embeddings', 'yes', 'The same, without the prefix.'],
     ['OPTIONS', 'any of the above', 'no', 'CORS preflight.'],
   ];
-  if (cfg.openrouter?.enabled) {
-    rows.push(['GET', cfg.openrouter.path || '/provider/models',
-      cfg.openrouter.token ? 'token' : 'no',
-      'Provider listing: the models on offer and what they cost.']);
-  }
+  // The partner listing is deliberately absent: it is not part of the API a
+  // customer integrates against, and naming it here would describe how this
+  // service is distributed rather than how to call it.
   return {
     title: 'Base URL and endpoints',
     blocks: [
@@ -123,32 +125,29 @@ function endpointSection(baseUrl, origin, localUrl, tunnelUrl, cfg) {
 
 function authSection(security, keys, keyPlaceholder) {
   const blocks = [
-    { p: 'Every endpoint except `/health` and preflight takes a client key as a bearer token.' },
+    { p: 'Every endpoint except `/health` and preflight takes your API key as a bearer token.' },
     { code: `Authorization: Bearer ${keyPlaceholder}`, lang: 'http' },
     { p: 'A key sent bare, without the `Bearer` scheme, is also accepted — some clients send it that way. Keys look like `Kunci-Zeiko-` followed by a version-4 UUID, so a key is only ever hex digits and hyphens and can be pasted anywhere without being mangled.' },
   ];
   if (security.requireClientKey === false) {
-    blocks.push({ note: 'This relay currently accepts requests **without** a key (`security.requireClientKey` is off). Turn it on before handing the URL out.' });
+    blocks.push({ note: 'This service currently accepts requests **without** a key (`security.requireClientKey` is off). Turn it on before handing the URL out.' });
   }
   if (keys.length) {
+    // The kind a key is issued as changes how it is accounted for here, which
+    // is ours to know and not a customer's to read: the column named it and
+    // the paragraph under it explained the difference. What a holder needs is
+    // what they may call and how often.
     blocks.push({
-      columns: ['Key', 'Kind', 'Models', 'Requests/min', 'Requests/day', 'Tokens/day'],
+      columns: ['Key', 'Models', 'Requests/min', 'Requests/day', 'Tokens/day'],
       rows: keys.map((k) => [
         k.label || k.id,
-        k.kind ?? 'company',
         (k.models ?? ['*']).join(', '),
         limitText(k.quota?.requestsPerMinute),
         limitText(k.quota?.requestsPerDay),
         limitText(k.quota?.tokensPerDay),
       ]),
     });
-    blocks.push({
-      p: 'A **company** key stands in front of many end users and must name the one '
-        + 'it is calling for — see *User ID* below. A **private** key is one holder: '
-        + 'the key is the user, anything it sends as `user` is ignored, and its '
-        + 'replies are never held to a model\u2019s tokens-a-second ceiling.',
-    });
-    blocks.push({ note: 'Key values are never shown here. Reveal one on the Keys tab and send it over a channel you trust — not in the same message as this guide.' });
+    blocks.push({ note: 'Key values are never shown here. Reveal one on the Keys tab and send it over a channel you trust, not in the same message as this guide.' });
   }
   return { title: 'Authentication', blocks };
 }
@@ -164,9 +163,9 @@ function modelSection(models, cfg) {
       columns: ['Model id', 'Aliases', 'Context', 'Max output', 'Stream cap'],
       rows: models.map((m) => [
         `\`${m.id}\``,
-        (m.aliases ?? []).length ? (m.aliases ?? []).map((a) => `\`${a}\``).join(', ') : '—',
-        m.contextLength ? `${exact(m.contextLength)} tokens` : '—',
-        m.limits?.maxOutputTokens ? `${exact(m.limits.maxOutputTokens)} tokens` : 'backend default',
+        (m.aliases ?? []).length ? (m.aliases ?? []).map((a) => `\`${a}\``).join(', ') : 'none',
+        m.contextLength ? `${exact(m.contextLength)} tokens` : 'not set',
+        m.limits?.maxOutputTokens ? `${exact(m.limits.maxOutputTokens)} tokens` : 'model default',
         m.maxTokensPerSecond > 0 ? `${m.maxTokensPerSecond} tok/s` : 'full speed',
       ]),
     },
@@ -190,8 +189,8 @@ function modelSection(models, cfg) {
           `\`${m.id}\``,
           rate(p.input), rate(p.cachedInput), rate(p.output),
           rate(p.maxThinking.output), rate(p.nonThinking.output),
-          p.requestUsd ? `$${p.requestUsd}` : '—',
-          p.refusalUsd ? `$${trimZeros(p.refusalUsd)}` : '—',
+          p.requestUsd ? `$${p.requestUsd}` : 'none',
+          p.refusalUsd ? `$${trimZeros(p.refusalUsd)}` : 'none',
         ];
       }),
     });
@@ -205,13 +204,13 @@ function modelSection(models, cfg) {
         .map(([name, b]) => `\`${m.id}\` on ${name}: input ${rate(b.input || p.input)}, cache read ${rate(b.cachedInput || p.cachedInput)}`);
     });
     if (bandInputs.length) {
-      blocks.push({ note: `Input and cache read also change by band — ${bandInputs.join('; ')}.` });
+      blocks.push({ note: `Input and cache read also change by band: ${bandInputs.join('; ')}.` });
     }
     const refusing = models.some((m) => resolvePricing(cfg.pricing ?? {}, m.pricing ?? {}).refusalUsd > 0);
     if (refusing) {
       blocks.push({
         note: 'A reply that declines the request is billed at the flat "Refused" price instead of its '
-          + 'tokens — it still arrives as a normal `200`, and `usage.usage` carries that price.',
+          + 'tokens. It still arrives as a normal `200`, and `usage.usage` carries that price.',
       });
     }
     const tiers = [...(cfg.pricing?.tiers ?? []), ...models.flatMap((m) => m.pricing?.tiers ?? [])]
@@ -235,30 +234,29 @@ function chatSection(sample, models) {
     for (const f of Object.keys(m.forceParams ?? {})) forced.add(f);
   }
   const blocks = [
-    { p: '`POST /v1/chat/completions` takes the OpenAI request body. Parameters the relay does not act on are forwarded to the backend untouched, so support for anything in the second group depends on the routed model rather than on this relay.' },
+    { p: '`POST /v1/chat/completions` takes the OpenAI request body. Whether a given parameter has an effect depends on the model; each model\u2019s `supported_parameters` in the catalogue is the authority.' },
     {
-      columns: ['Parameter', 'Handled by', 'Notes'],
+      columns: ['Parameter', 'Notes'],
       rows: [
-        ['`model`', 'relay', 'Required. One of the ids above; mapped to the backend’s own name, which is never disclosed.'],
-        ['`messages`', 'relay', 'Required. A system prompt may be prepended, appended or merged per model.'],
-        ['`stream`', 'relay', '`true` returns SSE, `false` one JSON body. Both are supported on every model.'],
-        ['`max_tokens` / `max_completion_tokens`', 'relay', 'Clamped down to the model’s ceiling; whichever field you send is the one kept.'],
-        ['`stop`', 'relay', 'Up to four entries, as OpenAI. The relay may add its own.'],
-        ['`user`', 'relay', 'The prompt-cache isolation key — see below.'],
-        ['`reasoning_effort`', 'relay', '`none`, `minimal`, `low`, `medium`, `high`, `max`. Also read from `reasoning.effort`, `thinking.effort`, `thinking.budget_tokens` and `enable_thinking`. Picks the system prompt and can move the price.'],
-        ['`stream_options`', 'relay', 'Dropped: usage always arrives on the final chunk, so `include_usage` is not needed.'],
-        ['`reasoning.exclude`, `include_reasoning`', 'relay', 'Leave the reasoning trace out of this reply. Only ever removes one \u2014 neither can turn on a trace the model keeps off.'],
-        ['`usage`, `route`, `models`, `transforms`, `provider`, `plugins`, `preset`', 'relay', 'OpenRouter\u2019s routing vocabulary. Accepted and answered here; never forwarded, since a strict backend rejects a body carrying fields it does not know.'],
-        ['`temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed`', 'backend', 'Forwarded as sent.'],
-        ['`response_format` (JSON mode), `tools`, `tool_choice`', 'backend', 'Forwarded as sent; whether they work is the backend model’s business.'],
+        ['`model`', 'Required. One of the ids above.'],
+        ['`messages`', 'Required. The usual `role` / `content` array.'],
+        ['`stream`', '`true` returns SSE, `false` one JSON body. Both are supported on every model.'],
+        ['`user_id`', 'Who the request is for: the prompt-cache partition key. See below.'],
+        ['`max_tokens` / `max_completion_tokens`', 'Clamped down to the model\u2019s ceiling; whichever field you send is the one kept.'],
+        ['`stop`', 'Up to four entries, as OpenAI.'],
+        ['`reasoning_effort`', '`none`, `minimal`, `low`, `medium`, `high`, `max`. Also read from `reasoning.effort`, `thinking.effort`, `thinking.budget_tokens` and `enable_thinking`. Can move the price.'],
+        ['`stream_options`', 'Ignored: usage always arrives on the final chunk, so `include_usage` is not needed.'],
+        ['`reasoning.exclude`, `include_reasoning`', 'Leave the reasoning trace out of this reply. Only ever removes one; neither can turn on a trace the model keeps off.'],
+        ['`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed`', 'Standard sampling and scoring parameters.'],
+        ['`response_format` (JSON mode), `tools`, `tool_choice`', 'JSON mode and tool calling, on models that list them.'],
       ],
     },
   ];
   if (dropped.size) {
-    blocks.push({ p: `Currently dropped before the backend sees them: ${[...dropped].map((d) => `\`${d}\``).join(', ')}.` });
+    blocks.push({ p: `Currently ignored: ${[...dropped].map((d) => `\`${d}\``).join(', ')}.` });
   }
   if (forced.size) {
-    blocks.push({ p: `Currently forced by the relay, so a caller’s value is overridden: ${[...forced].map((f) => `\`${f}\``).join(', ')}.` });
+    blocks.push({ p: `Fixed for this model, so a caller’s value is overridden: ${[...forced].map((f) => `\`${f}\``).join(', ')}.` });
   }
   blocks.push({
     code: JSON.stringify({
@@ -270,7 +268,7 @@ function chatSection(sample, models) {
       stream: true,
       temperature: 0.7,
       max_tokens: 512,
-      user: 'customer-42',
+      user_id: 'tenant-42:user-9f3c1ab7',
     }, null, 2),
     lang: 'json',
   });
@@ -301,11 +299,11 @@ function streamSection(server, sample) {
       },
       {
         list: [
-          `Lines beginning with \`:\` are SSE comments — keep-alive only, ${every ? `sent every ${every} ms of backend silence` : 'currently switched off'}. Discard them; a compliant SSE client already does.`,
+          `Lines beginning with \`:\` are SSE comments, keep-alive only, ${every ? `sent after about ${every} ms of quiet` : 'currently switched off'}. Discard them; a compliant SSE client already does.`,
           'The final data frame has an empty `choices` array and carries `usage`. It arrives whether or not `stream_options.include_usage` was sent.',
-          '`id` is a UUIDv4 minted by this relay, stable across every frame of one response, and unrelated to any id the backend used.',
+          '`id` is a UUIDv4 for this request, stable across every frame of one response.',
           '`model` is always the public id the caller asked for.',
-          'An upstream failure mid-stream arrives as a frame with an `error` object before `[DONE]`, so a stream that has already started never ends silently.',
+          'A failure mid-stream arrives as a frame with an `error` object before `[DONE]`, so a stream that has already started never ends silently.',
         ],
       },
     ],
@@ -317,16 +315,16 @@ function usageSection(cfg) {
   return {
     title: 'Usage and billing fields',
     blocks: [
-      { p: 'These are the exact paths to bill from. Prompt tokens are counted by this relay’s own tokenizer over the caller’s messages — the system prompt the relay injects is **not** charged, so the figure matches what the caller sent.' },
+      { p: 'These are the exact paths to bill from. Prompt tokens count the caller\u2019s own messages as they arrived, so anything added on their behalf is **not** charged, so the figure matches what they sent.' },
       {
         columns: ['Field', 'Type', 'Meaning'],
         rows: [
-          ['`usage.prompt_tokens`', 'integer', 'Input tokens, counted by the relay over the caller’s own messages.'],
+          ['`usage.prompt_tokens`', 'integer', 'Input tokens, over the caller\u2019s own messages.'],
           ['`usage.completion_tokens`', 'integer', 'Output tokens, reasoning included.'],
           ['`usage.total_tokens`', 'integer', 'The two above, added.'],
           ['`usage.prompt_tokens_details.cached_tokens`', 'integer', 'Cache-hit portion of the input. Absent when zero, never larger than `prompt_tokens`.'],
           ['`usage.completion_tokens_details.reasoning_tokens`', 'integer', 'Reasoning portion of the output. Absent when zero.'],
-          ['`usage.usage`', 'number', `What this request cost, in ${currency}, to nine decimal places \u2014 the relay’s own price list when it is switched on, otherwise the per-token price the model is published at in \`/v1/models\`, windows included. Absent only for a model nobody has priced at all.`],
+          ['`usage.usage`', 'number', `What this request cost, in ${currency}, to nine decimal places. Absent only for a model that has no published price at all.`],
           ['`usage.cost`', 'number', 'The same number under OpenRouter\u2019s spelling. Never a second price.'],
         ],
       },
@@ -346,39 +344,38 @@ function usageSection(cfg) {
   };
 }
 
-function identitySection(backends, keys = []) {
-  const forwarding = backends.filter((b) => b.forwardUserId && b.userIdHeader);
-  const anyPrivate = keys.some((k) => k.kind === 'private');
+/**
+ * One field, and what it buys.
+ *
+ * This used to publish the whole resolution order (two body spellings, four
+ * headers) and then describe, field by field, what each one was rewritten
+ * into on the way out. All of that is still true and none of it is a
+ * customer's to think about: they send one value, and the translation is ours.
+ * Every extra spelling printed here was one more way for an integrator to send
+ * a different id on different calls and lose every cache hit they had.
+ */
+function identitySection() {
   return {
-    title: 'User ID and KV-cache isolation',
+    title: 'Identifying your end users',
     blocks: [
-      { p: 'Send a stable per-end-user identifier on every request. It is what keeps two callers behind one API key from sharing a prompt-cache entry, and it is what the Usage screen groups by.' },
-      anyPrivate
-        ? {
-          note: 'This applies to **company** keys. A private key is its own user: '
-            + 'whatever it sends here is ignored, and the key\u2019s own identity is '
-            + 'what travels upstream and what its usage is filed under.',
-        }
-        : null,
-      {
-        columns: ['Where', 'What'],
-        rows: [
-          ['Body', '`user`, or `user_id`'],
-          ['Header', '`X-User-Id`, `X-User`, `X-OpenAI-User` or `X-KV-User`'],
-        ],
-      },
+      { p: 'Send one field, `user_id`, on every request. It is a stable, opaque identifier for the person the request is for, and it is the prompt-cache partition key.' },
+      { code: JSON.stringify({
+        model: 'your-model-id',
+        messages: ['\u2026'],
+        user_id: 'tenant-42:user-9f3c1ab7',
+      }, null, 2).replace('"\u2026"', '\u2026'), lang: 'json' },
+      { p: 'That is the whole integration: there is nothing else to set and no header to add.' },
       {
         list: [
-          'The body wins over the headers; the headers are tried in the order above.',
-          'A provider-specific pseudonymous id is enough — an opaque, stable string is all that is needed. Do not send an email address, a name or anything else that identifies a person.',
-          forwarding.length
-            ? `Forwarded upstream as \`${forwarding[0].userIdHeader}\` so the backend isolates its own cache the same way, and in the body as \`user\`${forwarding[0].userIdField ? ` and \`${forwarding[0].userIdField}\`` : ''} \u2014 backends disagree on the spelling, and one reading only its own would pool every caller into a single cache.`
-            : 'Not forwarded upstream at present: no backend has `forwardUserId` switched on, so isolation is recorded here but not requested of the backend.',
-          'Sending nothing is allowed. The request is then recorded with an empty user, and cache isolation is whatever the backend does by default.',
+          '**Isolation.** Requests carrying different `user_id` values can never reuse each other\u2019s cached prompt prefix. Without the field, everyone on one API key shares a single partition.',
+          '**Cost and speed.** A cached prefix is billed at the cache-read rate, a fraction of the fresh-input rate, and removes most of the time-to-first-token on a long system prompt.',
+          '**Stable, unique, opaque.** The same person gets the same string every time, two people never share one, and it is a hash or an internal id, never an email address, a username or a real name. Up to 120 characters.',
+          '`usage.prompt_tokens_details.cached_tokens` appears on the response once a prefix is being reused, and is absent while it is not. That is how you check it is working.',
         ],
       },
-      { note: 'Cache retention is the backend’s to state, not this relay’s: nothing about a prompt is stored here beyond the truncated preview on the Requests tab. Ask the upstream provider for the number before quoting one.' },
-    ].filter(Boolean),
+      { p: 'Omitting it is allowed and the request still succeeds. You simply get no isolation, and in practice far fewer cache hits.' },
+      { note: 'Nothing about a prompt is retained beyond the truncated preview on the Requests tab.' },
+    ],
   };
 }
 
@@ -389,13 +386,13 @@ function limitSection(server, models, keys, backends, security) {
     ['Request body',
       server.maxBodyBytes ? `${fmtBytes(server.maxBodyBytes)} (${exact(server.maxBodyBytes)} bytes)` : 'unlimited',
       'A larger body is refused with 413 before it is read.'],
-    ['Requests in flight', exact(server.maxConcurrentRequests ?? 0), 'Past this, requests queue.'],
-    ['Queue', `${exact(server.queueCapacity ?? 0)} waiting, ${exact(server.queueTimeoutMs ?? 0)} ms to wait`,
-      'A full or timed-out queue answers 503 with `Retry-After` rather than holding a client for a slot it will not reach.'],
+    // How many requests run at once, and how deep the queue behind them is,
+    // size this service for whoever reads it. A customer needs to know that a
+    // busy moment answers 503 with a `Retry-After`, which the error table says.
     ['Requests per minute', spread(quota('requestsPerMinute'), 'per key') ?? 'unlimited',
       'Set per key. Over it: 429 with a `Retry-After` header.'],
     ['Requests per day', spread(quota('requestsPerDay'), 'per key') ?? 'unlimited',
-      'Resets on the relay\u2019s local day.'],
+      'Resets daily.'],
     ['Tokens per day', spread(quota('tokensPerDay'), 'per key') ?? 'unlimited',
       'Input and output together.'],
   ];
@@ -404,7 +401,7 @@ function limitSection(server, models, keys, backends, security) {
   const outputs = spread(perModel((m) => m.limits?.maxOutputTokens ?? 0), 'tokens');
   if (outputs) rows.push(['Max output tokens', outputs, 'Per model; a larger `max_tokens` is clamped down, not refused.']);
   const timeouts = spread(backends.map((b) => b.timeoutMs ?? 0).filter((n) => n > 0), 'ms');
-  if (timeouts) rows.push(['Upstream timeout', timeouts, 'Set the client timeout above this; a slower answer comes back as 504.']);
+  if (timeouts) rows.push(['Maximum request duration', timeouts, 'Set the client timeout above this; a slower answer comes back as 504.']);
 
   const origins = security.corsOrigins ?? [];
   return {
@@ -426,18 +423,18 @@ function errorSection() {
       {
         columns: ['Status', 'Code', 'When'],
         rows: [
-          ['400', '—', 'Malformed JSON, no `model` field, or parameters this model will not accept.'],
-          ['401', '`invalid_api_key`', 'Missing, unknown or disabled client key.'],
-          ['403', '`invalid_api_key`', 'The key is not allowed that model, or the IP is blocked.'],
+          ['400', 'none', 'Malformed JSON, no `model` field, or parameters this model will not accept.'],
+          ['401', '`invalid_api_key`', 'Missing, unknown or disabled API key.'],
+          ['403', '`model_forbidden`', 'The key is not entitled to that model.'],
           ['404', '`model_not_found`', 'Unknown model id, or a path that does not exist.'],
-          ['413', '`too_large`', 'The body is over the size limit.'],
+          ['413', '`too_large`', 'The body is over the size limit, or the prompt is over the model context length.'],
           ['429', '`rate_limit_exceeded`', 'A per-minute rate limit or a daily quota is spent. The per-minute refusal carries a `Retry-After` header.'],
-          ['502', '`upstream_unavailable`', 'The model could not answer. Retry; if it persists, tell the operator.'],
-          ['503', '`overloaded`', 'Too many requests in flight and the queue is full or timed out. Carries `Retry-After`.'],
+          ['502', '`model_unavailable`', 'The model could not answer. Retry with backoff; if it persists, get in touch with an `X-Request-Id`.'],
+          ['503', '`overloaded`', 'Temporarily at capacity. Carries `Retry-After`.'],
           ['504', '`timeout`', 'The model took too long to answer.'],
         ],
       },
-      { note: 'A failure behind this relay is reported as this relay’s failure on purpose: the status is mapped by class and the wording is ours, so no upstream name, host, model or error text ever reaches a caller. An upstream refusal of the relay’s own credentials reads as 502, never as 401, because the caller’s key was fine.' },
+      { note: 'A `502` never means your key was refused: a credential problem on our side still reads as `model_unavailable`, because yours was fine and saying otherwise would send you debugging the wrong thing.' },
     ],
   };
 }
@@ -451,10 +448,10 @@ function exampleSection(baseUrl, sample, keyPlaceholder) {
         code: `curl -N ${baseUrl}/chat/completions \\
   -H "Authorization: Bearer ${keyPlaceholder}" \\
   -H "Content-Type: application/json" \\
-  -H "X-User-Id: customer-42" \\
   -d '{
     "model": "${sample}",
     "messages": [{"role": "user", "content": "Hello!"}],
+    "user_id": "tenant-42:user-9f3c1ab7",
     "stream": true
   }'`,
         lang: 'bash',
@@ -468,7 +465,7 @@ client = OpenAI(base_url="${baseUrl}", api_key="${keyPlaceholder}")
 reply = client.chat.completions.create(
     model="${sample}",
     messages=[{"role": "user", "content": "Hello!"}],
-    user="customer-42",          # KV-cache isolation
+    extra_body={"user_id": "tenant-42:user-9f3c1ab7"},   # cache isolation
 )
 print(reply.choices[0].message.content)
 print(reply.usage.prompt_tokens, reply.usage.completion_tokens)`,
@@ -506,7 +503,7 @@ function spread(values, unit = '') {
 }
 
 function rate(value) {
-  return value > 0 ? `$${trimZeros(value)}` : '—';
+  return value > 0 ? `$${trimZeros(value)}` : 'none';
 }
 
 function trimZeros(n) {
@@ -620,8 +617,8 @@ function renderBlock(block) {
 }
 
 /**
- * The small Markdown subset the document is written in — `code`, **bold**,
- * _italic_ — as HTML. Everything is escaped first, so a model id with an angle
+ * The small Markdown subset the document is written in (`code`, **bold**,
+ * _italic_) as HTML. Everything is escaped first, so a model id with an angle
  * bracket in it cannot become markup.
  */
 function inline(text) {
@@ -666,12 +663,12 @@ function download(doc) {
   try {
     const blob = new Blob([toMarkdown(doc)], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
-    const a = h('a', { href: url, download: 'chtting-relay-api.md' });
+    const a = h('a', { href: url, download: 'api-documentation.md' });
     document.body.append(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch {
-    toast('Could not build the file — copy it as Markdown instead', 'err');
+    toast('Could not build the file; copy it as Markdown instead', 'err');
   }
 }

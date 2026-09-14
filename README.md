@@ -925,6 +925,29 @@ Nilai key tidak pernah ikut: contohnya memakai placeholder
 `Kunci-Zeiko-XXXX…`, jadi dokumen itu aman dikirim, dan key asli dikirim
 terpisah lewat jalur yang kamu percaya.
 
+### PDF siap kirim
+
+`docs/API-Documentation.pdf` adalah versi cetak dari dokumen yang sama, 13
+halaman: cara request, **`user_id` — satu field, dan apa yang dia beli**,
+bentuk respons beserta blok `usage`, alur frame SSE lengkap dengan keep-alive
+dan frame penutup, lalu katalog model di `/v1/models`.
+
+Dokumen itu bicara sebagai **satu layanan**. Tidak ada kata relay, backend,
+upstream, provider, atau nama vendor di dalamnya — bukan cuma di kalimatnya,
+tapi juga di `type` dan `code` error, di header respons, dan di field yang
+dipublikasikan `/v1/models`. Kalau sebuah kalimat bikin pembaca bertanya "di
+balik apa?", kalimat itu tidak boleh ada di sana. Tab **API Docs** di dashboard
+sekarang menerapkan aturan yang sama, karena tombol Copy as Markdown-nya memang
+dipakai buat mengirim dokumen itu ke calon integrator.
+
+Sumbernya `docs/api-documentation.html`. Edit di situ, lalu bangun ulang:
+
+```bash
+pip install weasyprint
+python3 -c "from weasyprint import HTML; \
+  HTML('docs/api-documentation.html').write_pdf('docs/API-Documentation.pdf')"
+```
+
 ---
 
 ## 8. Cloudflare Tunnel

@@ -2,16 +2,36 @@
 //!
 //! One document, in the shape the wider ecosystem already reads: OpenAI's
 //! envelope on the outside (`object: "list"`, `object: "model"`, `owned_by`) so
-//! an unmodified OpenAI client still works, and OpenRouter's model document on
-//! the inside — `architecture`, `pricing`, `top_provider`,
-//! `supported_parameters`, `reasoning` — so a caller can read what a model
-//! costs and what it accepts without asking anybody.
+//! an unmodified OpenAI client still works, carrying what a caller needs to
+//! send a request and reconcile a bill — `context_length`,
+//! `max_completion_tokens`, `architecture`, `pricing`, `supported_parameters`,
+//! `reasoning` — and nothing else.
 //!
-//! Two rules hold throughout, the same two the provider document keeps. The
-//! backend's real model name never appears. And no price is invented: a rate
-//! nobody set is either derived from the relay's own rate card — the same
-//! numbers in a different unit, which is arithmetic rather than invention — or
-//! left out entirely. A missing price is a question; a wrong one is a bill.
+//! **Only that.** This document is the most widely copied thing the service
+//! publishes: every client fetches it at startup, it gets pasted into issues,
+//! and it is crawled. So everything describing how an answer is actually
+//! produced has been taken out, because each of those fields was a sentence
+//! about the internals written in a machine-readable format:
+//!
+//! * `architecture.tokenizer` named the vocabulary family, which is the model
+//!   underneath in all but name. It was the worst of them.
+//! * `architecture.instruct_type` names a prompt format, which identifies a
+//!   model family just as surely.
+//! * `hugging_face_id` pointed at the real weights by URL.
+//! * `top_provider` said there is a provider, and implied there could be more
+//!   than one. `max_completion_tokens` was the only part a caller used, so it
+//!   moved up beside `context_length`, where it reads as a property of the
+//!   model rather than of whatever serves it.
+//! * `canonical_slug`, `knowledge_cutoff` and `expiration_date` date a
+//!   snapshot, and a dated snapshot is a model anyone can look up.
+//! * `per_request_limits`, `supported_voices` and `links` were constant nulls
+//!   and an empty object: noise that made the rest harder to read.
+//!
+//! Two rules hold throughout. The real model name never appears — nor anything
+//! that names it by implication. And no price is invented: a rate nobody set is
+//! either derived from the service's own rate card — the same numbers in a
+//! different unit, which is arithmetic rather than invention — or left out
+//! entirely. A missing price is a question; a wrong one is a bill.
 //!
 //! `pricing.overrides` is what makes the listing complete rather than
 //! approximate: these models are not sold at one rate, they are sold at a rate
@@ -41,23 +61,29 @@ pub fn model_document(model: &Model, cfg: &Config) -> Value {
     let mut doc = Map::new();
 
     doc.insert("id".into(), json!(model.id));
-    // The dated name of this exact snapshot, beside the moving `id`. A caller
-    // pinning a behaviour pins this one.
-    doc.insert(
-        "canonical_slug".into(),
-        json!(if o.canonical_slug.is_empty() {
-            &model.id
-        } else {
-            &o.canonical_slug
-        }),
-    );
-    doc.insert("hugging_face_id".into(), or_null(&o.hugging_face_id));
+    doc.insert("object".into(), json!("model"));
     doc.insert(
         "name".into(),
         json!(if model.display_name.is_empty() {
             &model.id
         } else {
             &model.display_name
+        }),
+    );
+    doc.insert(
+        "display_name".into(),
+        json!(if model.display_name.is_empty() {
+            &model.id
+        } else {
+            &model.display_name
+        }),
+    );
+    doc.insert(
+        "owned_by".into(),
+        json!(if model.owner.is_empty() {
+            crate::config::DEFAULT_MODEL_OWNER
+        } else {
+            &model.owner
         }),
     );
     doc.insert(
@@ -69,16 +95,29 @@ pub fn model_document(model: &Model, cfg: &Config) -> Value {
         }),
     );
     doc.insert("description".into(), json!(model.description));
+
+    // The two numbers that bound a request, side by side. `max_completion_tokens`
+    // used to sit inside `top_provider`, which said there was a provider and
+    // implied there could be several; as a property of the model it reads as
+    // what it is, and a caller reaching for it has one place to look.
     doc.insert("context_length".into(), json!(context_length(model)));
-    doc.insert("architecture".into(), architecture(model, cfg));
+    let max_out = max_output(model);
+    doc.insert(
+        "max_completion_tokens".into(),
+        if max_out > 0 {
+            json!(max_out)
+        } else {
+            Value::Null
+        },
+    );
+
+    doc.insert("architecture".into(), architecture(model));
 
     let pricing = pricing(model, cfg);
     if !pricing.is_empty() {
         doc.insert("pricing".into(), Value::Object(pricing));
     }
 
-    doc.insert("top_provider".into(), top_provider(model));
-    doc.insert("per_request_limits".into(), Value::Null);
     doc.insert(
         "supported_parameters".into(),
         json!(supported_parameters(model, cfg)),
@@ -87,43 +126,11 @@ pub fn model_document(model: &Model, cfg: &Config) -> Value {
         "default_parameters".into(),
         Value::Object(default_parameters(model)),
     );
-    doc.insert("supported_voices".into(), Value::Null);
-    doc.insert("knowledge_cutoff".into(), or_null(&o.knowledge_cutoff));
-    doc.insert("expiration_date".into(), or_null(&o.deprecation_date));
-    doc.insert("links".into(), json!({}));
     if o.supports_reasoning {
         doc.insert("reasoning".into(), reasoning(model));
     }
 
-    // The OpenAI half of the envelope, so a client that only knows `/v1/models`
-    // still recognises what it is holding.
-    doc.insert("object".into(), json!("model"));
-    doc.insert(
-        "owned_by".into(),
-        json!(if model.owner.is_empty() {
-            crate::config::DEFAULT_MODEL_OWNER
-        } else {
-            &model.owner
-        }),
-    );
-    doc.insert(
-        "display_name".into(),
-        json!(if model.display_name.is_empty() {
-            &model.id
-        } else {
-            &model.display_name
-        }),
-    );
-
     Value::Object(doc)
-}
-
-fn or_null(text: &str) -> Value {
-    if text.is_empty() {
-        Value::Null
-    } else {
-        json!(text)
-    }
 }
 
 fn context_length(model: &Model) -> u32 {
@@ -146,7 +153,7 @@ fn max_output(model: &Model) -> u32 {
 
 /* -------------------------------------------------------- architecture -- */
 
-fn architecture(model: &Model, cfg: &Config) -> Value {
+fn architecture(model: &Model) -> Value {
     let o = &model.openrouter;
     let inputs: Vec<String> = if o.input_modalities.is_empty() {
         vec!["text".into()]
@@ -162,17 +169,6 @@ fn architecture(model: &Model, cfg: &Config) -> Value {
         "modality": format!("{}->{}", inputs.join("+"), outputs.join("+")),
         "input_modalities": inputs,
         "output_modalities": outputs,
-        "tokenizer": super::openrouter::tokenizer_family(model, cfg),
-        "instruct_type": or_null(&o.instruct_type),
-    })
-}
-
-fn top_provider(model: &Model) -> Value {
-    let max_out = max_output(model);
-    json!({
-        "context_length": context_length(model),
-        "max_completion_tokens": if max_out > 0 { json!(max_out) } else { Value::Null },
-        "is_moderated": model.openrouter.is_moderated,
     })
 }
 
@@ -540,21 +536,51 @@ mod tests {
     }
 
     #[test]
-    fn the_shape_carries_both_envelopes() {
+    fn the_shape_carries_what_a_caller_needs_and_no_more() {
         let cfg = setup();
         let doc = document(&cfg);
         let m = &doc["data"][0];
         assert_eq!(doc["object"], "list");
-        // OpenAI's half, so an unmodified client still recognises it.
+        // The OpenAI envelope, so an unmodified client still recognises it.
         assert_eq!(m["object"], "model");
         assert_eq!(m["owned_by"], crate::config::DEFAULT_MODEL_OWNER);
-        // OpenRouter's half.
         assert_eq!(m["architecture"]["modality"], "text->text");
-        assert_eq!(m["architecture"]["instruct_type"], Value::Null);
+        // The two bounds a caller writes code against, side by side.
         assert_eq!(m["context_length"], 1_048_576);
-        assert_eq!(m["top_provider"]["max_completion_tokens"], 384_000);
-        assert_eq!(m["per_request_limits"], Value::Null);
-        assert_eq!(m["canonical_slug"], "zeikoai/wissangeni-flash");
+        assert_eq!(m["max_completion_tokens"], 384_000);
+    }
+
+    /// Every field here described how the answer gets produced rather than how
+    /// to ask for one, and each named the model underneath or dated it well
+    /// enough to be looked up. The listing is the most-copied thing published,
+    /// so this test is the guard on what may go into it.
+    #[test]
+    fn the_listing_describes_the_model_not_what_runs_it() {
+        let cfg = setup();
+        let doc = document(&cfg);
+        let m = &doc["data"][0];
+
+        for leaky in [
+            "canonical_slug",
+            "hugging_face_id",
+            "top_provider",
+            "knowledge_cutoff",
+            "expiration_date",
+            "per_request_limits",
+            "supported_voices",
+            "links",
+        ] {
+            assert!(
+                m.get(leaky).is_none(),
+                "{leaky} is back in the public listing"
+            );
+        }
+        for leaky in ["tokenizer", "instruct_type"] {
+            assert!(
+                m["architecture"].get(leaky).is_none(),
+                "architecture.{leaky} names the model family"
+            );
+        }
     }
 
     #[test]

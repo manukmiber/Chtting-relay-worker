@@ -106,16 +106,24 @@ fn with_cors(state: &AppState, headers: &HeaderMap, mut response: Response) -> R
     response
 }
 
+/// Liveness, and nothing else.
+///
+/// This is the one endpoint that answers without a key, over the tunnel, to
+/// anybody. So it says only whether the service is up and how many models it
+/// offers — both of which a caller can learn anyway from `/v1/models`.
+///
+/// What it used to say it no longer does. `backends` announced that there is a
+/// backend layer and how many are in it; `in_flight` and `uptime_s` reported
+/// live load and how recently the process restarted, which is a capacity
+/// estimate and a restart signal for anyone who cares to poll; `version` dated
+/// the build. None of that is a caller's to know, and all of it was free to
+/// whoever asked. The operator reads every one of those on the dashboard,
+/// which is on loopback and behind a password.
 async fn health(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.config.current();
     Json(serde_json::json!({
         "status": "ok",
-        "service": "chtting-relay",
-        "version": env!("CARGO_PKG_VERSION"),
         "models": cfg.models.iter().filter(|m| m.enabled).count(),
-        "backends": cfg.backends.iter().filter(|b| b.enabled).count(),
-        "uptime_s": state.stats.uptime_s(),
-        "in_flight": state.gate.snapshot().in_flight,
     }))
     .into_response()
 }
@@ -395,7 +403,12 @@ async fn embeddings(
         return with_cors(
             &state,
             &headers,
-            error_response(502, "backend unavailable", "upstream_error", None),
+            error_response(
+                502,
+                "that model is unavailable right now",
+                "server_error",
+                None,
+            ),
         );
     };
 
@@ -517,7 +530,7 @@ async fn embeddings(
         error_response(
             if status >= 400 { status } else { 502 },
             &error,
-            "upstream_error",
+            "server_error",
             None,
         )
     } else {
