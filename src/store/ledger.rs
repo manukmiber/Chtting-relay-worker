@@ -163,6 +163,12 @@ pub struct LedgerEntry {
     /// What the backend charged for the same prompt, injection included.
     pub billed_input_tokens: i64,
     pub output_tokens: i64,
+    /// The caller's share of the backend's cache hit, on the same basis as
+    /// `input_tokens`: the injected prefix is taken off the front before any
+    /// of the hit is credited here, because a hit over the relay's own prompt
+    /// is not a discount the caller earned. Charging it to them would bill
+    /// their whole prompt at the cache rate on the strength of tokens they
+    /// never sent.
     pub cached_tokens: i64,
     pub reasoning_tokens: i64,
     /// 1 when the backend served part of this prompt from its cache.

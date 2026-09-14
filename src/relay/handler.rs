@@ -51,7 +51,7 @@ use crate::relay::upstream::Sent;
 use crate::state::AppState;
 use crate::store::{LedgerEntry, Phase, RequestRecord};
 use crate::tokenizer::chat::flatten_content;
-use crate::tokenizer::{reconcile_usage, LocalCount, Resolved, Usage};
+use crate::tokenizer::{reconcile_usage, CacheCredit, LocalCount, Resolved, Usage};
 use crate::util::{day_key, hour_key, new_uuid_v4, now_ms, round, truncate};
 
 /// The outcome of an authentication attempt.
@@ -235,6 +235,9 @@ struct Ctx {
     client_wants_stream: bool,
     /// The relay's own count of the caller's own body. What they are charged.
     user_local: u64,
+    /// Whether the injected prefix comes off the backend's cache hit before any
+    /// of it is credited to the caller.
+    cache_credit: CacheCredit,
     /// This route's price list, global and per-model already merged.
     pricing: Pricing,
     effort: Effort,
@@ -578,10 +581,12 @@ pub async fn handle_chat(
 
     // Charging for the injected prompt means treating the whole body as the
     // caller's.
-    let user_local = if cfg.tokenizer.bill_system_prompt_to_user {
-        input.billed as u64
+    let (user_local, cache_credit) = if cfg.tokenizer.bill_system_prompt_to_user {
+        // They are charged for the injected prompt, so a cache hit over it is
+        // a discount on tokens they are paying for and travels whole.
+        (input.billed as u64, CacheCredit::WholeBody)
     } else {
-        input.user as u64
+        (input.user as u64, CacheCredit::CallersBodyOnly)
     };
     trace.timed(
         "tok",
@@ -794,6 +799,7 @@ pub async fn handle_chat(
                 started,
                 client_wants_stream,
                 user_local,
+                cache_credit,
                 pricing: pricing::resolve(&cfg.pricing, &route),
                 effort,
                 trace: trace.clone(),
@@ -1046,7 +1052,7 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
     tokio::spawn(async move {
         let mut pumped = pump(response, &ctx, Some(&tx)).await;
         let billed = finalise_usage(&ctx, &pumped, true).await;
-        let charged = billed.charged_to_caller(ctx.user_local);
+        let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_credit);
 
         if !pumped.disconnected {
             // Requirements 16 and 18: the closing frame carries the relay's own
@@ -1095,7 +1101,7 @@ async fn pipe_stream(response: reqwest::Response, ctx: Ctx, ticket: Ticket) -> R
 async fn pipe_streamed_into_json(response: reqwest::Response, ctx: Ctx) -> Response {
     let mut pumped = pump(response, &ctx, None).await;
     let billed = finalise_usage(&ctx, &pumped, false).await;
-    let charged = billed.charged_to_caller(ctx.user_local);
+    let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_credit);
 
     let rules = compile_text_rules(&ctx.transform.replace);
     let body_text = match &rules {
@@ -1242,7 +1248,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
         payload.get("usage"),
         ctx.cfg.tokenizer.prefer_upstream_usage,
     );
-    let charged = billed.charged_to_caller(ctx.user_local);
+    let charged = billed.charged_to_caller(ctx.user_local, ctx.cache_credit);
 
     if let Some(map) = shaped.as_object_mut() {
         map.insert("usage".into(), ctx.usage_json(&charged, &spoken));
@@ -1414,8 +1420,17 @@ fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
     // dashboard computes from those two.
     record.completion_tokens = completion as i64;
     record.total_tokens = record.prompt_tokens + record.completion_tokens;
-    record.cached_tokens = out.billed.map_or(0, |u| u.cached_tokens as i64);
-    record.cache_hit = i64::from(record.cached_tokens > 0);
+    // On the caller's basis, like `prompt_tokens` right above it, so the cache
+    // rate the two make is a percentage rather than a number in the thousands:
+    // the backend's hit covers the injected prefix the caller never sent.
+    record.billed_cached_tokens = out.billed.map_or(0, |u| u.cached_tokens as i64);
+    record.cached_tokens = out
+        .charged
+        .map_or(record.cached_tokens, |u| u.cached_tokens as i64);
+    // The hit is still a hit whoever it is credited to: this stays true of the
+    // request, so a cache that only ever matches the injected prompt is
+    // countable rather than invisible.
+    record.cache_hit = i64::from(record.billed_cached_tokens > 0);
     record.reasoning_tokens = out.billed.map_or(0, |u| u.reasoning_tokens as i64);
     record.usage_source = out.billed.map_or(String::new(), |u| u.source.to_string());
     record.exact = out.billed.map_or(record.exact, |u| i64::from(u.exact));

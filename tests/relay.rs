@@ -1306,13 +1306,96 @@ async fn a_cache_hit_reported_by_the_backend_is_recorded() {
     h.post("/v1/chat/completions", chat("hi")).await;
 
     let row = h.last_row().await;
-    assert_eq!(row["cached_tokens"].as_i64().unwrap(), 96);
+    // The backend's own figure, over the body the backend received.
+    assert_eq!(row["billed_cached_tokens"].as_i64().unwrap(), 96);
     assert_eq!(row["cache_hit"].as_i64().unwrap(), 1);
+    // The caller's share of it, on the same basis as their `prompt_tokens`:
+    // the backend counted a prompt far larger than the caller's own body, and
+    // the hit has to clear all of that overhead before any of it is theirs.
+    let user = row["prompt_tokens"].as_i64().unwrap();
+    let billed = row["billed_prompt_tokens"].as_i64().unwrap();
+    let theirs = (96 - (billed - user)).clamp(0, user);
+    assert_eq!(row["cached_tokens"].as_i64().unwrap(), theirs);
+    assert!(
+        row["cached_tokens"].as_i64().unwrap() <= user,
+        "more cached tokens than tokens: {row}"
+    );
 
     let ledger = h.ledger().await;
     let final_row = ledger.last().unwrap();
-    assert_eq!(final_row["cached_tokens"].as_i64().unwrap(), 96);
-    assert_eq!(final_row["cache_hit"].as_i64().unwrap(), 1);
+    assert_eq!(final_row["cached_tokens"].as_i64().unwrap(), theirs);
+    assert_eq!(
+        final_row["cache_hit"].as_i64().unwrap(),
+        1,
+        "the hit is still recorded as a hit whoever it is credited to"
+    );
+}
+
+#[tokio::test]
+async fn a_hit_on_the_injected_prompt_is_not_billed_to_the_caller_as_cache() {
+    // The report this came from: a one-word request behind a long injected
+    // prompt came back with a cache hit bigger than the caller's whole body.
+    // Clamping that to their prompt called every token they sent "cached",
+    // billed the lot at the cache rate, and left the request selling for
+    // almost nothing while the backend still invoiced for the real body — a
+    // negative margin on a key that was working exactly as configured.
+    let mock = MockConfig {
+        usage: Some(json!({
+            "prompt_tokens": 3_941,
+            "completion_tokens": 8,
+            "total_tokens": 3_949,
+            "prompt_tokens_details": {"cached_tokens": 3_712},
+        })),
+        ..Default::default()
+    };
+    let h = harness(mock, |cfg| {
+        cfg.models[0].tokenizer = "o200k_base".into();
+        cfg.models[0].system_prompt = chtting_relay::config::SystemPromptSpec {
+            mode: "prepend".into(),
+            text: "You are Wissanggeni, a roleplay assistant. ".repeat(120),
+            ..Default::default()
+        };
+        // A cache rate three orders of magnitude under the input rate, so
+        // billing the caller's tokens as cached instead of fresh is the
+        // difference between a real price and a rounding error.
+        cfg.pricing = chtting_relay::config::Pricing {
+            enabled: true,
+            backend_input_usd_per_m: 1_000.0,
+            backend_cached_input_usd_per_m: 1.0,
+            backend_output_usd_per_m: 1_000.0,
+            margin_percent: 100.0,
+            ..Default::default()
+        };
+    })
+    .await;
+
+    h.post("/v1/chat/completions", chat("hai")).await;
+    let row = h.last_row().await;
+
+    let injected = row["system_prompt_tokens"].as_i64().unwrap();
+    assert!(
+        injected > 500,
+        "this test needs an injection that dwarfs the caller's prompt: {injected}"
+    );
+    // The whole hit sat inside the injected prefix, so none of it was theirs.
+    assert_eq!(row["billed_cached_tokens"].as_i64().unwrap(), 3_712);
+    assert_eq!(
+        row["cached_tokens"].as_i64().unwrap(),
+        0,
+        "the relay's own prompt came back from cache, not the caller's: {row}"
+    );
+    assert_eq!(row["cache_hit"].as_i64().unwrap(), 1, "it was still a hit");
+
+    // The caller wrote a handful of tokens and is charged for them at the
+    // input rate. Before the offset this was zero fresh input, all cache.
+    let user = row["prompt_tokens"].as_i64().unwrap();
+    assert!(user > 0, "{row}");
+    let proxy = row["proxy_usd"].as_f64().unwrap();
+    let fresh = f64::from(u32::try_from(user).unwrap()) * 2_000.0 / 1_000_000.0;
+    assert!(
+        proxy >= fresh,
+        "input billed at the cache rate: {proxy} < {fresh} in {row}"
+    );
 }
 
 /* ------------------------------------------- the OpenRouter provider doc -- */
