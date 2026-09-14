@@ -69,8 +69,13 @@ pub fn cors_headers(
 
     let mut out = vec![
         (
+            // Only what a caller actually sends. `x-api-key` and
+            // `anthropic-version` used to be listed here and nothing inbound
+            // has ever read either — a client sending them in place of a
+            // bearer token gets a 401 regardless — so all they did was name a
+            // vendor to every browser that asked what this API accepts.
             "access-control-allow-headers",
-            HeaderValue::from_static("authorization, content-type, x-api-key, anthropic-version"),
+            HeaderValue::from_static("authorization, content-type, x-user-id"),
         ),
         (
             "access-control-allow-methods",

@@ -717,7 +717,7 @@ async fn a_backend_failure_is_reshaped_before_the_caller_sees_it() {
     let body: serde_json::Value = response.json().await.unwrap();
     let message = body["error"]["message"].as_str().unwrap();
     assert_eq!(message, "the model is unavailable right now");
-    assert_eq!(body["error"]["code"], "upstream_unavailable");
+    assert_eq!(body["error"]["code"], "model_unavailable");
     assert!(
         !message.contains("warming up") && !message.contains("eu-west-2"),
         "the backend's own words must not travel: {message}"
@@ -768,15 +768,26 @@ async fn a_disabled_model_is_not_reachable() {
 
 /* ------------------------------------------------------------- health -- */
 
+/// `/health` answers without a key, over the tunnel, to anybody — so it says
+/// only that the service is up and how many models it offers, which
+/// `/v1/models` would tell the same caller anyway. Anything about how the
+/// service is built or how loaded it is right now is the operator's, and the
+/// operator reads it on the dashboard.
 #[tokio::test]
-async fn health_reports_what_is_configured_without_needing_a_key() {
+async fn health_says_it_is_up_and_nothing_about_how() {
     let h = harness(MockConfig::default(), |_| {}).await;
     let response = h.client().get(h.url("/health")).send().await.unwrap();
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["status"], "ok");
     assert_eq!(body["models"], 1);
-    assert_eq!(body["backends"], 1);
+
+    for leaky in ["backends", "in_flight", "uptime_s", "version", "service"] {
+        assert!(
+            body.get(leaky).is_none(),
+            "/health is unauthenticated and public: {leaky} must not be in it"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1604,7 +1615,7 @@ async fn the_id_the_caller_gets_is_our_own_uuid_v4() {
     let response = h.post("/v1/chat/completions", chat("hi")).await;
     let header = response
         .headers()
-        .get("x-relay-request-id")
+        .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
