@@ -220,13 +220,15 @@ async fn a_generated_key_is_shown_once_and_masked_afterwards() {
     let tail = secret
         .strip_prefix("Kunci-Zeiko-")
         .unwrap_or_else(|| panic!("unexpected key shape: {secret}"));
-    assert_eq!(tail.chars().count(), 32, "{secret}");
-    assert!(tail.chars().any(|c| c.is_ascii_lowercase()), "{secret}");
-    assert!(tail.chars().any(|c| c.is_ascii_uppercase()), "{secret}");
-    assert!(tail.chars().any(|c| c.is_ascii_digit()), "{secret}");
+    assert_eq!(tail.chars().count(), 36, "{secret}");
+    assert_eq!(
+        tail.split('-').map(|p| p.len()).collect::<Vec<_>>(),
+        vec![8, 4, 4, 4, 12],
+        "not a uuid: {secret}"
+    );
     assert!(
-        tail.chars().any(|c| c.is_ascii_punctuation()),
-        "no symbol in {secret}"
+        tail.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+        "{secret}"
     );
 
     // Listing it afterwards only ever shows the mask.

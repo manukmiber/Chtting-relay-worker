@@ -58,55 +58,21 @@ pub fn new_uuid_v4() -> String {
     )
 }
 
-/// The symbols a client key may contain.
+/// A relay client key: `Kunci-Zeiko-` and a version-4 UUID.
 ///
-/// Printable ASCII minus the characters that make a key painful to move
-/// around: no space, no quote, no backslash or backtick (shells and JSON), no
-/// comma or semicolon (header and cookie separators), no slash (URLs). What is
-/// left is still wide enough that the alphabet is 84 characters.
-const KEY_SYMBOLS: &[u8] = b"!#$%&()*+-.:<=>?@[]^_{|}~";
-
-/// A relay client key: `Kunci-Zeiko-` and 32 characters mixing digits,
-/// lower case, upper case and symbols.
+/// The tail used to be 32 characters mixing digits, both cases and symbols.
+/// Stronger on paper, unusable in practice: a key carrying `$`, `|`, `{` or
+/// `?` cannot be pasted into a shell, an `.env` line, a YAML file or a query
+/// string without something eating or reinterpreting a character, so the key
+/// that arrives at the relay is not the key that was minted and the caller is
+/// told their brand new key is invalid. A UUID is 122 random bits written in
+/// nothing but hex and hyphens, which survives every one of those paths
+/// untouched — and 122 bits is far past anything worth guessing at.
 ///
-/// The mix is guaranteed rather than hoped for: one character of each class is
-/// placed first and then the whole tail is shuffled, so a key can never come
-/// out as 32 digits by chance.
+/// Both kinds of key come from here: a company key and a private key differ in
+/// how the relay treats the caller, never in how the secret is shaped.
 pub fn new_client_key() -> String {
-    const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-    const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    const DIGIT: &[u8] = b"0123456789";
-    const LEN: usize = 32;
-
-    let mut rng = rand::rng();
-    let pick =
-        |rng: &mut rand::rngs::ThreadRng, set: &[u8]| -> u8 { set[rng.random_range(0..set.len())] };
-
-    let mut out = vec![
-        pick(&mut rng, LOWER),
-        pick(&mut rng, UPPER),
-        pick(&mut rng, DIGIT),
-        pick(&mut rng, KEY_SYMBOLS),
-    ];
-    let all: Vec<u8> = LOWER
-        .iter()
-        .chain(UPPER)
-        .chain(DIGIT)
-        .chain(KEY_SYMBOLS)
-        .copied()
-        .collect();
-    while out.len() < LEN {
-        out.push(pick(&mut rng, &all));
-    }
-    // Fisher-Yates, so the guaranteed four are not always in the same places.
-    for i in (1..out.len()).rev() {
-        out.swap(i, rng.random_range(0..=i));
-    }
-
-    format!(
-        "Kunci-Zeiko-{}",
-        String::from_utf8(out).expect("every alphabet above is ascii")
-    )
+    format!("Kunci-Zeiko-{}", new_uuid_v4())
 }
 
 pub fn random_hex(len: usize) -> String {
@@ -418,22 +384,26 @@ mod tests {
     }
 
     #[test]
-    fn a_client_key_is_kunci_zeiko_and_thirty_two_mixed_characters() {
+    fn a_client_key_is_kunci_zeiko_and_a_uuid_v4() {
         for _ in 0..200 {
             let key = new_client_key();
             let tail = key
                 .strip_prefix("Kunci-Zeiko-")
                 .expect("every key carries the prefix");
-            assert_eq!(tail.chars().count(), 32, "{key}");
-            assert!(tail.chars().any(|c| c.is_ascii_lowercase()), "{key}");
-            assert!(tail.chars().any(|c| c.is_ascii_uppercase()), "{key}");
-            assert!(tail.chars().any(|c| c.is_ascii_digit()), "{key}");
-            assert!(
-                tail.bytes().any(|b| KEY_SYMBOLS.contains(&b)),
-                "no symbol in {key}"
+            assert_eq!(tail.chars().count(), 36, "{key}");
+            let parts: Vec<&str> = tail.split('-').collect();
+            assert_eq!(
+                parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12],
+                "{key}"
             );
-            // It travels in an Authorization header, so nothing in it may be a
-            // character that header cannot carry.
+            assert!(parts[2].starts_with('4'), "not version 4: {key}");
+            // Nothing outside hex and hyphens, so the key survives a shell, an
+            // .env line and a URL without being mangled on the way in.
+            assert!(
+                tail.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+                "{key}"
+            );
             assert!(
                 axum::http::HeaderValue::from_str(&format!("Bearer {key}")).is_ok(),
                 "{key} cannot go in a header"

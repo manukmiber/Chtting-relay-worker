@@ -56,7 +56,7 @@ function buildDoc(state) {
   const origin = tunnelUrl || localUrl;
   const baseUrl = `${origin.replace(/\/+$/, '')}/v1`;
   const sample = models[0]?.id ?? 'your-model-id';
-  const keyPlaceholder = 'Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
+  const keyPlaceholder = 'Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
 
   const warnings = [];
   if (!tunnelUrl) warnings.push('No tunnel is up — the base URL below is local only');
@@ -125,7 +125,7 @@ function authSection(security, keys, keyPlaceholder) {
   const blocks = [
     { p: 'Every endpoint except `/health` and preflight takes a client key as a bearer token.' },
     { code: `Authorization: Bearer ${keyPlaceholder}`, lang: 'http' },
-    { p: 'A key sent bare, without the `Bearer` scheme, is also accepted — some clients send it that way. Keys look like `Kunci-Zeiko-` followed by 32 characters mixing digits, lower case, upper case and symbols.' },
+    { p: 'A key sent bare, without the `Bearer` scheme, is also accepted — some clients send it that way. Keys look like `Kunci-Zeiko-` followed by a version-4 UUID, so a key is only ever hex digits and hyphens and can be pasted anywhere without being mangled.' },
   ];
   if (security.requireClientKey === false) {
     blocks.push({ note: 'This relay currently accepts requests **without** a key (`security.requireClientKey` is off). Turn it on before handing the URL out.' });

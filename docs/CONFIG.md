@@ -450,10 +450,13 @@ that was never applied.
 Each key is one "daily user" in the stats. A key fronting many callers is told
 apart by the caller id — see *Caller ids and prompt caches* above.
 
-Keys minted by the relay are shaped `Kunci-Zeiko-` followed by 32 characters
-mixing lower case, upper case, digits and symbols, with at least one of each
-guaranteed rather than hoped for. Keys of any other shape keep working; nothing
-checks the format on the way in.
+Keys minted by the relay are shaped `Kunci-Zeiko-` followed by a version-4
+UUID — `Kunci-Zeiko-3f2b9c41-7d6a-4e0b-9a55-c1d8e2f40b73` — for company and
+private keys alike. Nothing but hex digits and hyphens, so a key survives a
+shell, an `.env` line, a YAML file and a query string without a character being
+eaten or reinterpreted, which is what earlier keys full of symbols did not.
+Keys of any other shape keep working, including every key minted before this;
+nothing checks the format on the way in.
 
 ---
 
