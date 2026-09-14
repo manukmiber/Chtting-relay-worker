@@ -562,12 +562,7 @@ pub async fn handle_chat(
         )
     });
 
-    let resolved = state.counter.resolve(
-        &cfg,
-        &route.upstream_model,
-        &route.tokenizer,
-        &route.chat_profile,
-    );
+    let resolved = state.counter.resolve_route(&cfg, &route);
     let tokenizing = Instant::now();
     let input = state
         .counter

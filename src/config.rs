@@ -389,6 +389,29 @@ pub struct Model {
     /// This model's own price list, layered over the global one.
     pub pricing: Pricing,
     pub openrouter: OpenRouterModel,
+
+    /// Which vocabulary and chat profile this route counts with, decided once
+    /// when the config is published.
+    ///
+    /// The answer is a pure function of the config — `upstreamModel` against
+    /// `tokenizer.rules`, with this model's own `tokenizer`/`chatProfile`
+    /// overriding — and yet it was being worked out again on every request:
+    /// a walk of the rule list, and `glob_match` lower-casing and collecting
+    /// both the model name *and* the pattern into a `Vec<char>` at each rule.
+    /// Fourteen rules in the default config, so tens of allocations per
+    /// request to re-answer a question whose inputs had not moved.
+    ///
+    /// `Arc<str>`, so handing it to the counter — which has to own it to read
+    /// it on the blocking pool — is a refcount bump rather than two `String`
+    /// allocations of its own.
+    ///
+    /// Set by [`normalize`] and never serialised. `None` means nobody
+    /// normalised this `Model`, which is only ever one built by hand in a
+    /// test; the counter then works it out live, exactly as it always did.
+    #[serde(skip)]
+    pub resolved_tokenizer: Option<Arc<str>>,
+    #[serde(skip)]
+    pub resolved_profile: Option<Arc<str>>,
 }
 
 impl Default for Model {
@@ -417,6 +440,8 @@ impl Default for Model {
             max_tokens_per_second: 0.0,
             pricing: Pricing::default(),
             openrouter: OpenRouterModel::default(),
+            resolved_tokenizer: None,
+            resolved_profile: None,
         }
     }
 }
@@ -1729,7 +1754,45 @@ pub fn normalize(mut cfg: Config) -> Config {
     // publishes a config comes through here, so the request path never has to
     // look an IANA name up again.
     cfg.parsed_tz = Some(crate::util::parse_tz(&cfg.timezone));
+    resolve_tokenizers(&mut cfg);
     cfg
+}
+
+/// Decide each route's vocabulary and chat profile once, here, rather than on
+/// every request that uses it.
+///
+/// Worked out in two passes because the answer depends on `cfg.tokenizer`
+/// while the place it is written is `cfg.models`, and the borrow checker is
+/// right to object to holding both at once.
+fn resolve_tokenizers(cfg: &mut Config) {
+    let decided: Vec<(Arc<str>, Arc<str>)> = cfg
+        .models
+        .iter()
+        .map(|m| {
+            let (rule_tokenizer, rule_profile) = crate::tokenizer::registry::Registry::match_rules(
+                &cfg.tokenizer,
+                &m.upstream_model,
+            );
+            // A route that names a vocabulary outright means it; feeding that
+            // name back through the rules would send it to the catch-all.
+            let tokenizer = if m.tokenizer.is_empty() {
+                rule_tokenizer
+            } else {
+                m.tokenizer.clone()
+            };
+            let profile = if m.chat_profile.is_empty() {
+                rule_profile
+            } else {
+                m.chat_profile.clone()
+            };
+            (Arc::from(tokenizer.as_str()), Arc::from(profile.as_str()))
+        })
+        .collect();
+
+    for (model, (tokenizer, profile)) in cfg.models.iter_mut().zip(decided) {
+        model.resolved_tokenizer = Some(tokenizer);
+        model.resolved_profile = Some(profile);
+    }
 }
 
 fn normalize_billing(billing: &mut BillingConfig) {

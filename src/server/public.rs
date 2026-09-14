@@ -417,12 +417,7 @@ async fn embeddings(
         _ => vec![String::new()],
     };
 
-    let resolved = state.counter.resolve(
-        &cfg,
-        &route.upstream_model,
-        &route.tokenizer,
-        &route.chat_profile,
-    );
+    let resolved = state.counter.resolve_route(&cfg, &route);
     // One hand-off to the blocking pool for the whole array, not one per item:
     // a batch of a hundred short inputs is still one short encode's worth of
     // work, and paying a round trip to the pool for each of them is all cost.

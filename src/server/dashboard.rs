@@ -1635,8 +1635,8 @@ async fn tokenizer_count(State(dash): State<Arc<Dashboard>>, Json(body): Json<Va
             "breakdown": counted.breakdown,
             "exact": counted.exact,
             "tokenizer": counted.tokenizer,
-            "profile": resolved.profile,
-            "resolved": {"tokenizer": resolved.tokenizer, "profile": resolved.profile},
+            "profile": &*resolved.profile,
+            "resolved": {"tokenizer": &*resolved.tokenizer, "profile": &*resolved.profile},
         }))
         .into_response();
     }
@@ -1652,7 +1652,7 @@ async fn tokenizer_count(State(dash): State<Arc<Dashboard>>, Json(body): Json<Va
         map.insert("mode".into(), Value::String("text".into()));
         map.insert(
             "resolved".into(),
-            json!({"tokenizer": resolved.tokenizer, "profile": resolved.profile}),
+            json!({"tokenizer": &*resolved.tokenizer, "profile": &*resolved.profile}),
         );
     }
     Json(detail).into_response()
