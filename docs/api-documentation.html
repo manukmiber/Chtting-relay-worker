@@ -175,7 +175,7 @@
 
   <table>
     <tr><td>Protocol</td><td>OpenAI-compatible HTTP + SSE</td></tr>
-    <tr><td>Base URL</td><td><code>https://api.example.com/v1</code></td></tr>
+    <tr><td>Base URL</td><td><code>https://ai.zeiko.biz.id/v1</code></td></tr>
     <tr><td>Auth</td><td><code>Authorization: Bearer &lt;API key&gt;</code></td></tr>
   </table>
 
@@ -205,7 +205,7 @@
 <!-- ==================================================================== -->
 <h2 id="s1">1. Base URL and endpoints</h2>
 
-<pre><code>base_url = https://api.example.com/v1</code></pre>
+<pre><code>base_url = https://ai.zeiko.biz.id/v1</code></pre>
 
 <p><strong>Every path works with and without the <code>/v1</code> prefix.</strong> Some clients
 append <code>/v1</code> themselves, others are given a base URL that already ends in it. Both hit
@@ -482,7 +482,7 @@ and every frame ends with a blank line.)</p>
 <p><code>GET /v1/models</code> and <code>GET /models</code> return the identical document.
 <code>/v1/models/{id}</code> returns a single entry.</p>
 
-<pre><code>curl https://api.example.com/v1/models \
+<pre><code>curl https://ai.zeiko.biz.id/v1/models \
   -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</code></pre>
 
 <h3>Before you call it</h3>
@@ -643,7 +643,7 @@ part of your agreement with us — ask if you need them raised.</p>
 <h2 id="s10">10. Examples</h2>
 
 <h3>Streaming, curl</h3>
-<pre><code>curl -N https://api.example.com/v1/chat/completions \
+<pre><code>curl -N https://ai.zeiko.biz.id/v1/chat/completions \
   -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" \
   -H "Content-Type: application/json" \
   -d '{
@@ -657,7 +657,7 @@ part of your agreement with us — ask if you need them raised.</p>
 <pre class="long"><code>from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://api.example.com/v1",
+    base_url="https://ai.zeiko.biz.id/v1",
     api_key="Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 )
 
@@ -694,7 +694,7 @@ for chunk in stream:
 print("\n", usage)</code></pre>
 
 <h3>Streaming, Node with fetch</h3>
-<pre class="long"><code>const res = await fetch("https://api.example.com/v1/chat/completions", {
+<pre class="long"><code>const res = await fetch("https://ai.zeiko.biz.id/v1/chat/completions", {
   method: "POST",
   headers: {
     "Authorization": "Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
@@ -739,7 +739,7 @@ while (true) {
 }</code></pre>
 
 <h3>Listing models</h3>
-<pre><code>curl https://api.example.com/v1/models \
+<pre><code>curl https://ai.zeiko.biz.id/v1/models \
   -H "Authorization: Bearer Kunci-Zeiko-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</code></pre>
 
 <div class="note" style="margin-top:8mm;">
