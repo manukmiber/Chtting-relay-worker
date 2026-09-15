@@ -149,9 +149,7 @@ pub fn model_document(model: &Model, cfg: &Config) -> Value {
     if !defaults.is_empty() {
         doc.insert("default_parameters".into(), Value::Object(defaults));
     }
-    if o.supports_reasoning {
-        doc.insert("reasoning".into(), reasoning(model));
-    }
+    doc.insert("reasoning".into(), reasoning(model, cfg));
 
     Value::Object(doc)
 }
@@ -249,7 +247,22 @@ impl Card {
         put("completion", &self.completion);
         put("input_cache_read", &self.cached_prompt);
         put("input_cache_write", &self.cache_write);
-        put("internal_reasoning", &self.internal_reasoning);
+        // Reasoning tokens are output tokens until somebody prices them apart,
+        // and that is exactly how they are charged — so the rate they are
+        // charged at is published under its own name rather than left for a
+        // caller to infer from a missing field. Absent, `internal_reasoning`
+        // read as "reasoning is not billed" while every invoice billed it at
+        // the output rate: the one hole in the formula a caller reconciles
+        // against. Taken from this card's own `completion`, so a band or a
+        // window that moves output moves this with it.
+        put(
+            "internal_reasoning",
+            if self.internal_reasoning.is_empty() {
+                &self.completion
+            } else {
+                &self.internal_reasoning
+            },
+        );
         put("request", &self.request);
         out
     }
@@ -564,10 +577,18 @@ fn supported_parameters(model: &Model, cfg: &Config) -> Vec<String> {
     if o.supports_structured_outputs {
         names.push("structured_outputs".into());
     }
+    // The thinking controls belong to the relay, not to whatever serves the
+    // model: the effort a caller names is what picks the system prompt that
+    // goes out and the price band the request is billed on, and that happens on
+    // every route whether or not the model publishes its working. So they are
+    // advertised everywhere — a listing that quotes three thinking bands while
+    // advertising no way to ask for one leaves a caller to guess at the
+    // parameter that moves their bill.
+    names.push("reasoning".into());
+    names.push("reasoning_effort".into());
     if o.supports_reasoning {
+        // Only a model that shows its working has a trace to leave out.
         names.push("include_reasoning".into());
-        names.push("reasoning".into());
-        names.push("reasoning_effort".into());
     }
 
     let rt = RequestTransform::merged(&cfg.defaults.request_transform, &model.request_transform);
@@ -584,12 +605,31 @@ fn default_parameters(model: &Model) -> Map<String, Value> {
     model.params.clone()
 }
 
-fn reasoning(model: &Model) -> Value {
+/// The thinking controls this model takes, and what silence means.
+///
+/// Published for every model rather than only the ones that show their working,
+/// because the price moves with the effort on all of them: `pricing.bands`
+/// quotes three rates chosen by a parameter, and a document that publishes the
+/// rates without the vocabulary that selects them is half a price list. That
+/// was the gap a client reading this document actually fell into — three bands,
+/// no `reasoning_effort` in `supported_parameters`, and no block here saying
+/// which levels exist.
+///
+/// What it says is what the relay does: the levels it parses, and the level a
+/// request that named none is treated as having asked for — the operator's
+/// `defaults.effort`, read through the same function the biller and the prompt
+/// picker read, rather than a constant that was right only while nobody
+/// changed the setting.
+fn reasoning(model: &Model, cfg: &Config) -> Value {
     let r = &model.openrouter.reasoning;
+    let silence = crate::pricing::default_effort(cfg);
     let efforts: Vec<String> = if r.supported_efforts.is_empty() {
-        // The levels the relay itself prices, dearest first, which is the order
-        // a caller reads a menu in.
-        ["max", "high", "medium", "low", "none"]
+        // Every level the relay parses, dearest first, which is the order a
+        // caller reads a menu in. `minimal` is one of them — the documentation
+        // and the biller both took it while this list left it out, so a client
+        // generating its options from here could not ask for the band it would
+        // have been charged at.
+        ["max", "high", "medium", "low", "minimal", "none"]
             .iter()
             .map(|s| (*s).to_string())
             .collect()
@@ -597,13 +637,16 @@ fn reasoning(model: &Model) -> Value {
         r.supported_efforts.clone()
     };
     let default_effort = if r.default_effort.is_empty() {
-        Effort::High.as_str().to_string()
+        silence.as_str().to_string()
     } else {
         r.default_effort.clone()
     };
     json!({
         "mandatory": r.mandatory,
-        "default_enabled": r.default_enabled,
+        // Thinking is on for a caller who said nothing exactly when silence
+        // resolves to a thinking level, which is the same question
+        // `pricing.default_band` answers in money.
+        "default_enabled": r.default_enabled || silence.is_thinking(),
         "supported_efforts": efforts,
         "default_effort": default_effort,
     })
@@ -925,14 +968,117 @@ mod tests {
         assert!(published_cost(&bare.models[0], &bare, &usage, quiet).is_none());
     }
 
+    /// The gap a customer integration reported: the document quoted three
+    /// thinking bands while advertising no parameter that selects one, and
+    /// carried no `reasoning` block to say which levels exist — so the bands
+    /// read as prices for something a caller could not ask for.
     #[test]
-    fn reasoning_is_described_only_by_a_model_that_reasons() {
+    fn a_document_that_prices_thinking_says_how_to_ask_for_it() {
         let mut cfg = setup();
-        assert_eq!(
-            document(&cfg)["data"][0]["reasoning"]["default_effort"],
-            "high"
-        );
+        // Even with nothing declared about traces: the effort still moves the
+        // price on this route, so the controls are still real.
         cfg.models[0].openrouter.supports_reasoning = false;
-        assert!(document(&cfg)["data"][0].get("reasoning").is_none());
+
+        let m = &document(&cfg)["data"][0];
+        let params: Vec<String> =
+            serde_json::from_value(m["supported_parameters"].clone()).unwrap();
+        assert!(params.contains(&"reasoning_effort".to_string()));
+        assert!(params.contains(&"reasoning".to_string()));
+        // A trace is the one part a model without one cannot offer.
+        assert!(!params.contains(&"include_reasoning".to_string()));
+
+        let r = &m["reasoning"];
+        assert_eq!(r["default_effort"], "high");
+        assert_eq!(r["default_enabled"], true);
+        let efforts: Vec<String> = serde_json::from_value(r["supported_efforts"].clone()).unwrap();
+        // Every level the biller prices, `minimal` included — it was missing
+        // here while the price list and the documentation both took it.
+        for level in ["none", "minimal", "low", "medium", "high", "max"] {
+            assert!(efforts.contains(&level.to_string()), "{level}");
+        }
+
+        // A model that does show its working says so.
+        cfg.models[0].openrouter.supports_reasoning = true;
+        let params: Vec<String> =
+            serde_json::from_value(document(&cfg)["data"][0]["supported_parameters"].clone())
+                .unwrap();
+        assert!(params.contains(&"include_reasoning".to_string()));
+    }
+
+    /// `default_effort` is the operator's setting, read through the same
+    /// function the biller and the prompt picker read. Published as a constant
+    /// it was right only until somebody changed the setting, and then it
+    /// disagreed with `pricing.default_band` in the same document.
+    #[test]
+    fn the_effort_silence_resolves_to_is_the_one_the_relay_actually_uses() {
+        let mut cfg = setup();
+        cfg.defaults.effort = "none".into();
+        let m = &document(&cfg)["data"][0];
+        assert_eq!(m["reasoning"]["default_effort"], "none");
+        assert_eq!(m["reasoning"]["default_enabled"], false);
+        assert_eq!(m["pricing"]["default_band"], "non_thinking");
+
+        cfg.defaults.effort = "max".into();
+        let m = &document(&cfg)["data"][0];
+        assert_eq!(m["reasoning"]["default_effort"], "max");
+        assert_eq!(m["reasoning"]["default_enabled"], true);
+    }
+
+    /// Reasoning tokens are charged at the output rate of whichever band the
+    /// request is on. Leaving `internal_reasoning` out said the opposite — that
+    /// they are not charged — and it was the one term missing from the formula
+    /// a caller reconciles an invoice with.
+    #[test]
+    fn the_rate_reasoning_tokens_are_billed_at_is_published() {
+        let mut cfg = setup();
+        cfg.models[0].openrouter.pricing = OpenRouterPricing::default();
+        cfg.models[0].pricing = Pricing {
+            enabled: true,
+            input_usd_per_m: 0.8,
+            cached_input_usd_per_m: 0.2,
+            output_usd_per_m: 4.0,
+            max_thinking: BandRates {
+                output_usd_per_m: 6.0,
+                ..Default::default()
+            },
+            non_thinking: BandRates {
+                output_usd_per_m: 3.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let pricing = &document(&cfg)["data"][0]["pricing"];
+        assert_eq!(pricing["internal_reasoning"], "0.000004");
+        // Every band, at that band's own output rate, exactly as `apply_band`
+        // charges it.
+        assert_eq!(
+            pricing["bands"]["non_thinking"]["internal_reasoning"],
+            "0.0000035"
+        );
+        assert_eq!(
+            pricing["bands"]["default"]["internal_reasoning"],
+            "0.000004"
+        );
+        assert_eq!(pricing["bands"]["max"]["internal_reasoning"], "0.000006");
+
+        // Priced apart, the price that was set is the price that is published.
+        cfg.models[0].pricing.reasoning_usd_per_m = 1.2;
+        let pricing = &document(&cfg)["data"][0]["pricing"];
+        assert_eq!(pricing["internal_reasoning"], "0.0000012");
+
+        // And a window that moves output moves what reasoning costs with it,
+        // rather than quoting the standing rate inside an hour that does not
+        // charge it.
+        let windowed = setup();
+        let window = &document(&windowed)["data"][0]["pricing"]["overrides"][1];
+        assert_eq!(window["completion"], "0.0000012");
+        assert_eq!(window["internal_reasoning"], "0.0000012");
+
+        // Nothing priced still publishes nothing: a rate nobody set is not
+        // invented out of a blank.
+        let mut bare = setup();
+        bare.models[0].openrouter.pricing = OpenRouterPricing::default();
+        assert!(document(&bare)["data"][0].get("pricing").is_none());
     }
 }

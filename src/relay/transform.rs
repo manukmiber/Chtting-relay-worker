@@ -205,6 +205,33 @@ const ROUTING_ONLY_KEYS: [&str; 7] = [
     "preset",
 ];
 
+/// The thinking controls this relay answers itself, and therefore does not pass
+/// on.
+///
+/// How hard the model is asked to think is settled here, before a byte goes
+/// out: the effort read off the caller's body picks the system prompt that is
+/// injected, the price band the request is billed on, and what the request row
+/// records, and `reasoning.exclude` is honoured on the way back by stripping
+/// the trace out of the reply. None of it is a question for the backend.
+///
+/// And the vocabulary is this relay's own. `none`, `minimal` and `max` are
+/// levels *it* prices; a backend that validates its input has never heard of
+/// them, so forwarding one turns `reasoning_effort: "none"` — a documented,
+/// accepted, already-acted-upon parameter — into a 400 on a request that was
+/// perfectly valid when it arrived.
+///
+/// Dropped alongside the routing keys, for the same reason and in the same
+/// place: before the route's own `params` and `forceParams` go on, so a route
+/// pointed at a backend that really does take one of these can still set it
+/// deliberately.
+const THINKING_KEYS: [&str; 5] = [
+    "reasoning_effort",
+    "reasoning",
+    "thinking",
+    "enable_thinking",
+    "include_reasoning",
+];
+
 /// Build the body actually sent upstream.
 pub fn transform_request(
     body: &Value,
@@ -222,6 +249,9 @@ pub fn transform_request(
     map.insert("model".into(), Value::String(route.upstream_model.clone()));
 
     for key in ROUTING_ONLY_KEYS {
+        map.remove(key);
+    }
+    for key in THINKING_KEYS {
         map.remove(key);
     }
 
@@ -978,6 +1008,65 @@ mod tests {
             "a default must not override the caller"
         );
         assert_eq!(out["top_p"], 0.9, "a forced param must override the caller");
+    }
+
+    /// The bug a customer integration hit: `reasoning_effort: "none"` is
+    /// documented, accepted, and already read off the body by the time this
+    /// runs — it has chosen the system prompt and the price band. Passing it on
+    /// as well handed a backend that has never heard of the level a parameter
+    /// it rejects, so a perfectly valid request came back 400 and the three
+    /// published thinking bands could not be selected at all.
+    #[test]
+    fn the_thinking_controls_the_relay_answers_itself_do_not_go_upstream() {
+        let (cfg, route) = cfg_with_route();
+        let body = serde_json::json!({
+            "messages": [],
+            "reasoning_effort": "none",
+            "reasoning": {"effort": "max", "exclude": true},
+            "thinking": {"budget_tokens": 60000},
+            "enable_thinking": false,
+            "include_reasoning": false,
+            "temperature": 0.4,
+        });
+        let out = transform_request(
+            &body,
+            &route,
+            &cfg,
+            &ResolvedRequestTransform::default(),
+            &route.system_prompt,
+        );
+        for key in THINKING_KEYS {
+            assert!(
+                out.get(key).is_none(),
+                "{key} was forwarded to a backend that never asked for it"
+            );
+        }
+        assert_eq!(out["temperature"], 0.4, "the rest of the body is untouched");
+    }
+
+    /// The escape hatch the routing keys have, on the same terms: a route
+    /// pointed at a backend that really does take a thinking parameter sets it
+    /// itself, and that survives.
+    #[test]
+    fn a_route_can_still_send_a_thinking_parameter_deliberately() {
+        let (cfg, mut route) = cfg_with_route();
+        route
+            .force_params
+            .insert("reasoning_effort".into(), serde_json::json!("high"));
+        route
+            .params
+            .insert("thinking".into(), serde_json::json!({"type": "enabled"}));
+
+        let body = serde_json::json!({"messages": [], "reasoning_effort": "none"});
+        let out = transform_request(
+            &body,
+            &route,
+            &cfg,
+            &ResolvedRequestTransform::default(),
+            &route.system_prompt,
+        );
+        assert_eq!(out["reasoning_effort"], "high");
+        assert_eq!(out["thinking"]["type"], "enabled");
     }
 
     #[test]
