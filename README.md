@@ -122,11 +122,37 @@ lama menjawab pakai config yang ia pegang sejak start — jadi key yang baru
 dibuat lewat dashboard tidak dikenal olehnya, dan pemanggil melihat
 `invalid API key` di sebagian request dan sukses di sebagian lain.
 
-Makanya `start` menulis `data/run/serving.pid` dan menolak jalan kalau pid di
-situ masih hidup dan masih relay ini. Rotasi dikecualikan — successor-nya punya
-nomor generasi, jadi tumpang tindihnya memang disengaja. Yang dijalankan
-manual tidak punya itu dan harus bilang `--replace` kalau memang mau
-mengambil alih port-nya.
+Makanya sebelum apa pun dikerjakan, `start` mengambil **sewa port** di
+`src/lock.rs`: satu *abstract unix socket* yang namanya diambil dari nomor
+port. Bind-nya satu syscall yang atomik — tidak ada celah untuk balapan — dan
+namanya hidup di ruang nama milik kernel, bukan di filesystem. Artinya
+`--home`, `$TMPDIR`, dan direktori kerja tidak ikut menentukan: dua proses yang
+sama-sama mau port 8787 pasti bertemu di nama yang sama, sekalipun segala hal
+lain tentang mereka berbeda. Kernel juga yang melepasnya begitu pemegangnya
+mati — exit bersih, panic, `SIGKILL`, atau dibunuh *low-memory killer* Android
+— jadi tidak pernah ada sisa kunci basi yang harus dibersihkan.
+
+Yang kedua menolak start dan keluar dengan **exit code 3**, menyebut port-nya
+dan siapa yang memegangnya. Pemegang sewa mendengarkan di sewanya sendiri dan
+menjawab pid-nya kalau ditanya, jadi `--replace` tahu persis siapa yang harus
+disuruh berhenti: minta baik-baik (`SIGTERM`), tunggu sewanya lepas, baru
+memaksa. Keeper-nya mengerti exit code 3 sebagai "tunggu, jangan restart" —
+selain itu tetap dianggap crash dan di-restart seperti biasa.
+
+Rotasi tetap dikecualikan, karena di situlah dua proses melayani satu port
+memang benar. Tapi successor harus **membuktikan** dirinya successor: ia
+membawa token sekali pakai yang dicetak pendahulunya di
+`data/run/handover-<gen>`. `CHTTING_GENERATION` saja tidak cukup — variabel
+environment diwariskan ke semua keturunan dan dulu itu saja sudah bisa
+melewati pemeriksaan. Dan successor belum jadi relay sampai ia memegang
+sewanya, yang baru bisa diambil setelah pendahulunya benar-benar pergi. Kalau
+pendahulunya tidak pergi juga, ia disuruh pergi. Jadi tumpang tindihnya
+berbatas di kedua ujung.
+
+`data/run/serving.pid` masih ada, tapi sekarang cuma **petunjuk** buat pesan
+error. Ia berkunci pada direktori data, dan justru itu sebabnya dulu ia tidak
+pernah bisa menangkap dua salinan yang dijalankan dengan `--home` berbeda.
+`chtting-relay doctor` menyebutkan port-nya bebas atau sedang dipakai siapa.
 
 Tidak ada request yang putus dan tidak ada koneksi yang ditolak, karena selalu
 ada yang mendengarkan. Kalau salinan barunya gagal naik, yang lama jalan terus

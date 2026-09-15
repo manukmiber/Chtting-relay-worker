@@ -243,9 +243,20 @@ impl Host {
              while :; do\n\
              \t[ -f \"$STOPFILE\" ] && break\n\
              \t{binary} start --home {home}\n\
+             \tstatus=$?\n\
              \t[ -f \"$STOPFILE\" ] && break\n\
-             \t# A crash loop should not become a busy loop.\n\
-             \tsleep 3\n\
+             \tif [ \"$status\" -eq {busy} ]; then\n\
+             \t\t# Another relay already owns the port, so this one refused to\n\
+             \t\t# start beside it. Usually the successor of an hourly rotation:\n\
+             \t\t# the process this keeper was watching hands over and exits, and\n\
+             \t\t# its replacement is the relay now. Restarting into that would be\n\
+             \t\t# exactly the duplicate that was just refused, so wait it out and\n\
+             \t\t# keep watching in case the survivor dies too.\n\
+             \t\tsleep 30\n\
+             \telse\n\
+             \t\t# A crash loop should not become a busy loop.\n\
+             \t\tsleep 3\n\
+             \tfi\n\
              done\n\
              rm -f \"$PIDFILE\"\n",
             shell = shell().display(),
@@ -254,6 +265,7 @@ impl Host {
             root = sh_quote(&self.paths.root.to_string_lossy()),
             binary = sh_quote(&self.binary().to_string_lossy()),
             home = sh_quote(&self.paths.home.to_string_lossy()),
+            busy = crate::lock::EXIT_PORT_BUSY,
         );
         write_script(&script, &body).await?;
         self.logger

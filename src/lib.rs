@@ -4,6 +4,7 @@
 //! tests in `tests/` can drive the real servers rather than a stand-in.
 
 pub mod config;
+pub mod lock;
 pub mod logging;
 pub mod pricing;
 pub mod relay;

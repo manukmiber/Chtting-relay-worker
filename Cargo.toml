@@ -58,6 +58,11 @@ tiktoken-rs = "0.9"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 
 # --- misc -----------------------------------------------------------------
+# For the one-relay-per-port lease in `src/lock.rs`: an abstract unix socket
+# bound with `bind(2)`, and `kill(2)` to move an incumbent along. Already in the
+# tree underneath tokio, socket2 and rusqlite, so naming it directly costs the
+# Termux build nothing.
+libc = "0.2"
 # fancy-regex, not `regex`: user-written rewrite rules are JS-flavoured and do
 # use lookaround, which the `regex` crate deliberately cannot express.
 fancy-regex = "0.16"
