@@ -215,8 +215,22 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
     // file logger's destination is even known.
     let boot = Logger::console(Level::Info);
     let store = ConfigStore::load(&paths.config).await?;
+
+    // The override moves before the port is read, because the port it names is
+    // the one that has to be free.
+    if let Some(port) = port {
+        store
+            .update(serde_json::json!({ "server": { "port": port } }))
+            .await?;
+    }
     let cfg = store.current();
 
+    // Whether this process may serve at all is settled here, before a database
+    // is opened, before a vocabulary is loaded, and before a line is logged
+    // that would read like the relay coming up. The old order did all of that
+    // first and checked afterwards, so a refused duplicate still announced
+    // itself as "chtting-relay starting" — which is how a phone with one relay
+    // on it came to look like a phone with two.
     let logger = if cfg.logging.file_enabled {
         Logger::with_file(
             Level::parse(&cfg.logging.level),
@@ -227,10 +241,18 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
     };
     drop(boot);
 
-    if let Some(port) = port {
-        store
-            .update(serde_json::json!({ "server": { "port": port } }))
-            .await?;
+    // Whether this process may serve at all is settled here, before a database
+    // is opened, before a vocabulary is loaded, and before a line is logged
+    // that would read like the relay coming up. The old order did all of that
+    // first and checked afterwards, so a refused duplicate still announced
+    // itself as "chtting-relay starting" — which is how a phone with one relay
+    // on it came to look like a phone with two.
+    let handover = rotate::handover(&paths.data).await;
+    if handover.is_none() {
+        match hold_the_port(&paths, cfg.server.port, replace, &logger).await {
+            Some(lease) => chtting_relay::lock::hold_for_life(lease),
+            None => std::process::exit(chtting_relay::lock::EXIT_PORT_BUSY),
+        }
     }
 
     let state = AppState::build(paths, logger.clone()).await?;
@@ -260,21 +282,14 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
     // Requirement 19: an instance may be taking over from one that is still
     // serving, so the ports are bound with SO_REUSEPORT and both are listening
     // for as long as the handover takes.
-    let generation = rotate::generation();
-    if generation > 0 {
-        logger.info(format!(
-            "generation {generation}: taking over from the instance before it"
-        ));
-    }
-
-    // Before anything binds: a second instance would not be refused by the
-    // kernel, because SO_REUSEPORT is what the rotation above depends on. It
-    // would quietly serve half the traffic out of its own config instead.
-    // A duplicate is an operator mistake with a known remedy, not a crash, so
-    // it is reported the way every other startup message is and exits quietly.
-    if let Err(err) = rotate::claim_serving(&state, replace).await {
-        logger.error(err.to_string());
-        std::process::exit(1);
+    match handover {
+        Some(h) => logger.info(format!(
+            "generation {}: taking over from pid {}",
+            h.generation, h.predecessor
+        )),
+        // The lease was taken before any of this ran, so reaching here at all
+        // means this process is the one entitled to the port.
+        None => rotate::record_serving(&state.paths.data, std::process::id()).await,
     }
 
     // The public, tunnel-facing server. `retire` is what stops it accepting
@@ -327,6 +342,15 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
     // Both ports are open, so anyone waiting on this instance can stand down.
     rotate::announce_ready(&state).await;
     rotate::sweep(&state).await;
+
+    // A successor is listening but is not yet the relay: its predecessor still
+    // holds the port lease while it drains. Taking that lease is what ends the
+    // overlap, and this is the only place in the program where a process serves
+    // without holding it.
+    if let Some(h) = handover {
+        finish_the_handover(state.clone(), h);
+    }
+    watch_the_lease(state.clone());
 
     // Requirement 9: the tunnel comes up with the relay and stays up. Not a
     // one-shot attempt that gives up if the phone has no network yet a second
@@ -415,6 +439,175 @@ fn humanise(d: std::time::Duration) -> String {
     } else {
         format!("{}m", secs / 60)
     }
+}
+
+/// Take the port for a relay that nobody handed it to, or explain why not.
+///
+/// `None` means do not start. There is no third answer: every uncertainty here
+/// — a lease that cannot be taken, a predecessor that will not go, a syscall
+/// that fails — resolves to not starting, because the failure it is guarding
+/// against is invisible. Two relays on one port do not crash and do not log;
+/// they split the traffic, and the older one answers out of the config it
+/// started with. That is what makes a key minted a minute ago come back
+/// `invalid API key` on some requests and work on others.
+async fn hold_the_port(
+    paths: &Paths,
+    port: u16,
+    replace: bool,
+    logger: &Logger,
+) -> Option<chtting_relay::lock::PortLease> {
+    use chtting_relay::lock::PortLease;
+
+    match PortLease::try_acquire(port) {
+        Ok(Some(lease)) => return Some(lease),
+        Ok(None) => {}
+        Err(err) => {
+            logger.error(format!(
+                "cannot tell whether port {port} is already being served ({err}), so this \
+                 start is refused. A relay that cannot check is not allowed to guess."
+            ));
+            return None;
+        }
+    }
+
+    // Who has it. The lease answers for itself, which is the only source that
+    // works between two copies started with different `--home` values — and
+    // that disagreement is precisely how two relays used to end up on one port.
+    // The pidfile is the fallback, and being wrong or missing changes nothing
+    // about the refusal itself.
+    let incumbent =
+        chtting_relay::lock::serving_pid(port).or(rotate::recorded_owner(&paths.data).await);
+
+    if !replace {
+        let who = match incumbent {
+            Some(pid) => format!("pid {pid}"),
+            None => "another process".into(),
+        };
+        logger.error(format!(
+            "port {port} is already being served by {who}.\n\
+             Starting a second copy would not fail on the port itself — SO_REUSEPORT lets \
+             both bind it — it would split the traffic between them, and the older process \
+             would answer out of the config it started with. That is what makes a freshly \
+             minted key come back \"invalid API key\" on some requests and work on others.\n\
+             Stop the one that is running first, or pass --replace to take the port over."
+        ));
+        return None;
+    }
+
+    logger.info(format!(
+        "--replace: taking port {port} from {}",
+        incumbent
+            .map(|p| format!("pid {p}"))
+            .unwrap_or_else(|| "whoever holds it".into())
+    ));
+    match chtting_relay::lock::take_over(port, incumbent, REPLACE_POLITE, REPLACE_FIRM).await {
+        Ok(Some(lease)) => Some(lease),
+        Ok(None) => {
+            logger.error(format!(
+                "port {port} is still held after asking and then insisting. Refusing to \
+                 start beside whatever is holding it."
+            ));
+            None
+        }
+        Err(err) => {
+            logger.error(format!("could not take port {port} over: {err}"));
+            None
+        }
+    }
+}
+
+/// How long `--replace` waits after asking politely, and after insisting.
+const REPLACE_POLITE: std::time::Duration = std::time::Duration::from_secs(20);
+const REPLACE_FIRM: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a successor lets its predecessor take to finish draining and go.
+/// Generous: the predecessor is draining real requests, and cutting it short
+/// costs a caller their answer.
+const HANDOVER_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Turn a successor into the relay by taking the lease its predecessor holds.
+///
+/// The predecessor stopped accepting the moment it saw this instance come up,
+/// so traffic is already arriving here and the overlap costs nothing while it
+/// lasts. What it must not do is last: a predecessor stuck draining forever
+/// used to leave two processes listening indefinitely, which is the state this
+/// whole mechanism exists to prevent. So it is given the grace period, and then
+/// it is moved along.
+fn finish_the_handover(state: Arc<AppState>, h: rotate::Handover) {
+    tokio::spawn(async move {
+        let port = state.config.current().server.port;
+        let logger = state.logger.clone();
+
+        if let Ok(Some(lease)) =
+            chtting_relay::lock::PortLease::acquire_within(port, HANDOVER_GRACE).await
+        {
+            chtting_relay::lock::hold_for_life(lease);
+            rotate::record_serving(&state.paths.data, std::process::id()).await;
+            logger.info(format!("generation {} now owns the port", h.generation));
+            return;
+        }
+
+        logger.warn(format!(
+            "pid {} has not let the port go {HANDOVER_GRACE:?} after handing over; moving it along",
+            h.predecessor
+        ));
+        match chtting_relay::lock::take_over(
+            port,
+            Some(h.predecessor),
+            REPLACE_POLITE,
+            REPLACE_FIRM,
+        )
+        .await
+        {
+            Ok(Some(lease)) => {
+                chtting_relay::lock::hold_for_life(lease);
+                rotate::record_serving(&state.paths.data, std::process::id()).await;
+                logger.info(format!("generation {} now owns the port", h.generation));
+            }
+            // Somebody else is on this port and it is not the predecessor. Two
+            // relays is the thing being prevented, so this one stands down
+            // rather than be the second.
+            _ => {
+                logger.error(format!(
+                    "port {port} belongs to something this instance cannot displace; \
+                     shutting down rather than serving beside it"
+                ));
+                state.store.flush().await;
+                std::process::exit(chtting_relay::lock::EXIT_PORT_BUSY);
+            }
+        }
+    });
+}
+
+/// Keep checking that this process is still the one entitled to the port.
+///
+/// Redundant while everything works, which is the point of it. The lease cannot
+/// be taken away — the kernel holds it against all comers — so the only way to
+/// be serving without it is to have never finished a handover, and this is what
+/// notices. It also puts the pidfile back if something overwrote it, so the
+/// next `--replace` asks the right process.
+fn watch_the_lease(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if !chtting_relay::lock::holding() {
+                state.logger.error(
+                    "still serving without the port lease long after the handover window; \
+                     shutting down rather than stay a second relay",
+                );
+                state.store.flush().await;
+                std::process::exit(chtting_relay::lock::EXIT_PORT_BUSY);
+            }
+            if rotate::recorded_owner(&state.paths.data).await.is_some() {
+                // Somebody wrote their pid over ours. We hold the lease, so
+                // they are not serving; put the note back before the next
+                // --replace asks the wrong process to stop.
+                rotate::record_serving(&state.paths.data, std::process::id()).await;
+            }
+        }
+    });
 }
 
 /// Bind a listener that can share its port with the instance being replaced.
@@ -560,7 +753,19 @@ async fn doctor(paths: Paths) -> Result<()> {
     println!("  models        {}", cfg.models.len());
     println!("  backends      {}", cfg.backends.len());
     println!("  client keys   {}", cfg.keys.len());
-    println!("  relay port    {}", cfg.server.port);
+    // The one question that turns "my key stopped working" into a two-second
+    // diagnosis: is something already serving on this port?
+    let port = cfg.server.port;
+    let owner = match chtting_relay::lock::port_is_taken(port) {
+        false => "free".to_string(),
+        true => match chtting_relay::lock::serving_pid(port)
+            .or(rotate::recorded_owner(&paths.data).await)
+        {
+            Some(pid) => format!("already served by pid {pid}"),
+            None => "already served by another process".into(),
+        },
+    };
+    println!("  relay port    {port} — {owner}");
     println!(
         "  dashboard     {}:{}",
         cfg.dashboard.host, cfg.dashboard.port

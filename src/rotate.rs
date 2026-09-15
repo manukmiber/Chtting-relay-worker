@@ -32,6 +32,16 @@
 //! binary that will not start, a marker that never appears — all of them leave
 //! the old instance running exactly as it was. A missed rotation is a
 //! non-event; a rotation that takes the relay down is not.
+//!
+//! The second safety property, which is newer: **the overlap ends.** A handover
+//! is the one moment two processes may serve one port, and it is bounded at
+//! both ends. The successor proves it is a successor with a token its
+//! predecessor minted (see [`handover`]) rather than with an environment
+//! variable anyone could be carrying, and it is not the relay until it holds
+//! the port lease in [`crate::lock`] — which it can only take once the
+//! predecessor is gone. A predecessor that will not go is moved along. Two
+//! instances for a few seconds during a rotation is the design; two instances
+//! afterwards is the bug this is written against.
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -42,14 +52,34 @@ use crate::state::AppState;
 
 /// Set in the child so it knows it was spawned by a rotation rather than by a
 /// person, and carries the generation number for the log line.
+///
+/// On its own it proves nothing. An environment variable is inherited by every
+/// descendant of whoever set it, exported by a shell profile that once needed
+/// it, and left behind in a `tmux` pane from last week — and this one used to
+/// be enough to skip the duplicate check entirely. [`HANDOVER_ENV`] is what a
+/// real successor also carries.
 pub const GENERATION_ENV: &str = "CHTTING_GENERATION";
+
+/// The one-shot token a predecessor mints for the successor it is spawning.
+///
+/// Its match is written to a file in the run directory that the successor
+/// consumes and deletes, so the token is good exactly once, only for the
+/// process it was minted for, and only while the predecessor that minted it is
+/// still alive. A stale `CHTTING_GENERATION` with no matching token is not a
+/// handover, and the process carrying it starts as what it actually is: a
+/// hand-started relay that has to take the port lease like any other.
+pub const HANDOVER_ENV: &str = "CHTTING_HANDOVER";
 
 /// How long the new instance is given to bind its ports and say so.
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Where the two processes leave notes for each other.
+pub fn run_dir_in(data: &Path) -> PathBuf {
+    data.join("run")
+}
+
 fn run_dir(state: &AppState) -> PathBuf {
-    state.paths.data.join("run")
+    run_dir_in(&state.paths.data)
 }
 
 /// The marker a starting instance writes once it is actually listening.
@@ -65,8 +95,23 @@ fn tunnel_lock(state: &AppState) -> PathBuf {
 }
 
 /// The pidfile naming the instance that owns the listening sockets.
+///
+/// A note, not a lock. What decides who may serve is the kernel-held port lease
+/// in [`crate::lock`]; this file exists so a refusal can name the pid to stop
+/// and so `--replace` has somebody to ask. It is allowed to be missing, stale
+/// or wrong without anything going wrong: every path that reads it treats it as
+/// a hint and falls back on the lease itself.
+pub fn serve_lock_in(data: &Path) -> PathBuf {
+    run_dir_in(data).join("serving.pid")
+}
+
 fn serve_lock(state: &AppState) -> PathBuf {
-    run_dir(state).join("serving.pid")
+    serve_lock_in(&state.paths.data)
+}
+
+/// The handover token a predecessor leaves for one named successor.
+fn handover_note(data: &Path, generation: u64) -> PathBuf {
+    run_dir_in(data).join(format!("handover-{generation}"))
 }
 
 /// This process's generation, from the environment. 0 for one started by hand.
@@ -96,46 +141,77 @@ pub async fn announce_ready(state: &Arc<AppState>) {
     }
 }
 
-/// Refuse to become a second relay on ports that already have one.
+/// What a validated handover looks like from the successor's side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handover {
+    pub generation: u64,
+    /// The instance this one is replacing. It is still serving right now, and
+    /// it is the pid to move along if it overstays.
+    pub predecessor: u32,
+}
+
+/// Am I actually a rotation successor?
 ///
-/// `SO_REUSEPORT` is what makes the rotation in this module possible, and it is
-/// also why nothing else catches this: the bind *succeeds*. Two instances then
-/// listen on the same port and the kernel hands each new connection to one of
-/// them at random, so the relay answers out of whichever config that process
-/// happens to hold. A key minted in one of them is unknown to the other, and
-/// the caller sees `invalid API key` on a fraction of requests exactly equal to
-/// the stale instance's share of the sockets.
+/// Three things have to hold, and any one of them missing means no: the
+/// environment carries a generation and a token, a note in the run directory
+/// matches that token, and the predecessor named in it is still alive. The note
+/// is deleted as it is read, so the token is spent — a process restarted later
+/// with the same environment is not a successor a second time.
 ///
-/// A rotation is the one case where two instances on one port is correct, and
-/// it is told apart by its generation: a successor is spawned with one and
-/// takes the lock over, because the predecessor is on its way out. Anything
-/// started by hand is generation 0 and has to say so with `--replace`.
+/// Answering `None` is never a licence to serve. It only means this process
+/// takes the port lease the way a hand-started one does: by taking it, or by
+/// not starting.
+pub async fn handover(data: &Path) -> Option<Handover> {
+    let generation: u64 = std::env::var(GENERATION_ENV).ok()?.trim().parse().ok()?;
+    if generation == 0 {
+        return None;
+    }
+    let presented = std::env::var(HANDOVER_ENV).ok()?;
+    let presented = presented.trim();
+    if presented.is_empty() {
+        return None;
+    }
+
+    let note = handover_note(data, generation);
+    let written = tokio::fs::read_to_string(&note).await.ok()?;
+    // Spent on sight, whether or not it turns out to match: a token that has
+    // been looked at is not offered to anybody else.
+    let _ = tokio::fs::remove_file(&note).await;
+
+    let mut parts = written.split_whitespace();
+    let token = parts.next()?;
+    let predecessor: u32 = parts.next()?.parse().ok()?;
+    if !crate::util::safe_equal(token, presented) {
+        return None;
+    }
+    // A predecessor that is already gone is not handing anything over, and the
+    // lease is free for the taking anyway.
+    crate::lock::is_alive(predecessor).then_some(Handover {
+        generation,
+        predecessor,
+    })
+}
+
+/// Write down who is serving, for the next process that has to ask.
 ///
-/// The lock is advisory and deliberately cheap to recover from: a pid that no
-/// longer exists, or one that has been recycled by an unrelated process, does
-/// not hold anything.
-pub async fn claim_serving(state: &Arc<AppState>, replace: bool) -> Result<()> {
-    let lock = serve_lock(state);
+/// Best-effort by design. The port lease is what actually stops a second
+/// instance; this only makes the refusal able to say a pid instead of "somebody".
+pub async fn record_serving(data: &Path, pid: u32) {
+    let lock = serve_lock_in(data);
     if let Some(dir) = lock.parent() {
         let _ = tokio::fs::create_dir_all(dir).await;
     }
+    let _ = tokio::fs::write(&lock, pid.to_string()).await;
+}
 
-    if generation() == 0 && !replace {
-        if let Some(pid) = live_owner(&lock).await.filter(|p| is_this_relay(*p)) {
-            bail!(
-                "this relay is already running as pid {pid}.\n\
-                 Starting a second copy would not fail on the port — SO_REUSEPORT lets \
-                 both bind it — it would split the traffic between them, and the older \
-                 process would answer out of the config it started with. That is what \
-                 makes a freshly minted key come back \"invalid API key\" on some \
-                 requests and work on others.\n\
-                 Stop pid {pid} first, or pass --replace to take the port over."
-            );
-        }
-    }
-
-    tokio::fs::write(&lock, std::process::id().to_string()).await?;
-    Ok(())
+/// Who the pidfile says is serving, if it is somebody that still exists.
+///
+/// A hint for an error message and a target for `--replace`. A wrong answer
+/// here costs a less helpful message, never a second relay.
+pub async fn recorded_owner(data: &Path) -> Option<u32> {
+    let contents = tokio::fs::read_to_string(serve_lock_in(data)).await.ok()?;
+    let pid: u32 = contents.trim().parse().ok()?;
+    (pid != std::process::id() && crate::lock::is_alive(pid)).then_some(pid)
 }
 
 /// Give the serve lock up, but only if it is still ours: a successor that
@@ -148,26 +224,6 @@ pub async fn release_serving(state: &Arc<AppState>) {
             let _ = tokio::fs::remove_file(&lock).await;
         }
     }
-}
-
-/// Is this pid one of ours, or a number Linux has since handed to something
-/// else? Refusing to start because an unrelated process inherited the pid
-/// would be a worse failure than the duplicate this is guarding against.
-fn is_this_relay(pid: u32) -> bool {
-    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    // /proc separates argv with NULs; argv[0] is the path the binary was run
-    // from, which may be absolute, relative, or a bare name.
-    cmdline
-        .split(|b| *b == 0)
-        .next()
-        .and_then(|argv0| std::str::from_utf8(argv0).ok())
-        .is_some_and(|argv0| {
-            std::path::Path::new(argv0)
-                .file_name()
-                .is_some_and(|n| n == env!("CARGO_PKG_NAME"))
-        })
 }
 
 /// Take the tunnel lock, waiting a bounded time for a predecessor to drop it.
@@ -221,11 +277,7 @@ async fn live_owner(lock: &Path) -> Option<u32> {
     if pid == std::process::id() {
         return None;
     }
-    // No kill(0) without libc; /proc answers the same question on Android.
-    tokio::fs::try_exists(format!("/proc/{pid}"))
-        .await
-        .unwrap_or(false)
-        .then_some(pid)
+    crate::lock::is_alive(pid).then_some(pid)
 }
 
 /// Delete markers left by instances that are long gone.
@@ -237,7 +289,12 @@ pub async fn sweep(state: &Arc<AppState>) {
     let generation = generation();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix("ready-") else {
+        // A note for a handover that never happened is as finished as a
+        // readiness marker for an instance that never came up.
+        let Some(rest) = name
+            .strip_prefix("ready-")
+            .or_else(|| name.strip_prefix("handover-"))
+        else {
             continue;
         };
         // Ours and anything newer stays; older markers are finished business.
@@ -259,12 +316,24 @@ pub async fn spawn_successor(state: &Arc<AppState>) -> Result<u32> {
         tokio::fs::create_dir_all(dir).await?;
     }
 
+    // The token that tells the successor apart from a process that merely
+    // inherited our environment. Written where only a successor started from
+    // this data directory will look, alongside the pid it is replacing, and
+    // spent the first time it is read.
+    let token = crate::util::new_id("ho");
+    tokio::fs::write(
+        handover_note(&state.paths.data, generation),
+        format!("{token} {}", std::process::id()),
+    )
+    .await?;
+
     let exe = own_binary()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut command = tokio::process::Command::new(&exe);
     command
         .args(&args)
         .env(GENERATION_ENV, generation.to_string())
+        .env(HANDOVER_ENV, &token)
         // Detached: it has to outlive us, and it must not die with our session.
         .stdin(std::process::Stdio::null())
         .kill_on_drop(false);
@@ -334,6 +403,116 @@ pub async fn drain(state: &Arc<AppState>, timeout: Duration) -> usize {
 mod tests {
     use super::*;
 
+    /// The process environment is one shared thing, and `cargo test` runs these
+    /// on several threads at once. Every test that sets a variable takes this
+    /// first, so they take turns instead of reading each other's.
+    static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold the environment, and leave it as clean as it was found.
+    struct EnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl EnvGuard {
+        fn take() -> EnvGuard {
+            let guard = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var(GENERATION_ENV);
+            std::env::remove_var(HANDOVER_ENV);
+            EnvGuard(guard)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(GENERATION_ENV);
+            std::env::remove_var(HANDOVER_ENV);
+        }
+    }
+
+    /// A scratch data directory.
+    async fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(crate::util::new_id("rot"));
+        tokio::fs::create_dir_all(run_dir_in(&dir)).await.unwrap();
+        dir
+    }
+
+    /// The bypass this closes: `CHTTING_GENERATION` is inherited by every
+    /// descendant of whoever set it, and on its own it used to be enough to
+    /// skip the duplicate check entirely. A generation without the token its
+    /// predecessor minted is somebody carrying an old environment, and it
+    /// starts as what it is.
+    #[tokio::test]
+    async fn a_generation_number_alone_does_not_make_a_successor() {
+        let _env = EnvGuard::take();
+        let dir = scratch().await;
+        std::env::set_var(GENERATION_ENV, "7");
+        assert_eq!(handover(&dir).await, None, "no token at all");
+
+        std::env::set_var(HANDOVER_ENV, "ho_invented");
+        assert_eq!(handover(&dir).await, None, "a token nobody minted");
+
+        tokio::fs::write(
+            handover_note(&dir, 7),
+            format!("ho_real {}", std::process::id()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(handover(&dir).await, None, "a token that does not match");
+    }
+
+    #[tokio::test]
+    async fn a_minted_token_is_good_once_and_only_while_its_minter_lives() {
+        let _env = EnvGuard::take();
+        let dir = scratch().await;
+        std::env::set_var(GENERATION_ENV, "3");
+        std::env::set_var(HANDOVER_ENV, "ho_abc");
+
+        tokio::fs::write(
+            handover_note(&dir, 3),
+            format!("ho_abc {}", std::process::id()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            handover(&dir).await,
+            Some(Handover {
+                generation: 3,
+                predecessor: std::process::id(),
+            })
+        );
+        // Spent: a process restarted later with the same environment is not a
+        // successor a second time.
+        assert_eq!(
+            handover(&dir).await,
+            None,
+            "the token was still good after being used"
+        );
+
+        // And a predecessor that is already gone is handing nothing over.
+        tokio::fs::write(handover_note(&dir, 3), "ho_abc 4194305")
+            .await
+            .unwrap();
+        assert_eq!(handover(&dir).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_pidfile_is_a_hint_and_says_so_by_never_naming_the_dead() {
+        let dir = scratch().await;
+        assert_eq!(recorded_owner(&dir).await, None, "nothing written yet");
+
+        record_serving(&dir, 4_194_305).await;
+        assert_eq!(recorded_owner(&dir).await, None, "a pid that cannot exist");
+
+        record_serving(&dir, std::process::id()).await;
+        assert_eq!(
+            recorded_owner(&dir).await,
+            None,
+            "our own pid is not somebody else to ask to stop"
+        );
+
+        // pid 1 is alive on every Linux box, and is somebody else.
+        record_serving(&dir, 1).await;
+        assert_eq!(recorded_owner(&dir).await, Some(1));
+    }
+
     #[tokio::test]
     async fn a_lock_left_by_a_dead_process_is_not_waited_on() {
         let dir = std::env::temp_dir().join(crate::util::new_id("rot"));
@@ -383,15 +562,6 @@ mod tests {
     }
 
     #[test]
-    fn a_pid_that_belongs_to_something_else_does_not_block_a_start() {
-        // pid 1 exists on every Linux box and is never this binary. Refusing to
-        // start because an unrelated process inherited a recycled pid would be
-        // a worse failure than the duplicate instance being guarded against.
-        assert!(!is_this_relay(1));
-        assert!(!is_this_relay(4_194_305), "and one that cannot exist");
-    }
-
-    #[test]
     fn the_successor_is_started_from_a_binary_that_exists() {
         // On a normal run this is just current_exe; the point of the test is
         // that whatever comes back is something that can actually be spawned,
@@ -403,6 +573,7 @@ mod tests {
 
     #[test]
     fn a_relay_started_by_hand_is_generation_zero() {
+        let _env = EnvGuard::take();
         // Nobody is waiting on a marker from an instance a person started, and
         // generation() is what announce_ready checks before writing one.
         std::env::remove_var(GENERATION_ENV);

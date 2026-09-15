@@ -345,6 +345,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "include_dir",
+ "libc",
  "parking_lot",
  "percent-encoding",
  "rand 0.9.5",
