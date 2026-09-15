@@ -978,6 +978,24 @@ of this model's own rate card when `pricing.enabled` is on — the same figure
 divided by a million. An operator who priced the model once does not have to
 type it again per token.
 
+### The three bands on the public listing
+
+The sell-side rate card has three bands — `nonThinking`, the standard rates, and
+`maxThinking` — and the public listing publishes all three under
+`pricing.bands`, keyed `non_thinking`, `default` and `max`, cheapest first. Each
+one carries a display `name`, the `efforts` that land a request on it, and a
+complete per-token price rather than only the rates that band moves, so nobody
+reading the max band has to walk back up the document to find its input rate.
+
+The top-level `pricing.prompt` and friends stay the **standard** band, so a
+client that only knows `pricing.prompt` reads what it always read. Which band a
+request that sends no `reasoning_effort` is billed at is `defaults.effort`'s
+business, not the standard band's, so the listing says which one it is in
+`pricing.default_band` instead of leaving it to be inferred.
+
+With `pricing.enabled` off there are no bands to read, and all three publish the
+one per-token price — said three times rather than left to be guessed at.
+
 Capacity is what the model can actually sustain:
 
 | Key | Meaning |

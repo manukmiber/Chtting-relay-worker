@@ -33,14 +33,32 @@
 //! different unit, which is arithmetic rather than invention — or left out
 //! entirely. A missing price is a question; a wrong one is a bill.
 //!
-//! `pricing.overrides` is what makes the listing complete rather than
-//! approximate: these models are not sold at one rate, they are sold at a rate
-//! that moves with the hour and the day, and a listing that publishes only the
-//! off-peak number is a listing nobody can reconcile an invoice against.
+//! Two things make the listing complete rather than approximate, and both are
+//! there for the same reason: these models are not sold at one rate.
+//!
+//! * `pricing.bands` — the rate moves with how hard the caller asked the model
+//!   to think. Thinking off is cheaper than ordinary thinking; maximum effort
+//!   is dearer. All three are published side by side, whole and whether or not
+//!   they differ, because a listing that quotes the middle one and leaves the
+//!   other two to be discovered from an invoice is a half-truth. Which band a
+//!   caller who names no effort lands on is its own question, so
+//!   `pricing.default_band` answers it by name rather than leaving it inferred.
+//! * `pricing.overrides` — the rate also moves with the hour and the day, and a
+//!   listing that publishes only the off-peak number is one nobody can
+//!   reconcile an invoice against.
+//!
+//! And the envelope carries no blanks. A `description` nobody wrote, a
+//! `context_length` of `0`, a `max_completion_tokens` of `null`, an empty
+//! `default_parameters` — every one of those is a field a client has to
+//! special-case, and `0` in particular is worse than silence: it reads as a
+//! model with no room in it. An unset value is left out, so what is present is
+//! known.
 
 use serde_json::{json, Map, Value};
 
-use crate::config::{Config, Model, OpenRouterPricing, PricingOverride, RequestTransform};
+use crate::config::{
+    BandRates, Config, Model, OpenRouterPricing, Pricing, PricingOverride, RequestTransform,
+};
 use crate::pricing::Effort;
 use crate::util::per_token;
 
@@ -94,22 +112,27 @@ pub fn model_document(model: &Model, cfg: &Config) -> Value {
             model.created_at / 1000
         }),
     );
-    doc.insert("description".into(), json!(model.description));
+    if !model.description.is_empty() {
+        doc.insert("description".into(), json!(model.description));
+    }
 
     // The two numbers that bound a request, side by side. `max_completion_tokens`
     // used to sit inside `top_provider`, which said there was a provider and
     // implied there could be several; as a property of the model it reads as
     // what it is, and a caller reaching for it has one place to look.
-    doc.insert("context_length".into(), json!(context_length(model)));
+    //
+    // A bound nobody set is left out rather than published as `0` or `null`. A
+    // client that finds no `context_length` falls back to its own default; one
+    // that finds `0` believes the model has no room in it and clamps every
+    // request to nothing.
+    let context = context_length(model);
+    if context > 0 {
+        doc.insert("context_length".into(), json!(context));
+    }
     let max_out = max_output(model);
-    doc.insert(
-        "max_completion_tokens".into(),
-        if max_out > 0 {
-            json!(max_out)
-        } else {
-            Value::Null
-        },
-    );
+    if max_out > 0 {
+        doc.insert("max_completion_tokens".into(), json!(max_out));
+    }
 
     doc.insert("architecture".into(), architecture(model));
 
@@ -122,10 +145,10 @@ pub fn model_document(model: &Model, cfg: &Config) -> Value {
         "supported_parameters".into(),
         json!(supported_parameters(model, cfg)),
     );
-    doc.insert(
-        "default_parameters".into(),
-        Value::Object(default_parameters(model)),
-    );
+    let defaults = default_parameters(model);
+    if !defaults.is_empty() {
+        doc.insert("default_parameters".into(), Value::Object(defaults));
+    }
     if o.supports_reasoning {
         doc.insert("reasoning".into(), reasoning(model));
     }
@@ -274,7 +297,10 @@ pub fn base_card(model: &Model, cfg: &Config) -> Card {
         cached_prompt: per_token(resolved.cached_input_usd_per_m),
         cache_write: String::new(),
         internal_reasoning: per_token(resolved.reasoning_usd_per_m),
-        request: per_token(resolved.request_usd),
+        // Not per-token: `requestUsd` is what one request costs, flat. Dividing
+        // it by a million published the one fee on the card at a millionth of
+        // its size — the one number a caller could not reconcile.
+        request: flat_usd(resolved.request_usd),
     };
     derived.over(&explicit)
 }
@@ -357,6 +383,12 @@ fn pricing(model: &Model, cfg: &Config) -> Map<String, Value> {
         return out;
     }
 
+    // The rates above are the standard band. Which of the three a caller who
+    // named no effort actually pays is a separate question with its own answer,
+    // so it is named rather than inferred.
+    out.insert("default_band".into(), json!(default_band(cfg)));
+    out.insert("bands".into(), Value::Object(bands(model, cfg, &base)));
+
     // Every window publishes a whole price, not the one field it moved: a
     // caller reading the third override should not have to walk back up the
     // list to learn what the other two rates are during that hour.
@@ -382,6 +414,113 @@ fn pricing(model: &Model, cfg: &Config) -> Map<String, Value> {
         out.insert("overrides".into(), Value::Array(windows));
     }
     out
+}
+
+/* --------------------------------------------------------------- bands -- */
+
+/// The three prices one model is actually sold at, cheapest first.
+///
+/// Nobody buys "the model"; they buy the model at an effort, and the rate moves
+/// with it. Each entry is the band's id — what a client keys off — the name a
+/// human reads, and the `reasoning_effort` values that land a request on it.
+const BANDS: [(&str, &str, &[&str]); 3] = [
+    ("non_thinking", "Non-thinking", &["none", "minimal"]),
+    ("default", "Default", &["low", "medium", "high"]),
+    ("max", "Max", &["max"]),
+];
+
+/// The rate card this band moves, or `None` for the standard band, which is the
+/// card the listing already quotes at the top level.
+fn band_rates<'a>(id: &str, pricing: &'a Pricing) -> Option<&'a BandRates> {
+    match id {
+        "non_thinking" => Some(&pricing.non_thinking),
+        "max" => Some(&pricing.max_thinking),
+        _ => None,
+    }
+}
+
+/// Each band's whole price, keyed by band id.
+///
+/// Whole, like an override is whole: a caller reading the max band should not
+/// have to walk back up to learn what its input rate is. And published for all
+/// three even when two of them are the same number, because "thinking off costs
+/// the same here" is an answer, and an absent band is a question.
+fn bands(model: &Model, cfg: &Config, base: &Card) -> Map<String, Value> {
+    let resolved = crate::pricing::resolve(&cfg.pricing, model);
+    let mut out = Map::new();
+    for (id, name, efforts) in BANDS {
+        // A relay billing off per-token strings alone has no bands at all, and
+        // neither does one whose rate card is switched off: then all three are
+        // the one price, said three times rather than left to be guessed at.
+        let card = match band_rates(id, &resolved) {
+            Some(band) if resolved.enabled => over_band(base, band),
+            _ => base.clone(),
+        };
+        let mut entry = Map::new();
+        entry.insert("name".into(), json!(name));
+        entry.insert("efforts".into(), json!(efforts));
+        entry.extend(card.to_json());
+        out.insert(id.into(), Value::Object(entry));
+    }
+    out
+}
+
+/// Lay a band's per-million rates over the standing card, exactly as the biller
+/// lays them over the standard rates.
+///
+/// Exactly, including that a band which moves output moves reasoning with it,
+/// because reasoning tokens are output tokens until somebody prices them apart.
+/// A published price arrived at differently from the charged one is not a
+/// published price.
+fn over_band(base: &Card, band: &BandRates) -> Card {
+    let mut card = base.clone();
+    if band.input_usd_per_m > 0.0 {
+        card.prompt = per_token(band.input_usd_per_m);
+    }
+    if band.cached_input_usd_per_m > 0.0 {
+        card.cached_prompt = per_token(band.cached_input_usd_per_m);
+    }
+    if band.output_usd_per_m > 0.0 {
+        card.completion = per_token(band.output_usd_per_m);
+        // Only restated where the standing card states it: a card that leaves
+        // reasoning to follow output has a band that leaves it to follow too.
+        if !card.internal_reasoning.is_empty() {
+            card.internal_reasoning = per_token(band.output_usd_per_m);
+        }
+    }
+    if band.reasoning_usd_per_m > 0.0 {
+        card.internal_reasoning = per_token(band.reasoning_usd_per_m);
+    }
+    card
+}
+
+/// The band a request that names no effort is billed at.
+///
+/// Not always the standard one: it is whatever `defaults.effort` resolves
+/// silence into, and an operator who resolves silence to `none` puts every
+/// unadorned request on the non-thinking band. The caller sending that request
+/// is the one who needs to know.
+fn default_band(cfg: &Config) -> &'static str {
+    match crate::pricing::default_effort(cfg) {
+        Effort::Max => "max",
+        Effort::None | Effort::Minimal | Effort::Unspecified => "non_thinking",
+        Effort::Low | Effort::Medium | Effort::High => "default",
+    }
+}
+
+/// A flat USD amount as the same kind of decimal string the per-token rates are
+/// published as — decimal because a caller checking an invoice compares
+/// decimals, not floats.
+fn flat_usd(usd: f64) -> String {
+    if !usd.is_finite() || usd <= 0.0 {
+        return String::new();
+    }
+    let text = format!("{usd:.12}");
+    let trimmed = text.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        return String::new();
+    }
+    trimmed.to_string()
 }
 
 /* ---------------------------------------------------------- parameters -- */
@@ -632,6 +771,103 @@ mod tests {
         assert_eq!(pricing["prompt"], "0.00000015");
         assert_eq!(pricing["completion"], "0.0000006");
         assert_eq!(pricing["input_cache_read"], "0.000000003");
+    }
+
+    #[test]
+    fn the_listing_publishes_all_three_prices_not_just_the_middle_one() {
+        // The complaint this answers: a price list that quotes one number for a
+        // model sold at three, leaving the other two to be discovered from an
+        // invoice.
+        let mut cfg = setup();
+        cfg.models[0].openrouter.pricing = OpenRouterPricing::default();
+        cfg.models[0].pricing = Pricing {
+            enabled: true,
+            input_usd_per_m: 0.8,
+            cached_input_usd_per_m: 0.2,
+            output_usd_per_m: 4.0,
+            max_thinking: BandRates {
+                output_usd_per_m: 6.0,
+                ..Default::default()
+            },
+            non_thinking: BandRates {
+                output_usd_per_m: 3.5,
+                ..Default::default()
+            },
+            request_usd: 0.002,
+            ..Default::default()
+        };
+
+        let pricing = &document(&cfg)["data"][0]["pricing"];
+        // The top level is still the standard band, so a client that only knows
+        // `pricing.prompt` reads exactly what it always read.
+        assert_eq!(pricing["completion"], "0.000004");
+        // A flat per-request fee is a flat fee, not a per-token rate.
+        assert_eq!(pricing["request"], "0.002");
+
+        let bands = &pricing["bands"];
+        assert_eq!(bands["non_thinking"]["completion"], "0.0000035");
+        assert_eq!(bands["default"]["completion"], "0.000004");
+        assert_eq!(bands["max"]["completion"], "0.000006");
+        // Whole prices: a band that moved only its output still says what its
+        // input costs, so nobody has to walk back up the document.
+        for band in ["non_thinking", "default", "max"] {
+            assert_eq!(bands[band]["prompt"], "0.0000008", "{band}");
+            assert_eq!(bands[band]["input_cache_read"], "0.0000002", "{band}");
+        }
+        assert_eq!(bands["max"]["name"], "Max");
+        assert_eq!(bands["max"]["efforts"][0], "max");
+        assert_eq!(bands["non_thinking"]["efforts"][0], "none");
+        // Cheapest first, which is the order a menu is read in.
+        let order: Vec<&String> = bands.as_object().unwrap().keys().collect();
+        assert_eq!(order, ["non_thinking", "default", "max"]);
+    }
+
+    #[test]
+    fn the_listing_names_the_band_a_caller_who_says_nothing_lands_on() {
+        let mut cfg = setup();
+        let band_of = |cfg: &Config| document(cfg)["data"][0]["pricing"]["default_band"].clone();
+        // Silence ships resolving to `high`, which is the standard band.
+        assert_eq!(band_of(&cfg), "default");
+        cfg.defaults.effort = "none".into();
+        assert_eq!(band_of(&cfg), "non_thinking");
+        cfg.defaults.effort = "max".into();
+        assert_eq!(band_of(&cfg), "max");
+    }
+
+    #[test]
+    fn a_relay_with_no_rate_card_still_publishes_three_bands() {
+        // Priced by per-token strings alone, so there are no bands to read: the
+        // one price is said three times rather than left to be guessed at.
+        let cfg = setup();
+        let bands = &document(&cfg)["data"][0]["pricing"]["bands"];
+        for band in ["non_thinking", "default", "max"] {
+            assert_eq!(bands[band]["prompt"], "0.00000015", "{band}");
+            assert_eq!(bands[band]["completion"], "0.0000006", "{band}");
+        }
+    }
+
+    #[test]
+    fn a_field_nobody_filled_in_is_left_out_rather_than_published_blank() {
+        let mut cfg = setup();
+        cfg.models[0].description = String::new();
+        cfg.models[0].context_length = 0;
+        cfg.models[0].limits.max_output_tokens = 0;
+
+        let m = &document(&cfg)["data"][0];
+        for blank in [
+            "description",
+            "context_length",
+            "max_completion_tokens",
+            "default_parameters",
+        ] {
+            assert!(
+                m.get(blank).is_none(),
+                "{blank} was published as a blank a client has to special-case"
+            );
+        }
+        // What is there is still there.
+        assert_eq!(m["id"], "zeikoai/wissangeni-flash");
+        assert_eq!(m["object"], "model");
     }
 
     #[test]

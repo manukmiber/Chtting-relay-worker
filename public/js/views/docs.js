@@ -89,7 +89,7 @@ function buildDoc(state) {
 function endpointSection(baseUrl, origin, localUrl, tunnelUrl, cfg) {
   const rows = [
     ['GET', '/health', 'no', 'Liveness, and how many models are available.'],
-    ['GET', '/v1/models', 'yes', 'The model catalogue: `context_length`, `max_completion_tokens`, `architecture`, `pricing` with its hour-and-day windows, `supported_parameters`, `reasoning`.'],
+    ['GET', '/v1/models', 'yes', 'The model catalogue: `context_length`, `max_completion_tokens`, `architecture`, `pricing` with all three effort bands and its hour-and-day windows, `supported_parameters`, `reasoning`.'],
     ['GET', '/models', 'yes', 'The same listing, for clients that omit `/v1`.'],
     ['GET', '/v1/models/{id}', 'yes', 'One model, or 404 with `model_not_found`. Ids containing a `/` work as written.'],
     ['GET', '/models/{id}', 'yes', 'The same, without the prefix.'],

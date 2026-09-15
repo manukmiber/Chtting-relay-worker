@@ -498,6 +498,15 @@ and every frame ends with a blank line.)</p>
       not per million. <code>"0.000000003"</code> loses its last digits through a float.</li>
   <li><strong>A missing <code>pricing</code> object means no published price</strong>, not a free
       model.</li>
+  <li><strong>These models are sold at three prices, not one.</strong> Which one you pay is
+      decided by the <code>reasoning_effort</code> you send, before anything else is read.
+      <code>pricing.bands</code> publishes all three; the top-level rates are the
+      <code>default</code> band, and <code>pricing.default_band</code> names the one a request
+      that sends no <code>reasoning_effort</code> at all lands on.</li>
+  <li><strong>A field that is absent was never set.</strong> An unset <code>description</code>,
+      <code>context_length</code>, <code>max_completion_tokens</code> or
+      <code>default_parameters</code> is left out rather than published as <code>""</code>,
+      <code>0</code> or <code>null</code>.</li>
 </ol>
 
 <pre class="long"><code>{
@@ -523,7 +532,24 @@ and every frame ends with a blank line.)</p>
         "completion": "0.0000006",
         "input_cache_read": "0.000000003",
         "internal_reasoning": "0.0000006",
-        "request": "0",
+        "default_band": "default",
+        "bands": {
+          "non_thinking": {
+            "name": "Non-thinking", "efforts": ["none","minimal"],
+            "prompt": "0.00000015", "completion": "0.0000005",
+            "input_cache_read": "0.000000003", "internal_reasoning": "0.0000005"
+          },
+          "default": {
+            "name": "Default", "efforts": ["low","medium","high"],
+            "prompt": "0.00000015", "completion": "0.0000006",
+            "input_cache_read": "0.000000003", "internal_reasoning": "0.0000006"
+          },
+          "max": {
+            "name": "Max", "efforts": ["max"],
+            "prompt": "0.00000015", "completion": "0.0000009",
+            "input_cache_read": "0.000000003", "internal_reasoning": "0.0000009"
+          }
+        },
         "overrides": [
           { "utc_days": ["monday","friday"], "utc_start": 100, "utc_end": 400,
             "prompt": "0.0000003", "completion": "0.0000012",
@@ -559,7 +585,9 @@ and every frame ends with a blank line.)</p>
 <tr><td><code>pricing.input_cache_read</code></td><td>Cache-hit input. Absent means a cache hit is <strong>not</strong> discounted, not that it is free.</td></tr>
 <tr><td><code>pricing.input_cache_write</code></td><td>Cache write, where one is charged.</td></tr>
 <tr><td><code>pricing.internal_reasoning</code></td><td>Reasoning tokens. Absent means they bill at the output rate.</td></tr>
-<tr><td><code>pricing.request</code></td><td>A flat per-request amount, where there is one.</td></tr>
+<tr><td><code>pricing.request</code></td><td>A flat per-request amount, where there is one. Flat, not per token.</td></tr>
+<tr><td><code>pricing.bands</code></td><td><strong>Price by thinking effort.</strong> Three entries, cheapest first: <code>non_thinking</code>, <code>default</code>, <code>max</code>. Each carries a human <code>name</code>, the <code>efforts</code> that land a request on it, and <strong>a complete price</strong> &mdash; not only the rates that band moves. Published for all three even where two are the same number.</td></tr>
+<tr><td><code>pricing.default_band</code></td><td>Which of the three a request that names no <code>reasoning_effort</code> is billed at. Usually <code>default</code>, but not necessarily &mdash; read it rather than assume it.</td></tr>
 <tr><td><code>pricing.overrides[]</code></td><td><strong>Time-of-day pricing.</strong> Optional <code>utc_days</code> (lowercase weekday names) and optional <code>utc_start</code>/<code>utc_end</code> as <code>HHMM</code> integers in UTC: <code>100</code> is 01:00, <code>1430</code> is 14:30. Half-open: start inclusive, end exclusive; an end before its start wraps midnight; no times means all day. <strong>Each override publishes a complete price</strong>, not only the fields it moves.</td></tr>
 <tr><td><code>supported_parameters</code></td><td>Exactly what this model accepts, sorted.</td></tr>
 <tr><td><code>default_parameters</code></td><td>Applied when you do not send them. Override any of them freely.</td></tr>
@@ -579,8 +607,10 @@ response. Cached input is carved out of <code>prompt_tokens</code> and reasoning
      +  reasoning_tokens                       * pricing.internal_reasoning
      +  pricing.request</code></pre>
 
-<p>Use whichever <code>overrides</code> entry covers the UTC moment the request ran, and the
-standing rates otherwise.</p>
+<p>Start from the band you asked for &mdash; <code>pricing.bands[&hellip;]</code> for the
+<code>reasoning_effort</code> you sent, or <code>pricing.bands[pricing.default_band]</code> if you
+sent none. Then use whichever <code>overrides</code> entry covers the UTC moment the request
+ran, and the standing rates otherwise.</p>
 
 <!-- ==================================================================== -->
 <h2 id="s8">8. Errors</h2>

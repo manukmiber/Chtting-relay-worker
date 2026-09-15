@@ -1076,9 +1076,23 @@ dan sebagian lagi sudah diberi base URL yang berakhir di situ.
 
 `GET /v1/models` memakai amplop OpenAI di luar (`object: "list"`,
 `object: "model"`, `owned_by`) dan dokumen model OpenRouter di dalam:
-`architecture`, `pricing` lengkap dengan `overrides` per jam dan per hari,
-`top_provider`, `supported_parameters`, `reasoning`. Klien OpenAI lama tetap
-jalan; klien yang mau tahu harga tidak perlu bertanya ke siapa pun.
+`architecture`, `pricing`, `supported_parameters`, `reasoning`. Klien OpenAI
+lama tetap jalan; klien yang mau tahu harga tidak perlu bertanya ke siapa pun.
+
+Harganya diumumkan **ketiga-tiganya**, bukan cuma yang tengah. Model-model ini
+tidak dijual satu harga: tarifnya ikut seberapa keras si pemanggil menyuruh
+model berpikir. `pricing.bands` berisi `non_thinking`, `default`, dan `max` —
+urut dari yang termurah, masing-masing dengan nama, daftar `efforts` yang
+mendaratkan request ke situ, dan **harga utuh**, bukan cuma angka yang berubah.
+`pricing.default_band` menyebut band mana yang kena kalau request tidak
+menyertakan `reasoning_effort` sama sekali. Di sebelahnya `pricing.overrides`
+tetap mengurus sisi yang lain: tarif yang bergerak per jam dan per hari.
+
+Yang tidak pernah diisi tidak ikut diumumkan. `description` kosong,
+`context_length` `0`, `max_completion_tokens` `null`, `default_parameters` `{}`
+— semuanya dihilangkan, bukan dikirim sebagai blanko yang harus di-*special
+case* klien. `0` malah lebih buruk daripada diam: terbaca sebagai model yang
+tidak punya ruang sama sekali.
 
 ---
 
