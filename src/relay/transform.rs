@@ -232,6 +232,123 @@ const THINKING_KEYS: [&str; 5] = [
     "include_reasoning",
 ];
 
+/// Every field DeepSeek's chat-completions API documents, and therefore the
+/// whole of what a route pointed at it is sent.
+///
+/// A whitelist rather than a list of exclusions, because the failure mode is
+/// asymmetric: a field DeepSeek has never heard of is a 400 on a request that
+/// was valid when it arrived, while a field it wants and we omit is a default
+/// it fills in itself. `frequency_penalty` and `presence_penalty` are absent on
+/// purpose — the API now answers "this parameter is no longer supported" — and
+/// so are OpenAI's `top_k`, `min_p`, `repetition_penalty`, `seed`, `logit_bias`
+/// and `n`, which it never took.
+///
+/// Thinking is the one that matters: DeepSeek takes it as a `thinking` object,
+/// not as OpenAI's flat `reasoning_effort`, which is why a perfectly good
+/// `reasoning_effort: "none"` came back 400. It is translated rather than
+/// dropped, in [`thinking_for_deepseek`].
+const DEEPSEEK_KEYS: [&str; 10] = [
+    "max_tokens",
+    "messages",
+    "model",
+    "stop",
+    "stream",
+    "stream_options",
+    "temperature",
+    "thinking",
+    "top_p",
+    "user_id",
+];
+
+/// Switched off for now, on the operator's call: JSON mode
+/// (`response_format`), function calling (`tools`, `tool_choice`) and token
+/// probabilities (`logprobs`, `top_logprobs`). DeepSeek documents all five, so
+/// this is a decision about what the service offers rather than about what the
+/// API takes — which is why they are named here instead of quietly missing
+/// from the list above. A caller who sends one gets the request served without
+/// it, and the listing stops advertising it, so nobody integrates against a
+/// feature that is not on.
+const DEEPSEEK_WITHHELD: [&str; 6] = [
+    "logprobs",
+    "response_format",
+    "structured_outputs",
+    "tool_choice",
+    "tools",
+    "top_logprobs",
+];
+
+/// Does DeepSeek take a parameter by this name?
+///
+/// Asked of the names the listing publishes, which are not quite the names in
+/// the body: `reasoning`, `reasoning_effort` and `include_reasoning` are the
+/// relay's own controls and are answered here — translated into DeepSeek's
+/// `thinking` object, or honoured on the reply — so they are supported however
+/// the body ends up spelled.
+pub fn deepseek_takes(name: &str) -> bool {
+    if DEEPSEEK_WITHHELD.contains(&name) {
+        return false;
+    }
+    matches!(name, "reasoning" | "reasoning_effort" | "include_reasoning")
+        || DEEPSEEK_KEYS.contains(&name)
+        || name == "max_completion_tokens"
+}
+
+/// Is this route served by DeepSeek?
+///
+/// The declared `type` first, and the base URL as a fallback so a backend
+/// nobody relabelled is still shaped correctly — the whole point is that the
+/// body matches the API it is about to be posted to.
+pub fn is_deepseek(cfg: &Config, route: &Model) -> bool {
+    cfg.backends
+        .iter()
+        .find(|b| b.id == route.backend)
+        .is_some_and(|b| {
+            b.kind.eq_ignore_ascii_case("deepseek")
+                || b.base_url.to_lowercase().contains("deepseek")
+        })
+}
+
+/// The effort the caller asked for, in DeepSeek's own vocabulary.
+///
+/// Its scale is `none`, `low`, `high`, `max` under a `thinking` object that is
+/// switched on or off, so the relay's six levels fold onto it: thinking off is
+/// `disabled`, `minimal` is thinking switched on at no effort, and `medium`
+/// takes the `low` rate rather than the `high` one — all of `low`, `medium` and
+/// `high` are billed on the standard band here either way, so the cheaper of
+/// the two is the one to buy.
+///
+/// An effort nobody named is not translated at all: DeepSeek's own default is a
+/// better answer than a guess, and `defaults.effort` has already spoken by the
+/// time this runs.
+fn thinking_for_deepseek(effort: Effort) -> Option<Value> {
+    let enabled =
+        |level: &str| Some(serde_json::json!({ "type": "enabled", "reasoning_effort": level }));
+    match effort {
+        Effort::Unspecified => None,
+        Effort::None => Some(serde_json::json!({ "type": "disabled" })),
+        Effort::Minimal => enabled("none"),
+        Effort::Low | Effort::Medium => enabled("low"),
+        Effort::High => enabled("high"),
+        Effort::Max => enabled("max"),
+    }
+}
+
+/// Cut the body down to what DeepSeek accepts, and say the thinking in the way
+/// it is spelled there.
+fn shape_for_deepseek(map: &mut Map<String, Value>, effort: Effort) {
+    // `max_completion_tokens` is OpenAI's newer spelling of a field DeepSeek
+    // only knows by its old name. Renamed rather than dropped, or a caller who
+    // sent the new spelling would lose their own ceiling — and the clamp
+    // further down would then have nothing to cap.
+    if let Some(max) = map.remove("max_completion_tokens") {
+        map.entry("max_tokens".to_string()).or_insert(max);
+    }
+    map.retain(|key, _| DEEPSEEK_KEYS.contains(&key.as_str()));
+    if let Some(thinking) = thinking_for_deepseek(effort) {
+        map.insert("thinking".into(), thinking);
+    }
+}
+
 /// Build the body actually sent upstream.
 pub fn transform_request(
     body: &Value,
@@ -253,6 +370,16 @@ pub fn transform_request(
     }
     for key in THINKING_KEYS {
         map.remove(key);
+    }
+
+    // Before the route's own `params` and `forceParams`, so an operator can
+    // still put anything back deliberately, and before the `stop` and
+    // `max_tokens` clamps below, which then work on the field DeepSeek reads.
+    if is_deepseek(cfg, route) {
+        shape_for_deepseek(
+            map,
+            crate::pricing::effort_of(body).or(crate::pricing::default_effort(cfg)),
+        );
     }
 
     // Parameter defaults the caller may override...
@@ -1018,7 +1145,9 @@ mod tests {
     /// published thinking bands could not be selected at all.
     #[test]
     fn the_thinking_controls_the_relay_answers_itself_do_not_go_upstream() {
-        let (cfg, route) = cfg_with_route();
+        let (mut cfg, route) = cfg_with_route();
+        // Not a DeepSeek route: this is the shape every backend gets.
+        cfg.backends[0].base_url = "https://api.example.com/v1".into();
         let body = serde_json::json!({
             "messages": [],
             "reasoning_effort": "none",
@@ -1044,12 +1173,118 @@ mod tests {
         assert_eq!(out["temperature"], 0.4, "the rest of the body is untouched");
     }
 
+    /// The body that goes to DeepSeek is the body DeepSeek documents: the
+    /// thinking said its way, the fields it never took gone, and nothing else
+    /// disturbed.
+    #[test]
+    fn a_deepseek_route_is_sent_what_deepseek_accepts() {
+        let (cfg, route) = cfg_with_route();
+        let out = transform_request(
+            &serde_json::json!({
+                "messages": [],
+                "reasoning_effort": "none",
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "top_k": 40,
+                "min_p": 0.05,
+                "repetition_penalty": 1.1,
+                "frequency_penalty": 0.5,
+                "presence_penalty": 0.5,
+                "seed": 7,
+                "logit_bias": {"1": 1},
+                "max_completion_tokens": 900,
+                "tools": [],
+                "tool_choice": "auto",
+            }),
+            &route,
+            &cfg,
+            &ResolvedRequestTransform::default(),
+            &route.system_prompt,
+        );
+
+        // Thinking off, in the only spelling this API has for it.
+        assert_eq!(out["thinking"]["type"], "disabled");
+        assert!(out.get("reasoning_effort").is_none());
+        // The newer spelling of a field it knows by the older name.
+        assert_eq!(out["max_tokens"], 900);
+        assert!(out.get("max_completion_tokens").is_none());
+        // Never taken, or no longer taken: every one of these was a 400
+        // waiting to happen.
+        for gone in [
+            "top_k",
+            "min_p",
+            "repetition_penalty",
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+            "logit_bias",
+        ] {
+            assert!(out.get(gone).is_none(), "{gone} still goes to DeepSeek");
+        }
+        // And what it does take arrives untouched.
+        assert_eq!(out["temperature"], 0.4);
+        assert_eq!(out["top_p"], 0.9);
+        assert_eq!(out["model"], "Deepseek-v4-flash-0731");
+        // Withheld for now, so they do not travel and are not advertised.
+        for off in DEEPSEEK_WITHHELD {
+            assert!(out.get(off).is_none(), "{off} is switched off");
+            assert!(!deepseek_takes(off), "{off} must not be advertised");
+        }
+    }
+
+    /// Each level the relay prices, in DeepSeek's coarser scale.
+    #[test]
+    fn every_effort_the_relay_prices_reaches_deepseek_as_thinking() {
+        let (mut cfg, route) = cfg_with_route();
+        let sent = |cfg: &Config, body: Value| {
+            transform_request(
+                &body,
+                &route,
+                cfg,
+                &ResolvedRequestTransform::default(),
+                &route.system_prompt,
+            )
+        };
+        let level = |cfg: &Config, effort: &str| {
+            sent(
+                cfg,
+                serde_json::json!({"messages": [], "reasoning_effort": effort}),
+            )["thinking"]
+                .clone()
+        };
+
+        assert_eq!(level(&cfg, "minimal")["reasoning_effort"], "none");
+        assert_eq!(level(&cfg, "minimal")["type"], "enabled");
+        assert_eq!(level(&cfg, "low")["reasoning_effort"], "low");
+        // No `medium` upstream, and all three are one band here, so it buys
+        // the cheaper of the two.
+        assert_eq!(level(&cfg, "medium")["reasoning_effort"], "low");
+        assert_eq!(level(&cfg, "high")["reasoning_effort"], "high");
+        assert_eq!(level(&cfg, "max")["reasoning_effort"], "max");
+
+        // Silence follows the operator's setting, which is what the price band
+        // and the system prompt already follow.
+        assert_eq!(
+            sent(&cfg, serde_json::json!({"messages": []}))["thinking"]["reasoning_effort"],
+            "high"
+        );
+        cfg.defaults.effort = "default".into();
+        assert!(
+            sent(&cfg, serde_json::json!({"messages": []}))
+                .get("thinking")
+                .is_none(),
+            "an effort nobody named is DeepSeek's own default, not a guess"
+        );
+    }
+
     /// The escape hatch the routing keys have, on the same terms: a route
     /// pointed at a backend that really does take a thinking parameter sets it
     /// itself, and that survives.
     #[test]
     fn a_route_can_still_send_a_thinking_parameter_deliberately() {
-        let (cfg, mut route) = cfg_with_route();
+        let (mut cfg, mut route) = cfg_with_route();
+        // Not a DeepSeek route: this is the shape every backend gets.
+        cfg.backends[0].base_url = "https://api.example.com/v1".into();
         route
             .force_params
             .insert("reasoning_effort".into(), serde_json::json!("high"));

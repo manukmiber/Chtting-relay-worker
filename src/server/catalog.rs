@@ -591,6 +591,14 @@ fn supported_parameters(model: &Model, cfg: &Config) -> Vec<String> {
         names.push("include_reasoning".into());
     }
 
+    // A parameter the backend never took is one a caller would otherwise spend
+    // an afternoon on: it is accepted at the door, discarded on the way out,
+    // and has no effect anybody can see. So a DeepSeek-served route advertises
+    // DeepSeek's vocabulary.
+    if crate::relay::transform::is_deepseek(cfg, model) {
+        names.retain(|name| crate::relay::transform::deepseek_takes(name));
+    }
+
     let rt = RequestTransform::merged(&cfg.defaults.request_transform, &model.request_transform);
     names.retain(|name| !rt.drop_params.contains(name) && !rt.rename_params.contains_key(name));
     names.sort();
