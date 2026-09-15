@@ -927,7 +927,7 @@ terpisah lewat jalur yang kamu percaya.
 
 ### PDF siap kirim
 
-`docs/API-Documentation.pdf` adalah versi cetak dari dokumen yang sama, 13
+`docs/API-Documentation.pdf` adalah versi cetak dari dokumen yang sama, 14
 halaman: cara request, **`user_id` — satu field, dan apa yang dia beli**,
 bentuk respons beserta blok `usage`, alur frame SSE lengkap dengan keep-alive
 dan frame penutup, lalu katalog model di `/v1/models`.

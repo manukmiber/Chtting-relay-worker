@@ -216,11 +216,11 @@ the same handler, so neither setup is wrong.</p>
 <tbody>
 <tr><td><span class="verbtag get">GET</span></td><td><code>/health</code></td><td>no</td><td>Liveness, and how many models are available.</td></tr>
 <tr><td><span class="verbtag get">GET</span></td><td><code>/v1/models</code><br><code>/models</code></td><td>yes</td><td>The model catalogue. See section 7.</td></tr>
-<tr><td><span class="verbtag get">GET</span></td><td><code>/v1/models/{id}</code><br><code>/models/{id}</code></td><td>yes</td><td>One model's entry, or <code>404</code>.</td></tr>
+<tr><td><span class="verbtag get">GET</span></td><td><code>/v1/models/{id}</code><br><code>/models/{id}</code></td><td>yes</td><td>One model's entry, or <code>404</code>. An id containing a <code>/</code> works as written, unescaped.</td></tr>
 <tr><td><span class="verbtag post">POST</span></td><td><code>/v1/chat/completions</code><br><code>/chat/completions</code></td><td>yes</td><td>Chat, streaming and non-streaming. The main endpoint.</td></tr>
 <tr><td><span class="verbtag post">POST</span></td><td><code>/v1/completions</code><br><code>/completions</code></td><td>yes</td><td>Legacy text completions.</td></tr>
 <tr><td><span class="verbtag post">POST</span></td><td><code>/v1/embeddings</code><br><code>/embeddings</code></td><td>yes</td><td>Embeddings, on models that offer them.</td></tr>
-<tr><td><span class="verbtag opt">OPTIONS</span></td><td>any of the above</td><td>no</td><td>CORS preflight.</td></tr>
+<tr><td><span class="verbtag opt">OPTIONS</span></td><td>any path above except <code>/health</code></td><td>no</td><td>CORS preflight.</td></tr>
 </tbody>
 </table>
 
@@ -269,16 +269,16 @@ required: <code>model</code> and <code>messages</code>.</p>
 <table>
 <thead><tr><th style="width:32%">Parameter</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td><code>model</code></td><td><strong>Required.</strong> One of the ids from <code>/v1/models</code>. Matched exactly and case-sensitively.</td></tr>
+<tr><td><code>model</code></td><td><strong>Required.</strong> An id from <code>/v1/models</code>. Matched exactly and case-sensitively. A name we issued you that is not in the listing still resolves to the entry it was set up for, but the listed id is the one to integrate against.</td></tr>
 <tr><td><code>messages</code></td><td><strong>Required.</strong> The usual <code>role</code> / <code>content</code> array.</td></tr>
 <tr><td><code>stream</code></td><td><code>true</code> returns SSE, <code>false</code> a single JSON body. Every model supports both.</td></tr>
-<tr><td><code>user_id</code></td><td>Who this request is for. <strong>See section 4: read it.</strong></td></tr>
+<tr><td><code>user_id</code></td><td>Who this request is for. <code>user</code> is read as the same field, so an OpenAI client's own <code>user=</code> argument works without <code>extra_body</code>. <strong>See section 4: read it.</strong></td></tr>
 <tr><td><code>max_tokens</code><br><code>max_completion_tokens</code></td><td>Clamped <em>down</em> to the model's <code>max_completion_tokens</code>, never refused for being too large. Whichever name you send is the one kept. Omit them and the model's own ceiling applies.</td></tr>
 <tr><td><code>stop</code></td><td>Up to four entries, as OpenAI.</td></tr>
 <tr><td><code>reasoning_effort</code></td><td><code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>max</code>, on models whose catalogue entry has a <code>reasoning</code> block. It can change the price; see <code>pricing</code> in section 7. Also read from <code>reasoning.effort</code>, <code>thinking.effort</code>, the boolean <code>enable_thinking</code>, and a budget in <code>thinking.budget_tokens</code>.</td></tr>
 <tr><td><code>reasoning.exclude</code><br><code>include_reasoning</code></td><td>Leave the reasoning trace out of the reply. Either can only <em>remove</em> a trace; neither turns on one a model does not expose.</td></tr>
 <tr><td><code>temperature</code>, <code>top_p</code>, <code>top_k</code>, <code>min_p</code>, <code>presence_penalty</code>, <code>frequency_penalty</code>, <code>repetition_penalty</code>, <code>seed</code>, <code>logit_bias</code>, <code>logprobs</code>, <code>top_logprobs</code></td><td>Standard sampling and scoring parameters.</td></tr>
-<tr><td><code>response_format</code>, <code>tools</code>, <code>tool_choice</code></td><td>JSON mode and tool calling, on models that list them.</td></tr>
+<tr><td><code>response_format</code>, <code>tools</code>, <code>tool_choice</code></td><td>JSON mode and tool calling, on models that list them. A model that can hold a reply to a schema also lists <code>structured_outputs</code>.</td></tr>
 <tr><td><code>stream_options</code></td><td>Ignored. Usage always arrives on the final chunk, so <code>include_usage</code> is never needed.</td></tr>
 </tbody>
 </table>
@@ -307,6 +307,11 @@ identifier for the person the request is for.</p>
 
 <p>That is the whole integration. There is nothing else to set, no header to add, and nothing to
 configure on your side. We take that one value and handle everything downstream of it.</p>
+
+<p>One alternative spelling is worth knowing: <code>user</code>, the field an OpenAI client already
+sends natively, is read as the same value, so <code>user="tenant-42:user-9f3c1ab7"</code> does the job
+without <code>extra_body</code>. It wins if both arrive. Pick one spelling and keep to it &mdash; sending
+a different one on a different call is a different partition, and every cache hit is lost.</p>
 
 <h3>Why it matters</h3>
 
@@ -358,7 +363,8 @@ isolation and, in practice, far fewer cache hits.</p>
         "reasoning_content": "The user greeted me...",
         "tool_calls": []
       },
-      "finish_reason": "stop"
+      "finish_reason": "stop",
+      "native_finish_reason": "stop"
     }
   ],
   "usage": {
@@ -374,7 +380,7 @@ isolation and, in practice, far fewer cache hits.</p>
 <table>
 <thead><tr><th style="width:34%">Field</th><th style="width:12%">Type</th><th>Meaning</th></tr></thead>
 <tbody>
-<tr><td><code>id</code></td><td>string</td><td>A UUIDv4 for this request, also returned as the <code>X-Request-Id</code> response header and repeated on every frame of a stream. <strong>Log it:</strong> quoting it lets us find the exact request.</td></tr>
+<tr><td><code>id</code></td><td>string</td><td>A UUIDv4 for this request, repeated on every frame of a stream and returned as the <code>X-Request-Id</code> response header. <strong>Log it:</strong> quoting it lets us find the exact request.</td></tr>
 <tr><td><code>object</code></td><td>string</td><td><code>"chat.completion"</code>, or <code>"chat.completion.chunk"</code> on a stream frame.</td></tr>
 <tr><td><code>created</code></td><td>integer</td><td>Unix seconds, stamped when the request arrived.</td></tr>
 <tr><td><code>model</code></td><td>string</td><td>The model id you asked for.</td></tr>
@@ -382,6 +388,7 @@ isolation and, in practice, far fewer cache hits.</p>
 <tr><td><code>choices[].message.reasoning_content</code></td><td>string</td><td>The reasoning trace, on models that expose one. Absent when empty or excluded.</td></tr>
 <tr><td><code>choices[].message.tool_calls</code></td><td>array</td><td>Assembled tool calls, each <code>{id, type, function:{name, arguments}}</code>. Absent when there are none.</td></tr>
 <tr><td><code>choices[].finish_reason</code></td><td>string</td><td><code>stop</code>, <code>length</code>, <code>tool_calls</code>.</td></tr>
+<tr><td><code>choices[].native_finish_reason</code></td><td>string</td><td>The same value again, under the name some OpenRouter-shaped clients read. Never a second, different reason &mdash; read either one.</td></tr>
 </tbody>
 </table>
 
@@ -398,7 +405,7 @@ arrived. Anything added on your behalf is not charged to you, so the figure matc
 <tr><td><code>usage.total_tokens</code></td><td>integer</td><td>The two above, added.</td></tr>
 <tr><td><code>usage.prompt_tokens_details.cached_tokens</code></td><td>integer</td><td>Cache-hit portion of the input. Never larger than <code>prompt_tokens</code>. <strong>Absent when zero.</strong></td></tr>
 <tr><td><code>usage.completion_tokens_details.reasoning_tokens</code></td><td>integer</td><td>Reasoning portion of the output. Absent when zero.</td></tr>
-<tr><td><code>usage.cost</code></td><td>number</td><td>What this request cost, in USD, to nine decimal places. Also repeated as <code>usage.usage</code> for clients that read that name. One number, never two prices.</td></tr>
+<tr><td><code>usage.cost</code></td><td>number</td><td>What this request cost, in USD, to nine decimal places. Also repeated as <code>usage.usage</code> for clients that read that name. One number, never two prices. Both are absent together on a model carrying no published price at all.</td></tr>
 </tbody>
 </table>
 
@@ -411,7 +418,7 @@ Parse it as a decimal, not a float, if you are reconciling invoices.</p></div>
 <table>
 <thead><tr><th style="width:32%">Header</th><th>Value</th></tr></thead>
 <tbody>
-<tr><td><code>X-Request-Id</code></td><td>Same UUIDv4 as <code>id</code>. On streaming and non-streaming alike.</td></tr>
+<tr><td><code>X-Request-Id</code></td><td>Same UUIDv4 as <code>id</code>, on streaming and non-streaming answers alike. <code>id</code> in the body is the copy that is always there, so read it from there if you record only one. An error carries neither &mdash; a request refused before it reached a model never got an id &mdash; so quote the time, the model and the status instead.</td></tr>
 <tr><td><code>Content-Type</code></td><td><code>application/json</code>, or <code>text/event-stream; charset=utf-8</code> when streaming.</td></tr>
 <tr><td><code>Retry-After</code></td><td>Seconds to wait. Sent with <code>429</code> and <code>503</code>.</td></tr>
 </tbody>
@@ -431,7 +438,7 @@ data: {"id":"32dadfde…","object":"chat.completion.chunk","created":1789936200,
        "model":"Wissangeni-512B-V1",
        "choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}
 
-: keep-alive
+: still working on it
 
 data: {"id":"32dadfde…","object":"chat.completion.chunk","created":1789936200,
        "model":"Wissangeni-512B-V1",
@@ -455,8 +462,8 @@ and every frame ends with a blank line.)</p>
 <tr><td><strong>First frame</strong></td><td>Carries <code>delta.role: "assistant"</code> and usually no content. Do not assume it has text.</td></tr>
 <tr><td><strong>Content frames</strong></td><td><code>delta.content</code> is a string fragment; concatenate in arrival order. A reasoning trace, where a model exposes one, arrives as <code>delta.reasoning_content</code> alongside it.</td></tr>
 <tr><td><strong>Tool calls</strong></td><td><code>delta.tool_calls</code> arrives as partial fragments keyed by <code>index</code>: accumulate <code>function.arguments</code> across frames before parsing.</td></tr>
-<tr><td><strong>Comment lines</strong></td><td>A line beginning with <code>:</code> is an SSE comment sent to hold the connection open during a quiet moment. <strong>Discard it.</strong> A compliant SSE parser already does; a hand-rolled one that only reads lines starting <code>data:</code> is also fine. Never try to JSON-parse it.</td></tr>
-<tr><td><strong>Final usage frame</strong></td><td>Has an <strong>empty <code>choices</code> array</strong> and carries <code>usage</code>. It always arrives. A client that assumes <code>choices[0]</code> exists on every frame will crash here, so guard it.</td></tr>
+<tr><td><strong>Comment lines</strong></td><td>A line beginning with <code>:</code> is an SSE comment sent to hold the connection open during a quiet moment. <strong>Discard it.</strong> Whatever follows the colon is free text and will change; never match on it, and never try to JSON-parse it. A compliant SSE parser already discards these; a hand-rolled one that only reads lines starting <code>data:</code> is also fine.</td></tr>
+<tr><td><strong>Final usage frame</strong></td><td>Carries <code>usage</code>, and it always arrives. <strong>Detect it by the presence of <code>usage</code>, not by an empty <code>choices</code>:</strong> it usually has <code>choices: []</code>, but the last frame can instead carry both <code>usage</code> and a final choice at once. So a client has to do two things &mdash; read <code>usage</code> off whichever frame carries it, and guard <code>choices[0]</code> rather than assume it exists.</td></tr>
 <tr><td><strong>Error frame</strong></td><td>If a request fails part-way through, a frame carrying <code>{"error":{"message":…,"type":"server_error"}}</code> is sent before <code>[DONE]</code>, so a stream that has started never just ends in silence. The HTTP status stays <code>200</code>, because it was sent before anything went wrong.</td></tr>
 <tr><td><code>data: [DONE]</code></td><td>The terminator. Always last, and not JSON.</td></tr>
 </tbody>
@@ -467,6 +474,8 @@ and every frame ends with a blank line.)</p>
 <ul>
   <li><code>id</code>, <code>created</code> and <code>model</code> are identical on every frame of
       one response.</li>
+  <li>Each choice carries <code>native_finish_reason</code> beside <code>finish_reason</code>, always
+      the same value. Read either; do not expect them to differ.</li>
   <li>Frames can split across TCP reads. Buffer until a blank line before parsing, and accept both
       <code>\n\n</code> and <code>\r\n\r\n</code> as the separator.</li>
   <li>A multi-byte character is never split across two frames' <code>delta.content</code>.</li>
@@ -490,8 +499,9 @@ and every frame ends with a blank line.)</p>
 
 <ol>
   <li><strong>It needs your API key.</strong> Unauthenticated it answers <code>401</code>.</li>
-  <li><strong>The ids here are the only values <code>model</code> accepts.</strong> Matching is
-      exact and case-sensitive.</li>
+  <li><strong>These ids are what <code>model</code> should be set to.</strong> Matching is
+      exact and case-sensitive. A name issued to you that is not in the listing still resolves,
+      but the listed id is the one to integrate against.</li>
   <li><strong>Re-fetch periodically.</strong> The catalogue reflects what is currently offered and
       can change; do not cache it for the lifetime of a process.</li>
   <li><strong>Prices are decimal strings in USD per single token</strong>, not JSON numbers, and
@@ -612,6 +622,14 @@ response. Cached input is carved out of <code>prompt_tokens</code> and reasoning
 sent none. Then use whichever <code>overrides</code> entry covers the UTC moment the request
 ran, and the standing rates otherwise.</p>
 
+<div class="note"><p><strong>One answer is not priced by its tokens, and it is the one that would
+otherwise look wrong.</strong> A reply that declines the request &mdash; the model saying it will not
+answer &mdash; is charged as a single flat amount instead of the tokens it took to say so. It is an
+ordinary <code>200</code> with ordinary token counts, and <code>usage.cost</code> carries that flat
+amount, so the formula above will not reproduce it. Reconcile from <code>usage.cost</code>, which is
+always the amount charged; the formula is how you check an answered request, not a substitute for
+the figure on the response.</p></div>
+
 <!-- ==================================================================== -->
 <h2 id="s8">8. Errors</h2>
 
@@ -626,15 +644,20 @@ ran, and the standing rates otherwise.</p>
 <table>
 <thead><tr><th style="width:11%">Status</th><th style="width:26%">code</th><th>When</th></tr></thead>
 <tbody>
-<tr><td><code>400</code></td><td>none</td><td>Malformed JSON, a missing or empty <code>model</code>, or a body this model will not accept.</td></tr>
+<tr><td><code>400</code></td><td>none</td><td>Malformed JSON, or a missing or empty <code>model</code>.</td></tr>
+<tr><td><code>400</code></td><td><code>invalid_request</code></td><td>A body this model will not accept. Alone among the <code>4xx</code> answers this one's <code>type</code> reads <code>server_error</code>, so branch on the status and the <code>code</code>, never on <code>type</code>.</td></tr>
 <tr><td><code>401</code></td><td><code>invalid_api_key</code></td><td>Missing or unknown key. Also what an unauthenticated <code>GET /v1/models</code> gets.</td></tr>
 <tr><td><code>403</code></td><td><code>invalid_api_key</code></td><td>The key is disabled.</td></tr>
 <tr><td><code>403</code></td><td><code>model_forbidden</code></td><td>Your key is not entitled to that model.</td></tr>
+<tr><td><code>403</code></td><td>none</td><td>Type <code>forbidden</code>, message <code>blocked</code>: this address is not served. Nothing about the request will change it.</td></tr>
 <tr><td><code>404</code></td><td><code>model_not_found</code></td><td>Unknown model id.</td></tr>
 <tr><td><code>404</code></td><td><code>not_found</code></td><td>No such path.</td></tr>
-<tr><td><code>413</code></td><td><code>too_large</code></td><td>The body is over the size limit, or the prompt is over the model's <code>context_length</code>. The message says which.</td></tr>
+<tr><td><code>413</code></td><td><code>context_length_exceeded</code></td><td>The prompt is over the model's <code>context_length</code>. The message gives both figures.</td></tr>
+<tr><td><code>413</code></td><td><code>too_large</code></td><td>The request is too large for the model to take.</td></tr>
+<tr><td><code>413</code></td><td><em>no body at all</em></td><td>The request body is over the size limit in section 9. This one is refused before it can be read, so it is the single case that comes back as <code>text/plain</code> rather than the JSON shape above. <strong>Guard your error parsing for it</strong> &mdash; a client that calls <code>JSON.parse</code> on every error body throws here.</td></tr>
 <tr><td><code>429</code></td><td><code>rate_limit_exceeded</code></td><td>A per-minute rate limit or a daily quota is spent. The per-minute refusal carries <code>Retry-After</code>.</td></tr>
-<tr><td><code>502</code></td><td><code>model_unavailable</code></td><td>The model could not answer. Retry with backoff; if it persists, contact us with an <code>X-Request-Id</code>.</td></tr>
+<tr><td><code>500</code></td><td><code>internal_error</code></td><td>Something went wrong on our side before an answer existed. Rare, always worth reporting.</td></tr>
+<tr><td><code>502</code></td><td><code>model_unavailable</code></td><td>The model could not answer. Retry with backoff; if it persists, contact us with the model id and roughly when it started &mdash; an error carries no request id of its own.</td></tr>
 <tr><td><code>503</code></td><td><code>overloaded</code></td><td>Temporarily at capacity. Carries <code>Retry-After</code>.</td></tr>
 <tr><td><code>504</code></td><td><code>timeout</code></td><td>The model took too long to answer.</td></tr>
 </tbody>
@@ -648,6 +671,7 @@ ran, and the standing rates otherwise.</p>
   <li><code>502</code> and <code>504</code>: retry two or three times with backoff.</li>
   <li><code>400</code>, <code>401</code>, <code>403</code>, <code>404</code>, <code>413</code>: do
       not retry. Fix the request or the credentials.</li>
+  <li><code>500</code>: retry once, then report it. A second one on the same request is not a blip.</li>
 </ul>
 
 <!-- ==================================================================== -->
@@ -656,7 +680,7 @@ ran, and the standing rates otherwise.</p>
 <table>
 <thead><tr><th style="width:30%">Limit</th><th style="width:22%">Value</th><th>Behaviour at the edge</th></tr></thead>
 <tbody>
-<tr><td>Request body size</td><td>20 MB</td><td><code>413</code> before the body is read. Comfortably above a full-context request: at typical text density, even a million tokens of JSON is a few megabytes.</td></tr>
+<tr><td>Request body size</td><td>20 MB</td><td><code>413</code> before the body is read, as <code>text/plain</code> rather than the JSON error shape &mdash; see section 8. Comfortably above a full-context request: at typical text density, even a million tokens of JSON is a few megabytes.</td></tr>
 <tr><td>Input tokens</td><td>per model, as <code>context_length</code></td><td><code>413</code>. Refused, never truncated.</td></tr>
 <tr><td>Output tokens</td><td>per model, as <code>max_completion_tokens</code></td><td>A larger <code>max_tokens</code> is clamped down, not refused.</td></tr>
 <tr><td>Requests per minute</td><td>per key</td><td><code>429</code> with <code>Retry-After</code>.</td></tr>
@@ -713,9 +737,8 @@ print(reply.usage.model_extra.get("cost"))</code></pre>
 
 usage = None
 for chunk in stream:
-    if chunk.usage is not None:       # the final frame: choices is empty here
-        usage = chunk.usage
-        continue
+    if chunk.usage is not None:       # take usage off whichever frame carries it
+        usage = chunk.usage           # and keep going: it may carry text too
     if not chunk.choices:             # guard - never assume choices[0] exists
         continue
     piece = chunk.choices[0].delta.content
@@ -774,9 +797,10 @@ while (true) {
   -H "Authorization: Bearer Kunci-Zeiko-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"</code></pre>
 
 <div class="note" style="margin-top:8mm;">
-<p><strong>Support.</strong> Every response carries an <code>X-Request-Id</code> header, repeated as
-<code>id</code> in the body. Log it. A question that quotes one can be answered precisely; one
-without usually cannot.</p>
+<p><strong>Support.</strong> Every answer carries an <code>id</code> in its body, repeated as the
+<code>X-Request-Id</code> header. Log it. A question that quotes one can be answered precisely; one
+without usually cannot. An error never has one, so for those log the time, the model and the status
+instead.</p>
 </div>
 
 </body>
