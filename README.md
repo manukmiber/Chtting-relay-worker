@@ -186,6 +186,39 @@ linker-nya tidak kena OOM killer di tengah jalan. Mau memaksa:
 cargo build --profile release-small -j1
 ```
 
+### Kalau perangkatnya justru lapang
+
+Tablet kelas atas — Dimensity 9400+, Snapdragon 8 Elite, 12–16 GB RAM — punya
+core dan memori yang cukup untuk build yang lebih mahal dan biner yang lebih
+cepat:
+
+```bash
+# fat LTO, satu codegen unit — beberapa menit, beberapa GB RAM
+CHTTING_PROFILE=release-fast bash scripts/build-android.sh
+
+# sekalian targetkan chip-nya sendiri
+CHTTING_PROFILE=release-fast bash scripts/build-android.sh --tune cortex-x925
+```
+
+`--tune` melepas asumsi ARMv8.0 baseline yang dipakai supaya binernya jalan di
+perangkat arm64 mana pun. Di core ARMv9.2 itu berarti ekstensi kriptografinya
+ikut terpakai — relay meng-SHA-256 setiap client key yang masuk, merantai setiap
+baris ledger, dan menghash setiap invoice — plus instruksi dot-product/i8mm dan
+model penjadwalan untuk pipeline yang benar.
+
+Harganya: **hasilnya cuma jalan di chip sekelas itu.** Biner ber-`--tune` yang
+disalin ke perangkat lama tidak gagal dengan sopan, dia kena SIGILL. Makanya ini
+opt-in dan build tanpa tuning tetap yang default.
+
+Di SoC big.LITTLE, sebut core mana saja dari klasternya: semua core dalam satu
+SoC mengimplementasikan versi arsitektur yang sama, jadi pilihannya mengubah
+model penjadwalan, bukan instruksi yang tersedia. Dimensity 9400+ itu 1×
+Cortex-X925 + 3× Cortex-X4 + 4× Cortex-A720, semuanya ARMv9.2-A, jadi
+`cortex-x925` aman untuk kedelapan-delapannya.
+
+Nama yang dikenal toolchain-mu:
+`rustc --print target-cpus --target aarch64-linux-android`.
+
 Dependensinya sengaja dijaga supaya **tidak ada cmake, Go, Node, atau compiler
 C++**: TLS-nya `ring` bukan aws-lc, tokenizer-nya dibangun tanpa backend C++
 `esaxx`, regex-nya `fancy-regex` yang murni Rust. Yang perlu di Termux cuma
@@ -753,6 +786,53 @@ per user, dan tanpa itu prefix cache satu orang bisa dipakai request orang lain.
 Matikan per backend lewat `forwardUserId` kalau cuma mau mencatat tanpa
 meneruskan.
 
+### Mengirim trace ke Langfuse
+
+Nyalakan di **Settings → Langfuse tracing**, isi `publicKey` dan `secretKey`.
+Satu span per request, membawa empat hal yang **tidak bisa diketahui dari log
+backend**:
+
+| Isi span | Di mana |
+|---|---|
+| body pemanggil, sebelum relay menyentuhnya | `langfuse.observation.input` |
+| system prompt yang relay suntikkan | `…metadata.injected_system_prompt` |
+| body yang benar-benar diterima backend | `…metadata.upstream_input` |
+| jawaban yang dikirim balik, setelah reshaping | `langfuse.observation.output` |
+
+Ditambah aritmetikanya: token hitungan lokal, token yang ditagih backend, cached
+dan reasoning, `proxy_usd` / `backend_usd` / `profit_usd`, TTFT, lama antre, lama
+tokenizing, lama injeksi, token per detik, retry, cache hit, finish reason, dan
+model publik vs model backend.
+
+**Trace id-nya adalah uuid request itu sendiri** (tanpa tanda hubung), jadi uid
+yang kamu lihat di `relay.log` bisa langsung ditempel ke pencarian Langfuse.
+
+Lewat **OpenTelemetry** (`POST /api/public/otel/v1/traces`), bukan endpoint
+`/api/public/ingestion`: dokumen API Langfuse sendiri menandainya deprecated, dan
+di Langfuse Cloud endpoint itu berhenti menerima trace saat mode tulis v4-only
+mulai **16 November 2026**. JSON protobuf juga berarti tidak perlu `prost` dan
+tidak perlu codegen saat build — cuma `serde_json` dan `reqwest` yang sudah ada.
+
+Yang **tidak pernah** ikut:
+
+- **Key apa pun.** Private key yang `privateUserId`-nya `secret` dikirim sebagai
+  sidik jari, dan field yang bisa diisi client key (`user`, `user_id`,
+  `api_key`, …) dibuang dari setiap body.
+- **Apa pun, kalau antreannya penuh.** Span-nya dibuang dan dihitung.
+
+Tidak ada satu pun yang terjadi di jalur request: `submit` cuma `try_send` ke
+channel berbatas, body dipegang lewat `Arc` dan baru diserialisasi kalau span-nya
+memang jadi dikirim, dan batch-nya dikirim dari task terpisah. Langfuse yang
+mati, lambat, atau salah setelan **tidak bisa** memperlambat atau menggagalkan
+satu pun panggilan — dia mundur ke satu percobaan per menit, dan penghitungnya
+yang memberi tahu. Lihat sent / queued / dropped / failed di Settings atau di
+`GET /api/langfuse`.
+
+`sampleRate` mengatur berapa banyak request **sukses** yang di-trace; kegagalan
+selalu ikut selama `captureErrors` menyala, karena kegagalan itu justru alasan
+orang membuka trace viewer. Keputusannya diambil di awal request, jadi request
+yang tidak terpilih tidak membayar untuk menangkap sesuatu yang akan dibuang.
+
 ---
 
 ## Dua jenis client key
@@ -868,13 +948,75 @@ Terbitkan lewat tombol di tab **Billing**, atau nyalakan `billing.autoIssue`
 supaya siklus bulanan mengerjakannya sendiri — hanya untuk key yang memasang
 `billing.autoInvoice`, karena menutup periode tagihan itu keputusan.
 
+### Isi invoice
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ INV-2026-0001                                       [issued]         │
+│                                                                      │
+│ Dari    PT Zeiko Relay Indonesia      Ditagihkan ke  CV Pelanggan    │
+│         Jakarta Selatan                              Budi            │
+│         NPWP 01.234.567.8-901.000                    Bandung         │
+│                                                                      │
+│ Tanggal invoice  16 Sep 2026      Bayar paling lambat  19 Sep 2026   │
+│                                                                      │
+│ Model            Req     In      Out    Cached  Reasoning  Jumlah    │
+│ model-a          842   9,1 jt   2,4 jt   1,2 jt    180 rb  $24,1180  │
+│ model-b          362   3,8 jt   1,1 jt     410 rb  60 rb   $14,2922  │
+│                                                                      │
+│ Total pemakaian  1.204 request · 16,4 jt token                       │
+│ Subtotal $38,4102   Pajak 11% $4,2251   Total $42,6353               │
+│                                                                      │
+│ Bayar    42.635300 USDT      ≈ Rp 692.823                            │
+│ Kurs     Rp 16.250 / USDT    (Indodax mid, 16 Sep 2026)              │
+│ Alamat   TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE   (TRC20)                │
+│          Kirim hanya lewat TRC20. USDT yang dikirim ke alamat ini    │
+│          lewat jaringan lain tidak bisa dikembalikan.                │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Setel di **Settings → Billing**: `dueDays` (bawaan 3 hari), alamat USDT,
+jaringannya, kurs IDR per USDT, dan sumber kursnya. Nama perusahaan pelanggan
+ada di **Keys → Billing → Company**.
+
+Relay menghitung semuanya dalam USD; dua langkah mengubahnya jadi angka yang
+ditransfer pelanggan:
+
+```
+total_usdt = total_usd / usdPerUsdt     dibulatkan 6 desimal, satuan terkecil transfer USDT
+total_idr  = total_usdt * idrPerUsdt    dibulatkan ke rupiah utuh
+```
+
+`usdPerUsdt` ada dan tidak diasumsikan 1, karena USDT pernah lepas peg — invoice
+yang menghardcode 1.0 akan salah harga persis di hari itu penting. Angka rupiah
+diambil dari total **setelah pajak**, bukan subtotal.
+
+**Alamat, jaringan, kurs, dan tanggal jatuh tempo dibekukan saat invoice terbit.**
+Tidak dibaca ulang dari config sesudahnya: ganti dompet besok, invoice yang masih
+dipegang pelanggan tetap menyebut dompet yang dia terima. Semuanya ikut content
+hash dan ikut trigger SQLite yang menolak menulis ulang invoice yang sudah
+terbit.
+
+Invoice yang terbit sebelum field-field ini ada membawa `hashVersion: 1` dan
+diverifikasi dengan bentuk kanonik yang memang dipakai saat menulisnya. Kalau
+field baru ikut di-hash begitu saja, semua invoice lama akan dilaporkan sebagai
+"diubah" padahal tidak — dan pemeriksaan keutuhan yang sering salah lapor adalah
+pemeriksaan yang tidak ada yang baca.
+
 ---
 
 ## 7. Dashboard
 
-Di `http://127.0.0.1:8788`, terikat ke localhost dan **tidak pernah dilewatkan
-tunnel**. Vanilla JS, tanpa build step, tanpa CDN — dan sekarang **ikut
-ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pun.
+Di `http://127.0.0.1:8788`, terikat ke localhost. Vanilla JS, tanpa build step,
+tanpa CDN — dan **ikut ter-compile ke dalam binary**, jadi relay bisa dijalankan
+dari direktori mana pun.
+
+Bindingnya tetap localhost walau kamu mau membukanya dari perangkat lain: yang
+dipakai adalah `dashboard.tunnel`, bukan `dashboard.host: "0.0.0.0"`. Bedanya
+besar — `0.0.0.0` menerbitkannya ke semua perangkat di Wi-Fi itu tanpa TLS dan
+tanpa cara menariknya kembali, sementara tunnel menjangkau loopback dari luar
+lewat TLS, lewat satu proses yang relay ini awasi dan bisa hentikan. Lihat
+[bagian Cloudflare Tunnel](#membuka-dashboard-dari-perangkat-lain).
 
 | Tab | Isinya |
 |---|---|
@@ -883,15 +1025,15 @@ ter-compile ke dalam binary**, jadi relay bisa dijalankan dari direktori mana pu
 | Models | editor alias: terjemahan nama, prompt, params, limit, tokenizer, reshaping |
 | Backends | provider upstream + tombol tes koneksi |
 | Prompts | library system prompt |
-| Keys | client key, jenisnya (company/private), kuota, batasan model, data penagihan |
+| Keys | client key, jenisnya (company/private), kuota, batasan model, data penagihan (termasuk nama perusahaan) |
 | Requests | log per panggilan + rincian timing dan token |
 | Usage | angka dari buku besar: request, token, harga, TTFT, TPS, cache hit, dan status rantai hash |
-| Billing | yang belum ditagih per key + rincian per model, terbitkan invoice, riwayat invoice |
+| Billing | yang belum ditagih per key + rincian per model, terbitkan invoice, riwayat invoice dengan tanggal jatuh tempo dan total USDT/IDR |
 | Tokenizer | playground token, biaya satu request chat, pasang vocabulary |
 | Playground | kirim request beneran lewat relay |
-| Tunnel | start/stop cloudflared, URL publik, output mentah |
+| Tunnel | start/stop cloudflared untuk **dua** tunnel — relay dan dashboard — URL publik masing-masing, output mentah |
 | API Docs | dokumentasi integrasi yang ditulis dari config yang sedang jalan — base URL, endpoint, model, parameter, field usage, limit, error; bisa disalin sebagai Markdown |
-| Settings | server, antrean, security, logging, aturan tokenizer, default, OpenRouter |
+| Settings | server, antrean, security, logging, **Langfuse**, aturan tokenizer, default, OpenRouter |
 | Logs | ekor `relay.log` |
 
 Beri password lewat Settings kalau HP-mu dipakai orang lain. Secret selalu
@@ -985,8 +1127,48 @@ Tab **Tunnel**, atau setel `tunnel.autoStart` di config.
 - autoStart menyalakan tunnel bersama relay dan menyambungkannya lagi kalau putus,
   dengan backoff (jaringan seluler memang sering putus)
 
-Yang dipublikasikan hanya port relay. Dashboard tetap di localhost. Tunnel token
-tidak pernah ikut tertulis ke buffer log yang ditampilkan dashboard.
+Yang dipublikasikan tunnel ini hanya port relay. Tunnel token tidak pernah ikut
+tertulis ke buffer log yang ditampilkan dashboard.
+
+### Membuka dashboard dari perangkat lain
+
+Dashboard punya tunnel sendiri: `dashboard.tunnel`, isinya sama persis dengan
+`tunnel` di atas, tapi yang dipublikasikan adalah `dashboard.port`. Dua proses
+cloudflared terpisah, dua URL terpisah, dan tidak ada konfigurasi yang bisa
+membuat salah satunya mempublikasikan port milik yang lain — masing-masing
+membaca portnya dari scope-nya sendiri.
+
+Bawaannya `off`. Mempublikasikan panel kontrol itu keputusan, dan default yang
+mengambil keputusan itu untukmu akan salah setiap kali.
+
+**Tidak akan menyala sebelum `dashboard.password` minimal 16 karakter.** Di
+loopback, password lemah menjaga permukaan yang cuma bisa dijangkau dari HP ini.
+Di balik tunnel, password itu satu-satunya pagar: URL-nya bisa ditebak, tercatat
+di setiap perantara yang dilewatinya, dan di belakangnya ada panel yang menulis
+config, membaca semua prompt tersimpan, dan mengembalikan setiap client key
+dalam bentuk aslinya. Dashboard memberi tahu alasannya sebelum tombol Start
+ditekan, bukan sesudahnya.
+
+Begitu request datang lewat nama publik dan bukan nama lokal, empat hal berubah:
+
+- penjaga origin menerima nama itu — lewat hostname tunnel yang sedang hidup,
+  atau `security.dashboardAllowedHosts`. Penjaganya **tidak dimatikan**: daftar
+  namanya bertambah satu, karena nama yang hari ini menunjuk 127.0.0.1 besok
+  bisa menunjuk ke tempat lain (itulah DNS rebinding);
+- cookie sesi diberi tanda `Secure` (tidak diberi di loopback http biasa, yang
+  di sebagian browser justru bikin cookie-nya tidak disimpan sama sekali);
+- login tanpa password ditolak langsung, apa pun keadaan tunnelnya — bisa saja
+  ada hal lain yang meneruskan portnya;
+- password salah dihitung per alamat pemanggil, bukan cuma satu hitungan global,
+  supaya satu penyerang tidak bisa mengunci kamu dari panelmu sendiri.
+
+Kedua tunnel ikut mati saat relay berhenti atau berotasi. Tunnel dashboard yang
+dibiarkan hidup melewati proses pemiliknya akan menjaga satu URL tetap menyala
+ke *penerusnya* — panel kontrol yang dipublikasikan oleh proses yang tidak
+pernah menyetujuinya.
+
+Kalau bisa, pasang Cloudflare Access di depan hostname itu. Password ini pagar
+terakhir, bukan satu-satunya yang boleh ada.
 
 Tombol **Stop** dan **Restart** di tab itu benar-benar menghentikan cloudflared.
 Dulu tidak: proses pengawasnya memegang mutex penjaga child process selama
@@ -1229,6 +1411,30 @@ tanpa menghapus satu baris pun.
 - Prompt hanya disimpan lokal. Kalau tidak mau disimpan sama sekali, set
   `logging.storeBodies` ke `none`.
 - Client key ditampilkan penuh sekali saat dibuat, sesudah itu selalu termask.
+- **Dashboard yang dipublikasikan tidak menyala tanpa password 16 karakter.**
+  Lihat bagian Cloudflare Tunnel di atas untuk apa saja yang berubah begitu
+  panel ini bisa dijangkau dari luar HP.
+- Setiap respons dashboard membawa CSP (`connect-src 'self'`,
+  `frame-ancestors 'none'`, `form-action 'none'`), `nosniff`, `no-referrer`, dan
+  `X-Frame-Options: DENY`. Respons API juga `no-store` — isinya config, key, dan
+  prompt, jadi tidak boleh ada cache yang menyimpannya. Asetnya tidak, karena
+  tidak membawa rahasia apa pun dan melarangnya di-cache berarti mengirim ulang
+  seluruh frontend lewat tunnel setiap kali halaman dibuka.
+- `tokenizer/install` menerima URL dari pemanggil, jadi itu alat untuk menyuruh
+  relay mengambil sesuatu. Loopback, alamat link-local (`169.254.169.254`, tempat
+  instance cloud menyimpan kredensialnya), dan skema selain http/https ditolak —
+  dicek dari alamat literal maupun setelah hostname-nya diresolusi. Mirror
+  kosakata di jaringanmu sendiri tetap jalan.
+- **Trace ke Langfuse tidak pernah membawa kredensial.** Private key yang
+  `privateUserId`-nya `secret` dikirim sebagai sidik jari, dan field yang bisa
+  berisi client key (`user`, `user_id`, `api_key`, …) dibuang dari setiap body.
+  Semua pengiriman trace di luar jalur request: Langfuse yang mati atau salah
+  setelan tidak bisa memperlambat atau menggagalkan satu pun panggilan.
+- **Instruksi pembayaran di invoice dibekukan saat invoice terbit.** Alamat USDT,
+  jaringannya, kurs, dan tanggal jatuh tempo disalin ke invoice, tidak dibaca
+  ulang dari config. Mengganti dompet tidak boleh diam-diam mengalihkan invoice
+  yang masih dipegang pelanggan, dan semuanya ikut masuk content hash — alamat
+  yang diubah lewat belakang SQLite sama kelihatannya dengan total yang diubah.
 
 ## Lisensi
 

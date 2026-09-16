@@ -20,7 +20,16 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 8788,
-    "password": ""
+    "password": "",
+    "_tunnel_comment": "Publishes THIS port so the dashboard can be opened from another device. Off by default, and it refuses to start until dashboard.password is at least 16 characters \u2014 behind a tunnel that password is the only thing between the internet and a panel that reveals every client key.",
+    "tunnel": {
+      "mode": "off",
+      "binary": "cloudflared",
+      "autoStart": false,
+      "token": "",
+      "hostname": "",
+      "extraArgs": []
+    }
   },
   "security": {
     "requireClientKey": true,
@@ -29,6 +38,8 @@
     ],
     "trustProxyHeaders": true,
     "dashboardOriginGuard": true,
+    "_dashboardAllowedHosts_comment": "Extra hostnames the dashboard answers to. The live dashboard tunnel's own name is accepted automatically; this is for a named tunnel or a proxy in front of one. The guard stays ON \u2014 this widens its list by one name rather than replacing it with \"anything\".",
+    "dashboardAllowedHosts": [],
     "privateUserId": "fingerprint"
   },
   "backends": [
@@ -554,12 +565,45 @@
     "minimumUsd": 0,
     "cycleDay": 1,
     "autoIssue": false,
+    "dueDays": 3,
     "issuer": {
       "name": "",
       "email": "",
       "address": "",
       "taxId": "",
       "paymentTerms": ""
+    },
+    "_payment_comment": "Copied onto each invoice as it is issued and never read back live: rotating the wallet must not redirect an invoice a customer is still holding. usdtNetwork is not decoration \u2014 USDT sent to the right address over the wrong chain cannot be recovered. usdPerUsdt is not assumed to be 1 because USDT has broken its peg before.",
+    "payment": {
+      "usdtAddress": "",
+      "usdtNetwork": "TRC20",
+      "idrPerUsdt": 0,
+      "usdPerUsdt": 1,
+      "rateSource": "",
+      "rateUpdatedAt": 0,
+      "instructions": ""
     }
+  },
+  "_langfuse_comment": "One trace per request: the caller's body, the system prompt this relay injected, the body the backend received, the answer, the tokens and the cost. Over OpenTelemetry, because Langfuse's batch ingestion endpoint is deprecated and stops accepting traces on Cloud from 2026-11-16. Nothing happens on the request path; a Langfuse that is down cannot slow a caller down.",
+  "langfuse": {
+    "enabled": false,
+    "host": "https://cloud.langfuse.com",
+    "publicKey": "",
+    "secretKey": "",
+    "sampleRate": 1,
+    "captureErrors": true,
+    "captureInput": true,
+    "captureOutput": true,
+    "captureSystemPrompt": true,
+    "captureReasoning": false,
+    "captureClientIp": false,
+    "maxFieldChars": 20000,
+    "batchSize": 24,
+    "flushIntervalMs": 5000,
+    "queueCapacity": 2048,
+    "timeoutMs": 10000,
+    "environment": "production",
+    "release": "",
+    "tags": []
   }
 }

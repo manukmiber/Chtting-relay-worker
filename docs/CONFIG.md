@@ -140,6 +140,48 @@ waiting, peak depth, average wait, and how many were turned away.
 | `port` | `8788` | must differ from `server.port` |
 | `password` | `""` | empty means no sign-in; set one if the phone is shared |
 | `sessionTtlMs` | 7 days | how long a sign-in lasts |
+| `tunnel` | off | a cloudflared of its own, publishing the dashboard port — see below |
+
+### Reaching the dashboard from another device
+
+`dashboard.tunnel` takes the same keys as [`tunnel`](#tunnel) and publishes
+`dashboard.port` instead of `server.port`. It is a **second cloudflared
+process** with its own settings and its own URL; neither tunnel can publish the
+other's port, because each reads its port from its own scope.
+
+It is `mode: "off"`, `autoStart: false` by default. Publishing a control panel
+is a decision, and a default that made it for you would be the wrong one every
+time.
+
+**It will not start without a dashboard password of at least 16 characters.**
+On loopback a weak password guards a surface only this device can reach. Behind
+a tunnel it is the entire boundary: the URL is guessable in principle, gets
+logged by everything it passes through, and the surface behind it writes the
+config, reads every stored prompt and returns every client key in the clear.
+The refusal is at start, not at save, and the dashboard says so before you press
+the button rather than after.
+
+Four things change once a request arrives under a published name rather than a
+local one:
+
+* the origin guard accepts that name — see `dashboardAllowedHosts` below;
+* the session cookie is marked `Secure` (it is not on plain loopback http,
+  where some browsers would refuse to store it at all);
+* sign-in with no password set is refused outright, whatever the tunnel is
+  doing, because something else may be forwarding the port;
+* wrong passwords are counted per calling address as well as globally.
+
+Both tunnels stop when the relay stops or rotates. A dashboard tunnel left
+running past the process that owned it would keep a URL alive pointing at the
+*successor* — a control panel published by a process that never agreed to.
+
+```jsonc
+"dashboard": {
+  "port": 8788,
+  "password": "correct-horse-battery-staple",   // 16 characters or more
+  "tunnel": { "mode": "quick", "autoStart": false }
+}
+```
 
 ## `security`
 
@@ -150,6 +192,7 @@ waiting, peak depth, average wait, and how many were turned away.
 | `trustProxyHeaders` | `true` | read `CF-Connecting-IP` / `X-Forwarded-For` — correct behind the tunnel |
 | `blockedIps` | `[]` | refused outright |
 | `dashboardOriginGuard` | `true` | refuse dashboard requests from another origin or host |
+| `dashboardAllowedHosts` | `[]` | extra hostnames the dashboard answers to |
 | `privateUserId` | `fingerprint` | what a private key's user id looks like upstream: `fingerprint`, `keyId` or `secret` |
 
 `trustProxyHeaders` is honoured only when the connection itself came from this
@@ -167,6 +210,21 @@ whose `Origin` is not this server, and one whose `Host` is a name that is not
 this machine, which is what DNS rebinding relies on. It is not a substitute for
 `dashboard.password`: the guard is about browsers, and the password is about
 everything else.
+
+`dashboardAllowedHosts` is how publishing the dashboard widens that guard
+**without switching it off**. The live dashboard tunnel's own hostname is
+accepted automatically while it is running; this list is for a named tunnel
+whose hostname the relay cannot read off cloudflared's output, or for a proxy
+in front of one. Entries are matched host-only and case-insensitively, and a
+port is ignored — `panel.example.com` answers for `panel.example.com:443` and
+for nothing else. `panel.example.com.attacker.example` is a different name and
+is refused, and a cross-origin `POST` to the published name is still refused by
+the `Origin` half of the guard.
+
+The guard staying on is the point. A name that resolves to 127.0.0.1 today can
+resolve somewhere else tomorrow, which is what DNS rebinding is; publishing the
+dashboard adds exactly one name to a fixed list rather than replacing the list
+with "anything".
 
 `privateUserId` decides what a private key sends upstream as its user id.
 `fingerprint`, the default, is a truncated SHA-256 of the key — stable, unique
@@ -493,8 +551,78 @@ Turning recorded usage into an invoice, and starting the next period.
 | `minimumUsd` | `0` | under this the period stays open instead of being billed |
 | `cycleDay` | `1` | day of the month the automatic cycle runs, 1–28 |
 | `autoIssue` | `false` | run that cycle |
+| `dueDays` | `3` | how long the customer has to pay, counted from the invoice date |
 | `issuer.name` / `.email` / `.address` / `.taxId` | | who the invoice is from |
 | `issuer.paymentTerms` | | free text under the totals |
+| `payment.*` | | where the money goes, and at what rate — see below |
+
+### Paying in USDT
+
+| Key | Default | Meaning |
+|---|---|---|
+| `payment.usdtAddress` | `""` | the wallet the customer sends to |
+| `payment.usdtNetwork` | `TRC20` | which chain that address is on |
+| `payment.idrPerUsdt` | `0` | what one USDT is worth in rupiah |
+| `payment.usdPerUsdt` | `1` | what one USDT is worth in US dollars |
+| `payment.rateSource` | `""` | printed under the rate, so it reads as sourced rather than invented |
+| `payment.rateUpdatedAt` | `0` | when the rate was last set, so a stale one looks stale |
+| `payment.instructions` | `""` | memo, proof of payment, who to ask |
+
+The relay prices everything in USD. Two legs turn that into the number the
+customer transfers, and both are on the invoice:
+
+```
+total_usdt = total_usd / usdPerUsdt        rounded to 6 dp, the smallest unit a transfer carries
+total_idr  = total_usdt * idrPerUsdt       rounded to whole rupiah, the smallest unit in circulation
+```
+
+`usdPerUsdt` exists rather than being assumed to be 1 because USDT has broken
+its peg before, and an invoice that hard-coded 1.0 would misprice itself on
+exactly the day it mattered. A zero or negative value falls back to 1 rather
+than dividing by nothing and printing an infinity.
+
+The rupiah figure is taken from the **taxed** total, not the subtotal.
+
+**`usdtNetwork` is not decoration.** USDT exists on several chains, the address
+formats overlap, and sending to the right address over the wrong network
+destroys the money with no way back. It is printed beside the address for that
+reason and no other.
+
+### What an issued invoice freezes
+
+`billTo` was already copied onto the invoice rather than referenced. These now
+are too, and for the same reason — an invoice is a statement about a moment:
+
+* `issuer` — the company name, address and tax id as they stood
+* `dueAt` — `issuedAt + dueDays`, so shortening the terms next month cannot
+  retroactively make an invoice somebody is holding overdue
+* `usdtAddress`, `usdtNetwork` — rotating the wallet must not silently redirect
+  an invoice already in a customer's inbox
+* `idrPerUsdt`, `usdPerUsdt`, `totalUsdt`, `totalIdr`, `rateSource` — the rate
+  they were quoted
+
+All of it is covered by the invoice's content hash and by the SQLite trigger
+that refuses to restate an issued invoice, so a redirected payment address is as
+visible as an edited total.
+
+Invoices issued before these fields existed carry `hashVersion: 1` and are
+verified against the canonical form they were actually written with. Hashing the
+new fields unconditionally would have reported every invoice already on disk as
+tampered with, and an integrity check that cries wolf is one nobody reads.
+
+### What the customer sees
+
+The invoice drawer is the document, in the order the questions get asked:
+
+1. **both companies** — the issuer, and `keys[].billing.company` over
+   `keys[].billing.name` for the customer
+2. **the two dates** — issued, and pay by
+3. **models used** — per model: requests, input, output, cached and reasoning
+   tokens, the amount in USD and the same amount in rupiah
+4. **total usage** — requests and tokens over the whole period, with the ledger
+   row range the figures were drawn from
+5. **the rate** — IDR per USDT, and where it came from
+6. **the wallet** — the address, the chain, and a warning about the chain
 
 ### What "reset the usage" actually does
 
@@ -837,7 +965,10 @@ couple of hundred bytes per request — a million requests is a few hundred MB.
 | `configFile` | `""` | named mode alternative to a token |
 | `extraArgs` | `[]` | passed through to cloudflared |
 
-Only `server.port` is published. The dashboard is never routed through it.
+Only `server.port` is published by this one. The dashboard has a tunnel of its
+own under [`dashboard.tunnel`](#reaching-the-dashboard-from-another-device) —
+a separate process publishing a separate port, off by default. Neither can
+publish the other's port.
 
 `autoStart` is on by default, and it means more than one attempt. A phone that
 has just rebooted may have no network for a while, and cloudflared may not be
@@ -846,9 +977,94 @@ giving up on the first failure, and the supervisor inside brings cloudflared
 back if it dies later. Between them, the tunnel is up after a restart without
 anyone opening a terminal.
 
-During an instance rotation the retiring copy hands the tunnel over rather than
-leaving two cloudflared processes fighting over one quick-tunnel URL: the
+During an instance rotation the retiring copy hands both tunnels over rather
+than leaving two cloudflared processes fighting over one quick-tunnel URL: the
 successor waits for the lock under `data/run/` before starting its own.
+
+---
+
+## `langfuse`
+
+One trace per relayed request: what was asked, what this relay put in front of
+it, what came back, and what it cost. Off until both keys are set.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | |
+| `host` | `https://cloud.langfuse.com` | the project's origin — the EU/US region, or your own |
+| `publicKey` | `""` | `pk-lf-…`; not a secret, not masked |
+| `secretKey` | `""` | `sk-lf-…`; masked everywhere the config is read back |
+| `sampleRate` | `1.0` | fraction of **successful** requests that leave a trace |
+| `captureErrors` | `true` | trace failures whatever the sample rate says |
+| `captureInput` | `true` | the caller's own request body |
+| `captureOutput` | `true` | what the relay answered |
+| `captureSystemPrompt` | `true` | the injected prompt, and the body the backend received |
+| `captureReasoning` | `false` | the model's reasoning trace |
+| `captureClientIp` | `false` | the caller's address |
+| `maxFieldChars` | `20000` | ceiling on every piece of text a span carries |
+| `batchSize` | `24` | spans per POST |
+| `flushIntervalMs` | `5000` | how long a partial batch waits for company |
+| `queueCapacity` | `2048` | spans that may be waiting; past this they are dropped |
+| `timeoutMs` | `10000` | per POST |
+| `environment` | `production` | |
+| `release` | `""` | blank uses this binary's version |
+| `tags` | `[]` | added to every trace |
+
+### Over OpenTelemetry, not the ingestion endpoint
+
+Traces go to `POST /api/public/otel/v1/traces` with Basic auth and JSON-encoded
+protobuf. **Not** `/api/public/ingestion`: Langfuse's own API document marks that
+deprecated, and on Langfuse Cloud it stops accepting traces and observations
+when v4-only write mode begins on 2026-11-16 — it keeps taking scores and
+nothing else. Self-hosted deployments are unaffected until they turn v4-only
+write mode on.
+
+It is also the cheaper of the two here. JSON protobuf means no `prost`, no
+build-time code generation and no second HTTP client: `serde_json` and the
+`reqwest` already in the tree are the whole dependency list.
+
+### What a span carries
+
+The four things the backend's own logs cannot tell you:
+
+* the **caller's body**, before the relay touched it;
+* the **injection** — the system prompt the relay put in front of it, under
+  `langfuse.observation.metadata.injected_system_prompt`, and the body the
+  backend actually received under `…metadata.upstream_input`;
+* the **answer**, after reshaping, which is what the caller saw;
+* the **arithmetic** — tokens counted locally, tokens the backend charged,
+  what it cost, what it sold for, TTFT, queue time, tokenize time, inject time,
+  tokens per second, retries, cache hit, finish reason.
+
+The trace id *is* the request's own uuid with the dashes removed, so a uid out
+of `relay.log` pastes straight into Langfuse's search.
+
+`usageDetails` carries the caller's figures as `input`/`output` — that is what a
+trace is read to explain — with the relay's own `upstream_input` and
+`injected_system_prompt` beside them under their own names, so a dashboard
+summing `input` does not silently include tokens the caller never wrote.
+
+### What never travels
+
+* **Client keys and backend keys.** A key is not in a request body, and the one
+  place one could reach a trace is a private key's upstream id when
+  `security.privateUserId` is `secret` — that case is fingerprinted first. The
+  fields a key can be written into (`user`, `user_id`, `api_key`, …) are
+  stripped from every body.
+* **Anything at all, when the queue is full.** The span is dropped and counted.
+
+Nothing happens on the request path: `submit` is a `try_send` on a bounded
+channel, bodies are held by `Arc` and not serialised until a span is certainly
+going out, and the batch is posted from a background task. A Langfuse that is
+down, slow or misconfigured cannot slow a caller down or fail a request — it
+backs off to one attempt a minute and the counters say so. `GET /api/langfuse`,
+and the Settings screen, show sent / queued / dropped / failed and the last
+error.
+
+Sampling is decided when the request starts, not at the end, so a sampled-out
+request does not pay to capture what it would then throw away. With
+`captureErrors` on, the capture survives the roll — which is how a failure at
+`sampleRate: 0` still produces a trace.
 
 ---
 
