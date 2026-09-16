@@ -181,6 +181,7 @@ export async function settingsView(ctx) {
   i.cors = text((cfg.security.corsOrigins ?? ['*']).join(', '), { class: 'mono' });
   i.blockedIps = text((cfg.security.blockedIps ?? []).join(', '), { class: 'mono' });
   i.originGuard = h('input', { type: 'checkbox', checked: cfg.security.dashboardOriginGuard !== false });
+  i.dashHosts = text((cfg.security.dashboardAllowedHosts ?? []).join(', '), { class: 'mono' });
   i.privateUserId = select(cfg.security.privateUserId ?? 'fingerprint', [
     ['fingerprint', 'a fingerprint of the key — reveals nothing'],
     ['keyId', 'the key\u2019s id'],
@@ -206,6 +207,14 @@ export async function settingsView(ctx) {
     }),
     field('A private key\u2019s user id upstream', i.privateUserId,
       'what the backend sees when a private key calls'),
+    field('Extra dashboard hostnames', i.dashHosts,
+      'comma separated; the live dashboard tunnel\u2019s own name is always accepted'),
+    h('p.small.muted', {
+      text: 'The guard stays on when you publish the dashboard — publishing adds one '
+        + 'name to the list it answers to, rather than removing the list. A name that '
+        + 'resolves here today can resolve somewhere else tomorrow, which is exactly '
+        + 'what the list is for.',
+    }),
     field('Allowed CORS origins', i.cors, '* allows browser clients from anywhere'),
     field('Blocked IPs', i.blockedIps),
   )));
@@ -225,6 +234,21 @@ export async function settingsView(ctx) {
   i.blIssuerAddress = text(issuer.address ?? '');
   i.blIssuerTaxId = text(issuer.taxId ?? '');
   i.blTerms = textarea(issuer.paymentTerms ?? '', { rows: 3 });
+  i.blDueDays = number(bill.dueDays ?? 3, { min: 0, max: 365 });
+  const pay = bill.payment ?? {};
+  i.payAddress = text(pay.usdtAddress ?? '', { class: 'mono', placeholder: 'TQn9…' });
+  i.payNetwork = select(pay.usdtNetwork ?? 'TRC20', [
+    ['TRC20', 'TRC20 — Tron'],
+    ['BEP20', 'BEP20 — BNB Smart Chain'],
+    ['ERC20', 'ERC20 — Ethereum'],
+    ['SOL', 'SOL — Solana'],
+    ['POLYGON', 'POLYGON'],
+    ['ARBITRUM', 'ARBITRUM'],
+  ]);
+  i.payIdrPerUsdt = number(pay.idrPerUsdt ?? 0, { min: 0, step: 1 });
+  i.payUsdPerUsdt = number(pay.usdPerUsdt ?? 1, { min: 0.0001, step: 0.0001 });
+  i.payRateSource = text(pay.rateSource ?? '', { placeholder: 'Indodax mid, set by hand, …' });
+  i.payInstructions = textarea(pay.instructions ?? '', { rows: 3 });
 
   root.append(card('Billing', h('div', {},
     h('label.switch', { style: { marginBottom: '12px' } }, i.blEnabled,
@@ -253,6 +277,29 @@ export async function settingsView(ctx) {
     ),
     field('Address', i.blIssuerAddress),
     field('Payment terms', i.blTerms, 'bank details, due dates — printed under the totals'),
+
+    h('h3.small', { text: 'How it is paid' }),
+    h('div.grid.form', {},
+      field('Due in (days)', i.blDueDays, 'counted from the invoice date; frozen onto each invoice'),
+      field('USDT network', i.payNetwork, 'printed beside the address'),
+      field('IDR per USDT', i.payIdrPerUsdt, 'the rate the customer is quoted'),
+    ),
+    field('USDT address', i.payAddress),
+    h('p.small.muted', {
+      text: 'The address and the network are copied onto every invoice as it is issued, '
+        + 'never read back live. Rotate the wallet and an invoice somebody is still '
+        + 'holding keeps pointing at the one it named — and USDT sent over the wrong '
+        + 'chain is gone, which is why the chain is printed beside the address rather '
+        + 'than assumed.',
+    }),
+    h('div.grid.form', {},
+      field('USD per USDT', i.payUsdPerUsdt, 'practically 1; not assumed to be'),
+      field('Rate source', i.payRateSource, 'printed under the rate'),
+    ),
+    field('Payment instructions', i.payInstructions, 'memo, proof of payment, who to ask'),
+    pay.rateUpdatedAt
+      ? h('p.small.muted', { text: `Rate last set ${new Date(pay.rateUpdatedAt).toLocaleString()}` })
+      : null,
   )));
 
   /* ----------------------------------------------------------- logging */
@@ -281,6 +328,74 @@ export async function settingsView(ctx) {
         + 'took, how long injecting the prompt took, time to first token, and one '
         + 'summary line with memory, network, tokens, cost and throughput. It goes to '
         + 'the terminal and to relay.log alike, so the Logs tab shows what Termux shows.',
+    }),
+  )));
+
+  /* --------------------------------------------------------- langfuse */
+  // Per-request traces: what was asked, what the relay injected, what came
+  // back, and what it cost. Off until both keys are set.
+  const lf = cfg.langfuse ?? {};
+  const lfLive = await api.langfuse().catch(() => null);
+  i.lfEnabled = h('input', { type: 'checkbox', checked: lf.enabled === true });
+  i.lfHost = text(lf.host ?? 'https://cloud.langfuse.com', { class: 'mono' });
+  i.lfPublic = text(lf.publicKey ?? '', { class: 'mono', placeholder: 'pk-lf-…' });
+  i.lfSecret = h('input', {
+    type: 'password',
+    value: '',
+    class: 'mono',
+    placeholder: lf.secretKey ? '•••••• (unchanged)' : 'sk-lf-…',
+  });
+  i.lfSample = number((lf.sampleRate ?? 1) * 100, { min: 0, max: 100, step: 1 });
+  i.lfEnvironment = text(lf.environment ?? 'production');
+  i.lfTags = text((lf.tags ?? []).join(', '), { placeholder: 'relay, termux' });
+  i.lfMaxChars = number(lf.maxFieldChars ?? 20000, { min: 64, max: 1000000, step: 1000 });
+  i.lfInput = h('input', { type: 'checkbox', checked: lf.captureInput !== false });
+  i.lfOutput = h('input', { type: 'checkbox', checked: lf.captureOutput !== false });
+  i.lfSystem = h('input', { type: 'checkbox', checked: lf.captureSystemPrompt !== false });
+  i.lfReasoning = h('input', { type: 'checkbox', checked: lf.captureReasoning === true });
+  i.lfErrors = h('input', { type: 'checkbox', checked: lf.captureErrors !== false });
+  i.lfIp = h('input', { type: 'checkbox', checked: lf.captureClientIp === true });
+
+  root.append(card('Langfuse tracing', h('div', {},
+    lfLive
+      ? h('div.grid.stats', {},
+        stat('Sent', fmtNum(lfLive.sent ?? 0), lfLive.lastOkAt ? `last at ${new Date(lfLive.lastOkAt).toLocaleTimeString()}` : 'nothing yet'),
+        stat('Waiting', fmtNum(lfLive.inFlight ?? 0), `of ${fmtNum(lfLive.capacity ?? 0)} queued`),
+        stat('Dropped', fmtNum(lfLive.dropped ?? 0), 'queue was full, or tracing was off'),
+        stat('Failed', fmtNum(lfLive.failed ?? 0), lfLive.lastError || 'no errors'),
+      )
+      : null,
+    h('label.switch', { style: { marginBottom: '12px' } }, i.lfEnabled,
+      h('span', { text: 'Send a trace for each relayed request' })),
+    h('div.grid.form', {},
+      field('Host', i.lfHost, 'https://cloud.langfuse.com, the EU/US region, or your own'),
+      field('Public key', i.lfPublic),
+      field('Secret key', i.lfSecret, 'leave blank to keep the current one'),
+    ),
+    h('div.grid.form', {},
+      field('Sample %', i.lfSample, 'of successful requests; failures are always kept'),
+      field('Environment', i.lfEnvironment),
+      field('Max characters per field', i.lfMaxChars),
+    ),
+    field('Tags', i.lfTags, 'comma separated, added to every trace'),
+    h('label.switch', {}, i.lfInput, h('span', { text: 'The caller’s own request body' })),
+    h('label.switch', {}, i.lfOutput, h('span', { text: 'What the relay answered' })),
+    h('label.switch', {}, i.lfSystem,
+      h('span', { text: 'The system prompt this relay injects, and the body the backend received' })),
+    h('label.switch', {}, i.lfReasoning, h('span', { text: 'The model’s reasoning trace' })),
+    h('label.switch', {}, i.lfErrors, h('span', { text: 'Trace failures too, whatever the sample rate' })),
+    h('label.switch', {}, i.lfIp, h('span', { text: 'The caller’s IP address' })),
+    h('p.small.muted', {
+      text: 'Traces go out over OpenTelemetry — Langfuse’s own batch ingestion endpoint '
+        + 'is deprecated and stops accepting traces on Cloud from 16 November 2026. '
+        + 'Nothing is sent on the request path: spans are queued and posted in the '
+        + 'background, and a Langfuse that is down or wrong can never slow a caller '
+        + 'down or fail their request.',
+    }),
+    h('p.small.muted', {
+      text: 'Keys never travel. A private key whose upstream identity is the key itself '
+        + 'is fingerprinted before it goes, and the fields a client key can be written '
+        + 'into are stripped from every body.',
     }),
   )));
 
@@ -449,6 +564,7 @@ export async function settingsView(ctx) {
               requireClientKey: i.requireKey.checked,
               trustProxyHeaders: i.trustProxy.checked,
               dashboardOriginGuard: i.originGuard.checked,
+              dashboardAllowedHosts: parseList(i.dashHosts.value),
               privateUserId: i.privateUserId.value,
               corsOrigins: parseList(i.cors.value),
               blockedIps: parseList(i.blockedIps.value),
@@ -461,6 +577,21 @@ export async function settingsView(ctx) {
               taxPercent: Number(i.blTax.value) || 0,
               minimumUsd: Number(i.blMinimum.value) || 0,
               cycleDay: Number(i.blCycleDay.value) || 1,
+              dueDays: Number(i.blDueDays.value) || 0,
+              payment: {
+                usdtAddress: i.payAddress.value.trim(),
+                usdtNetwork: i.payNetwork.value,
+                idrPerUsdt: Number(i.payIdrPerUsdt.value) || 0,
+                usdPerUsdt: Number(i.payUsdPerUsdt.value) || 1,
+                rateSource: i.payRateSource.value.trim(),
+                instructions: i.payInstructions.value,
+                // Stamped whenever the rate is written, so a stale rate reads
+                // as stale rather than as current.
+                rateUpdatedAt:
+                  Number(i.payIdrPerUsdt.value) !== (bill.payment?.idrPerUsdt ?? 0)
+                    ? Date.now()
+                    : (bill.payment?.rateUpdatedAt ?? 0),
+              },
               issuer: {
                 name: i.blIssuerName.value,
                 email: i.blIssuerEmail.value,
@@ -490,6 +621,22 @@ export async function settingsView(ctx) {
               previewChars: Number(i.previewChars.value),
               fileEnabled: i.fileEnabled.checked,
               verboseRequests: i.verbose.checked,
+            },
+            langfuse: {
+              enabled: i.lfEnabled.checked,
+              host: i.lfHost.value.trim(),
+              publicKey: i.lfPublic.value.trim(),
+              ...(i.lfSecret.value ? { secretKey: i.lfSecret.value } : {}),
+              sampleRate: Math.min(1, Math.max(0, (Number(i.lfSample.value) || 0) / 100)),
+              environment: i.lfEnvironment.value.trim(),
+              tags: parseList(i.lfTags.value),
+              maxFieldChars: Number(i.lfMaxChars.value) || 20000,
+              captureInput: i.lfInput.checked,
+              captureOutput: i.lfOutput.checked,
+              captureSystemPrompt: i.lfSystem.checked,
+              captureReasoning: i.lfReasoning.checked,
+              captureErrors: i.lfErrors.checked,
+              captureClientIp: i.lfIp.checked,
             },
             tokenizer: {
               fallback: i.fallback.value.trim(),

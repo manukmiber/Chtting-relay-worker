@@ -156,6 +156,7 @@ function editKey(ctx, k, models) {
     i.note = text(k.note ?? '');
 
     const b = k.billing ?? {};
+    i.billCompany = text(b.company ?? '', { placeholder: 'PT / CV / Ltd — the registered name' });
     i.billName = text(b.name ?? '', { placeholder: k.label || 'who the invoice is for' });
     i.billEmail = text(b.email ?? '', { placeholder: 'billing@example.com' });
     i.billAddress = text(b.address ?? '');
@@ -177,8 +178,11 @@ function editKey(ctx, k, models) {
       field('Note', i.note),
       h('h3.small', { text: 'Billing', style: { marginTop: '18px' } }),
       h('div.grid.form', {},
-        field('Bill to', i.billName, 'blank uses the label'),
+        field('Company', i.billCompany, 'printed at the top of the invoice'),
+        field('Contact', i.billName, 'blank uses the label'),
         field('Email', i.billEmail),
+      ),
+      h('div.grid.form', {},
         field('Tax id', i.billTaxId),
         field('Tax %', i.billTax, 'blank inherits the global rate'),
       ),
@@ -216,6 +220,7 @@ function editKey(ctx, k, models) {
           },
           note: i.note.value,
           billing: {
+            company: i.billCompany.value,
             name: i.billName.value,
             email: i.billEmail.value,
             address: i.billAddress.value,

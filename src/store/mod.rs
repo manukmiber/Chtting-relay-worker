@@ -286,6 +286,11 @@ fn write_batch(
 fn migrate(conn: &Connection) -> Result<()> {
     add_columns(conn, "requests", &schema::ADDED_COLUMNS)?;
     add_columns(conn, "usage_ledger", &ledger::ADDED_COLUMNS)?;
+    // Same problem, same answer: an invoices table written before the payment
+    // fields existed has to grow them before anything selects one. Their
+    // defaults are what keep an invoice issued back then verifying against the
+    // canonical form it was actually hashed with — see `invoice::HASH_V2`.
+    add_columns(conn, "invoices", &invoice::ADDED_COLUMNS)?;
     Ok(())
 }
 

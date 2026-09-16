@@ -78,6 +78,15 @@ pub struct AppState {
     pub limiter: Arc<RateLimiter>,
     pub quotas: Arc<QuotaTracker>,
     pub tunnel: Arc<TunnelManager>,
+    /// A second cloudflared, publishing the dashboard port so the control
+    /// panel can be opened from another device. Off unless the operator turns
+    /// it on, and it refuses to start without a real password — see
+    /// [`crate::tunnel`].
+    pub dashboard_tunnel: Arc<TunnelManager>,
+    /// Per-request traces on their way to Langfuse. Always present; whether it
+    /// exports anything is read from the live config on each request, so
+    /// switching it on in the dashboard needs no restart.
+    pub langfuse: Arc<crate::langfuse::Langfuse>,
     /// The phone itself: the service, the boot hook, the wake lock. Everything
     /// that used to be a Termux command.
     pub host: Arc<Host>,
@@ -101,6 +110,9 @@ impl AppState {
         let counter = Arc::new(TokenCounter::new(registry));
         let upstream = Arc::new(crate::relay::upstream::Upstream::new(logger.clone())?);
         let tunnel = Arc::new(TunnelManager::new(config.clone(), logger.clone()));
+        let dashboard_tunnel =
+            Arc::new(TunnelManager::for_dashboard(config.clone(), logger.clone()));
+        let langfuse = crate::langfuse::Langfuse::start(config.clone(), logger.clone());
         let host = Arc::new(Host::new(paths.clone(), logger.clone()));
         let updater = Arc::new(crate::update::Updater::new(paths.clone(), logger.clone()));
 
@@ -125,6 +137,8 @@ impl AppState {
             limiter: Arc::new(RateLimiter::new()),
             quotas,
             tunnel,
+            dashboard_tunnel,
+            langfuse,
             host,
             updater,
             paths,

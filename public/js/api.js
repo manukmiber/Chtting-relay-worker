@@ -73,10 +73,13 @@ export const api = {
   usageLedger: (limit = 100) => request('GET', `/api/usage/ledger?limit=${limit}`),
   verifyLedger: () => request('GET', '/api/usage/verify'),
   queue: () => request('GET', '/api/queue'),
+  langfuse: () => request('GET', '/api/langfuse'),
   openrouterPreview: () => request('GET', '/api/openrouter/preview'),
 
   tunnel: () => request('GET', '/api/tunnel'),
   tunnelAction: (action) => request('POST', `/api/tunnel/${action}`),
+  dashboardTunnel: () => request('GET', '/api/dashboard-tunnel'),
+  dashboardTunnelAction: (action) => request('POST', `/api/dashboard-tunnel/${action}`),
 
   setup: () => request('GET', '/api/setup'),
   serviceAction: (action) => request('POST', `/api/service/${action}`),

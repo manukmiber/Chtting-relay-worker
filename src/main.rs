@@ -328,11 +328,17 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
                 let app = server::dashboard::router(state.clone());
                 let mut retire_rx = retire.subscribe();
                 dashboard_task = Some(tokio::spawn(async move {
-                    axum::serve(listener, app)
-                        .with_graceful_shutdown(async move {
-                            let _ = retire_rx.changed().await;
-                        })
-                        .await
+                    // With connect info, like the relay: once the dashboard can
+                    // be reached through a tunnel, "who is guessing this
+                    // password" stops being a question with one answer.
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move {
+                        let _ = retire_rx.changed().await;
+                    })
+                    .await
                 }));
             }
             Err(err) => logger.error(format!("cannot bind the dashboard on {addr}: {err}")),
@@ -356,16 +362,29 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
     // one-shot attempt that gives up if the phone has no network yet a second
     // after boot — ensure_running keeps trying, and the supervisor inside the
     // manager brings cloudflared back if it dies later.
-    if cfg.tunnel.auto_start && cfg.tunnel.mode != "off" {
+    let wants = |t: &chtting_relay::config::TunnelConfig| t.auto_start && t.mode != "off";
+    let relay_tunnel = wants(&cfg.tunnel);
+    // The dashboard's is a separate process publishing a separate port, and it
+    // comes up the same way — but only if somebody switched it on. It refuses
+    // to start without a real password, and says so once rather than retrying.
+    let dash_tunnel = cfg.dashboard.enabled && !no_dashboard && wants(&cfg.dashboard.tunnel);
+    if relay_tunnel || dash_tunnel {
         let tunnel_state = state.clone();
         let tunnel_logger = logger.clone();
         tokio::spawn(async move {
-            // One cloudflared per relay: during a rotation the retiring
-            // instance still owns it, and starting a second would hand out a
-            // second quick-tunnel URL.
+            // One cloudflared generation per relay: during a rotation the
+            // retiring instance still owns them, and starting a second would
+            // hand out a second quick-tunnel URL. The claim covers both
+            // tunnels, because both belong to the generation that holds it.
             rotate::claim_tunnel(&tunnel_state).await;
-            tunnel_logger.info("cloudflared: bringing the tunnel up");
-            tunnel_state.tunnel.ensure_running();
+            if relay_tunnel {
+                tunnel_logger.info("cloudflared: bringing the relay tunnel up");
+                tunnel_state.tunnel.ensure_running();
+            }
+            if dash_tunnel {
+                tunnel_logger.info("cloudflared: bringing the dashboard tunnel up");
+                tunnel_state.dashboard_tunnel.ensure_running();
+            }
         });
     }
 
@@ -406,6 +425,11 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
             rotate::release_serving(&state).await;
             rotate::release_tunnel(&state).await;
             let _ = state.tunnel.stop().await;
+            // Both, always: a dashboard tunnel left running past the process
+            // that owned it would keep a URL alive with nothing behind it —
+            // and, after a rotation, with the *successor* behind it, which is
+            // a control panel published by a process that never agreed to.
+            let _ = state.dashboard_tunnel.stop().await;
             state.host.release_wake_lock().await;
             // Commit whatever the metrics writer still had queued.
             state.store.flush().await;
@@ -689,8 +713,9 @@ fn rotate_on_a_clock(state: Arc<AppState>, retire: tokio::sync::watch::Sender<bo
                 ));
             }
 
-            // The successor is waiting on this before starting its cloudflared.
+            // The successor is waiting on these before starting its own.
             let _ = state.tunnel.stop().await;
+            let _ = state.dashboard_tunnel.stop().await;
             rotate::release_tunnel(&state).await;
             // A successor that is already up owns the lock by now, so this
             // only fires when the handover never happened.

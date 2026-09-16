@@ -7,7 +7,7 @@
 //! untouched — it is embedded into the binary at build time.
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -17,6 +17,7 @@ use include_dir::{include_dir, Dir};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::config::{mask_item, unmask_secrets};
@@ -67,36 +68,94 @@ impl Sessions {
 /// The counter is cleared by a correct password, so getting it right is the
 /// way out rather than waiting.
 const LOGIN_ATTEMPTS: u32 = 10;
+/// The shared budget, across every address at once. Larger than the per-address
+/// one because a handful of people on a shared NAT are not an attack, and much
+/// smaller than ten times it because a run spread over a thousand addresses is.
+const LOGIN_ATTEMPTS_GLOBAL: u32 = 40;
 const LOGIN_LOCKOUT_MS: i64 = 30_000;
 
+/// How many addresses are tracked separately before the map is swept.
+///
+/// A bound, because the key is whatever address the request came from and
+/// behind a tunnel that is attacker-chosen: without one, a run of guesses from
+/// a new address each time is a memory leak with a lockout counter attached.
+const LOGIN_TRACKED_ADDRESSES: usize = 4_096;
+
 /// Wrong sign-ins so far, and when the current lockout ends.
+///
+/// Counted twice: once for the whole dashboard, and once per calling address.
+///
+/// The global counter is what actually stops a guessing run, and it is the one
+/// that was here first — it cannot be escaped by changing address, which
+/// matters now that the dashboard can be reached from anywhere. The per-address
+/// counter exists so that one attacker cannot lock the operator out of their
+/// own panel by failing ten times on purpose: a request from an address that
+/// has not been guessing is answered while the global lockout is still running,
+/// as long as *that* address is clean.
+///
+/// So a guess is refused when either counter says so, and allowed only when
+/// both agree — with the global one carrying a much larger budget, because it
+/// is shared.
 #[derive(Default)]
 struct LoginGuard {
-    state: parking_lot::Mutex<(u32, i64)>,
+    global: parking_lot::Mutex<(u32, i64)>,
+    per_address: parking_lot::Mutex<HashMap<String, (u32, i64)>>,
 }
 
 impl LoginGuard {
     /// `Err(seconds)` while locked out, `Ok(())` when a guess may be made.
-    fn check(&self) -> Result<(), i64> {
-        let (_, until) = *self.state.lock();
+    fn check(&self, address: &str) -> Result<(), i64> {
         let now = crate::util::now_ms();
+        let mut wait = 0i64;
+
+        if let Some((_, until)) = self.per_address.lock().get(address) {
+            if *until > now {
+                wait = wait.max((*until - now) / 1000);
+            }
+        }
+        let (_, until) = *self.global.lock();
         if until > now {
-            return Err(((until - now) / 1000).max(1));
+            wait = wait.max((until - now) / 1000);
+        }
+        if wait > 0 {
+            return Err(wait.max(1));
         }
         Ok(())
     }
 
-    fn failed(&self) {
-        let mut state = self.state.lock();
-        state.0 += 1;
-        if state.0 >= LOGIN_ATTEMPTS {
-            state.0 = 0;
-            state.1 = crate::util::now_ms() + LOGIN_LOCKOUT_MS;
+    fn failed(&self, address: &str) {
+        let now = crate::util::now_ms();
+        {
+            let mut global = self.global.lock();
+            global.0 += 1;
+            if global.0 >= LOGIN_ATTEMPTS_GLOBAL {
+                global.0 = 0;
+                global.1 = now + LOGIN_LOCKOUT_MS;
+            }
+        }
+        let mut per = self.per_address.lock();
+        if per.len() >= LOGIN_TRACKED_ADDRESSES {
+            // Everything whose lockout has run out is no longer evidence of
+            // anything, so it is the right thing to forget first.
+            per.retain(|_, (_, until)| *until > now);
+            if per.len() >= LOGIN_TRACKED_ADDRESSES {
+                // Still full: every entry is an address currently locked out,
+                // and the global counter is already carrying this run. Adding
+                // more rows would only cost memory.
+                return;
+            }
+        }
+        let entry = per.entry(address.to_string()).or_insert((0, 0));
+        entry.0 += 1;
+        if entry.0 >= LOGIN_ATTEMPTS {
+            entry.0 = 0;
+            entry.1 = now + LOGIN_LOCKOUT_MS;
         }
     }
 
-    fn succeeded(&self) {
-        *self.state.lock() = (0, 0);
+    fn succeeded(&self, address: &str) {
+        *self.global.lock() = (0, 0);
+        self.per_address.lock().remove(address);
     }
 }
 
@@ -150,6 +209,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/invoices/{id}", get(get_invoice))
         .route("/api/invoices/{id}/status", post(set_invoice_status))
         .route("/api/queue", get(queue_status))
+        .route("/api/langfuse", get(langfuse_status))
         .route("/api/openrouter/preview", get(openrouter_preview))
         .route("/api/maintenance/prune", post(prune))
         .route("/api/logs", get(read_logs))
@@ -158,6 +218,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/tokenizer/install", post(tokenizer_install))
         .route("/api/tunnel", get(tunnel_status))
         .route("/api/tunnel/{action}", post(tunnel_action))
+        .route("/api/dashboard-tunnel", get(dashboard_tunnel_status))
+        .route(
+            "/api/dashboard-tunnel/{action}",
+            post(dashboard_tunnel_action),
+        )
         .route("/api/setup", get(setup))
         .route("/api/update", get(update_status))
         .route("/api/service/{action}", post(service_action))
@@ -166,12 +231,67 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/playground", post(playground))
         .fallback(static_files)
         .layer(middleware::from_fn_with_state(dash.clone(), guard))
+        // Outside the guard so a 403 from it is hardened too, and outside the
+        // routes so every response carries them — including the static files.
+        .layer(middleware::from_fn(security_headers))
         // Outside the guard, so a panic in the guard itself is answered too.
         .layer(middleware::from_fn_with_state(
             dash.state.logger.clone(),
             crate::server::catch_panics,
         ))
         .with_state(dash)
+}
+
+/// Headers every dashboard response carries.
+///
+/// On loopback most of these were belt and braces. Once the dashboard can be
+/// opened from another device they are the difference between a control panel
+/// and a control panel anybody's browser can be talked into driving:
+///
+/// * **CSP** — the page loads its own modules and its own stylesheet and
+///   nothing else, and `connect-src 'self'` means a script that did get in
+///   could not post what it read anywhere. `frame-ancestors 'none'` keeps it
+///   out of somebody else's iframe, and `form-action 'none'` stops a form
+///   being pointed off-site. `'unsafe-inline'` is granted to styles only,
+///   because the frontend sets `style` attributes from JavaScript; scripts get
+///   no such grant.
+/// * **`no-store`** — the responses are the config, the keys and the prompts.
+///   A shared or proxied cache holding any of those is the whole problem.
+/// * **nosniff** — a JSON body that a browser decides to treat as HTML is a
+///   cross-site scripting bug in a response that contains client keys.
+/// * **`no-referrer`** — the tunnel URL is a capability in its own right, and
+///   a `Referer` header is how a URL walks to a third party by itself.
+async fn security_headers(request: Request, next: Next) -> Response {
+    const CSP: &str = "default-src 'self'; \
+                       script-src 'self'; \
+                       style-src 'self' 'unsafe-inline'; \
+                       img-src 'self' data:; \
+                       font-src 'self'; \
+                       connect-src 'self'; \
+                       object-src 'none'; \
+                       base-uri 'none'; \
+                       form-action 'none'; \
+                       frame-ancestors 'none'";
+
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("content-security-policy", CSP),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("x-frame-options", "DENY"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("cache-control", "no-store, max-age=0"),
+    ] {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::try_from(name),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    response
 }
 
 /* --------------------------------------------------------------- auth -- */
@@ -211,8 +331,8 @@ fn same_origin(dash: &Dashboard, headers: &HeaderMap) -> Result<(), &'static str
     }
 
     if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-        if !is_local_host(host) {
-            return Err("this dashboard answers only to localhost");
+        if !dash.answers_to(host) {
+            return Err("this dashboard does not answer to that hostname");
         }
     }
 
@@ -227,10 +347,73 @@ fn same_origin(dash: &Dashboard, headers: &HeaderMap) -> Result<(), &'static str
         .split_once("//")
         .map(|(_, rest)| rest)
         .unwrap_or(origin);
-    if is_local_host(host) {
+    if dash.answers_to(host) {
         Ok(())
     } else {
         Err("cross-origin requests are refused: open the dashboard directly")
+    }
+}
+
+/// Just the host part of a `host:port`, lowercased.
+fn host_only(host: &str) -> String {
+    // An IPv6 literal is bracketed, so the last colon is only a port separator
+    // when it comes after the closing bracket.
+    let name = match host.rfind(']') {
+        Some(end) => &host[..=end],
+        None => host.split(':').next().unwrap_or(host),
+    };
+    name.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+impl Dashboard {
+    /// Is this a name the dashboard is legitimately reachable at?
+    ///
+    /// This machine's own names always; plus the hostname of the dashboard
+    /// tunnel while it is up, and whatever `dashboardAllowedHosts` lists.
+    ///
+    /// The guard is not switched off to let a tunnel through, and that is the
+    /// point. A name that resolves to 127.0.0.1 today can resolve somewhere
+    /// else tomorrow — DNS rebinding — so the set of names this answers to is
+    /// still a fixed list rather than "anything". Publishing the dashboard adds
+    /// exactly one name to that list: the one the operator published it at.
+    fn answers_to(&self, host: &str) -> bool {
+        if is_local_host(host) {
+            return true;
+        }
+        let name = host_only(host);
+        if name.is_empty() {
+            return false;
+        }
+        if self
+            .state
+            .dashboard_tunnel
+            .public_host()
+            .is_some_and(|live| host_only(&live) == name)
+        {
+            return true;
+        }
+        self.state
+            .config
+            .current()
+            .security
+            .dashboard_allowed_hosts
+            .iter()
+            .any(|allowed| host_only(allowed) == name)
+    }
+
+    /// Did this request arrive over the tunnel rather than from this machine?
+    ///
+    /// Read off the `Host` the client asked for, not off a forwarded-proto
+    /// header: the header is set by cloudflared and would be believable, but
+    /// the name is what the browser will key the cookie to, and matching the
+    /// two is what makes `Secure` correct rather than merely plausible.
+    fn is_remote(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|host| !is_local_host(host))
     }
 }
 
@@ -294,12 +477,40 @@ fn error(status: u16, message: &str) -> Response {
         .into_response()
 }
 
-async fn login(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> Response {
+async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response {
+    // Taken off the request rather than extracted, so a missing `ConnectInfo`
+    // is an address of "unknown" instead of a 500. A server wired up without
+    // connect info — a test, an embedding, a later refactor — must still be
+    // able to sign in; refusing the only route that grants access because of a
+    // detail of how the listener was built is the worst failure this endpoint
+    // could have. Without it every caller shares one bucket, which is what the
+    // throttle was before there were two.
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    let headers = request.headers().clone();
+    let body = match read_json(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
     let cfg = dash.state.config.current();
     let expected = &cfg.dashboard.password;
     let given = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    let remote = dash.is_remote(&headers);
+    // Behind the tunnel every request arrives from cloudflared on loopback, so
+    // the peer address is the same for everyone and useless as a throttle key.
+    // `client_ip` is the function that already knows when a forwarded address
+    // is worth believing — from a loopback peer, with the header set — and it
+    // is the same rule here as on the relay.
+    let caller = match peer {
+        Some(peer) => crate::server::client_ip(&headers, peer, cfg.security.trust_proxy_headers),
+        None => "unknown".to_string(),
+    };
+
     if !expected.is_empty() {
-        if let Err(wait) = dash.logins.check() {
+        if let Err(wait) = dash.logins.check(&caller) {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, wait.to_string())],
@@ -310,13 +521,26 @@ async fn login(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> R
                 .into_response();
         }
         if !safe_equal(given, expected) {
-            dash.logins.failed();
+            dash.logins.failed(&caller);
+            dash.state.logger.warn(format!(
+                "dashboard: wrong password from {caller}{}",
+                if remote { " (over the tunnel)" } else { "" }
+            ));
             return error(401, "wrong password");
         }
+    } else if remote {
+        // Reachable from outside and not asking for anything. The tunnel
+        // refuses to start in this state, so getting here means something else
+        // is forwarding the port — and a password-less control panel on a
+        // public name is not something to answer.
+        return error(
+            403,
+            "this dashboard is reachable from outside and has no password set;              set one before signing in remotely",
+        );
     }
-    dash.logins.succeeded();
+    dash.logins.succeeded(&caller);
 
-    let token = random_hex(24);
+    let token = random_hex(32);
     let ttl = cfg.dashboard.session_ttl_ms.max(60_000);
     // Signing in is the natural moment to clear out what has expired: it is
     // rare, and it is the only thing that grows the set.
@@ -326,9 +550,15 @@ async fn login(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>) -> R
         .write()
         .insert(token.clone(), crate::util::now_ms() + ttl);
 
+    // `Secure` only when the request came in under a name that is not this
+    // machine — which is exactly when it came over the tunnel, and therefore
+    // over TLS. Setting it unconditionally would be the safer-sounding choice
+    // and would break signing in over plain `http://127.0.0.1` in any browser
+    // that does not treat loopback as a secure context.
     let cookie = format!(
-        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        ttl / 1000
+        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        ttl / 1000,
+        if remote { "; Secure" } else { "" },
     );
     (
         StatusCode::OK,
@@ -342,12 +572,21 @@ async fn logout(State(dash): State<Arc<Dashboard>>, headers: HeaderMap) -> Respo
     if let Some(token) = cookie_value(&headers, COOKIE) {
         dash.sessions.tokens.write().remove(&token);
     }
+    // Cleared with the same attributes it was set with. A browser matches a
+    // deletion against name, path and domain — and rejects a `Secure` cookie
+    // sent over plain http — so the two have to agree or the cookie survives
+    // the sign-out in the one place it matters most.
+    let cookie = format!(
+        "{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        if dash.is_remote(&headers) {
+            "; Secure"
+        } else {
+            ""
+        },
+    );
     (
         StatusCode::OK,
-        [(
-            header::SET_COOKIE,
-            format!("{COOKIE}=; HttpOnly; Path=/; Max-Age=0"),
-        )],
+        [(header::SET_COOKIE, cookie)],
         Json(json!({ "ok": true })),
     )
         .into_response()
@@ -378,6 +617,7 @@ async fn app_state(State(dash): State<Arc<Dashboard>>) -> Response {
     Json(json!({
         "config": state.config.redacted(),
         "tunnel": state.tunnel.status(),
+        "dashboardTunnel": state.dashboard_tunnel.status(),
         "cloudflared": state.tunnel.version().await,
         "store": {
             "kind": state.store.kind(),
@@ -1461,11 +1701,29 @@ async fn get_invoice(State(dash): State<Arc<Dashboard>>, Path(id): Path<String>)
         .read(move |conn| Ok(invoice::get(conn, &id)?))
         .await;
     match result {
-        // The issuer travels with the invoice rather than being stored on it:
-        // it is the same for every invoice, and an operator who fixes a typo in
-        // their own address expects the fix to show on what they print next.
         Ok(Some(inv)) => {
-            Json(json!({ "invoice": inv, "issuer": cfg.billing.issuer })).into_response()
+            // The issuer is stored *on* the invoice now, because an invoice is
+            // a statement about a moment and the company name on it is part of
+            // that statement. Invoices issued before it was recorded carry
+            // nothing, and those fall back to the live issuer — which is
+            // exactly what they have always done.
+            let issuer = if inv.issuer.is_null() {
+                serde_json::to_value(&cfg.billing.issuer).unwrap_or(Value::Null)
+            } else {
+                inv.issuer.clone()
+            };
+            let overdue = inv.status == invoice::ISSUED
+                && inv.due_at > 0
+                && crate::util::now_ms() > inv.due_at;
+            Json(json!({
+                "invoice": inv,
+                "issuer": issuer,
+                // Derived rather than stored: it is a fact about today, not
+                // about the invoice, and storing it would make it a lie the
+                // moment the clock moved.
+                "overdue": overdue,
+            }))
+            .into_response()
         }
         Ok(None) => error(404, "invoice not found"),
         Err(err) => error(500, &err.to_string()),
@@ -1517,6 +1775,28 @@ async fn usage_verify(State(dash): State<Arc<Dashboard>>) -> Response {
         Ok(v) => Json(v).into_response(),
         Err(err) => error(500, &err.to_string()),
     }
+}
+
+/// Whether traces are actually reaching Langfuse, and what has been lost.
+///
+/// The relay deliberately never learns this on the request path — telemetry
+/// that could fail a request is worse than no telemetry — so the counters are
+/// the only way to tell a working exporter from one that has been posting into
+/// a 401 for a week.
+async fn langfuse_status(State(dash): State<Arc<Dashboard>>) -> Response {
+    let cfg = dash.state.config.current();
+    let lf = &cfg.langfuse;
+    let mut body = dash.state.langfuse.status();
+    if let Some(map) = body.as_object_mut() {
+        map.insert("enabled".into(), json!(lf.enabled));
+        map.insert("ready".into(), json!(lf.ready()));
+        map.insert("host".into(), json!(lf.host));
+        map.insert("endpoint".into(), json!(lf.traces_url()));
+        map.insert("sampleRate".into(), json!(lf.sample_rate));
+        map.insert("publicKeySet".into(), json!(!lf.public_key.is_empty()));
+        map.insert("secretKeySet".into(), json!(!lf.secret_key.is_empty()));
+    }
+    Json(body).into_response()
 }
 
 /// The queue as it stands right now, for a dashboard that polls it.
@@ -1815,8 +2095,56 @@ async fn tunnel_status(State(dash): State<Arc<Dashboard>>) -> Response {
 }
 
 async fn tunnel_action(State(dash): State<Arc<Dashboard>>, Path(action): Path<String>) -> Response {
-    let tunnel = &dash.state.tunnel;
-    let result = match action.as_str() {
+    act_on_tunnel(&dash.state.tunnel, &action).await
+}
+
+/// The second tunnel: the one that publishes this dashboard.
+///
+/// Its own routes rather than a parameter on the existing ones, because the
+/// two do very different things and confusing them is expensive in one
+/// direction. A relay URL is meant to be handed out; this one is a way into
+/// the config, the stored prompts and every client key.
+async fn dashboard_tunnel_status(State(dash): State<Arc<Dashboard>>) -> Response {
+    let mut status = dash.state.dashboard_tunnel.status();
+    if let Some(map) = status.as_object_mut() {
+        map.insert(
+            "cloudflared".into(),
+            dash.state.dashboard_tunnel.version().await,
+        );
+        let cfg = dash.state.config.current();
+        map.insert(
+            "passwordSet".into(),
+            json!(!cfg.dashboard.password.is_empty()),
+        );
+        map.insert(
+            "passwordLength".into(),
+            json!(cfg.dashboard.password.chars().count()),
+        );
+        map.insert(
+            "minPasswordLength".into(),
+            json!(crate::config::MIN_REMOTE_PASSWORD),
+        );
+        map.insert(
+            "allowedHosts".into(),
+            json!(cfg.security.dashboard_allowed_hosts),
+        );
+        map.insert(
+            "originGuard".into(),
+            json!(cfg.security.dashboard_origin_guard),
+        );
+    }
+    Json(status).into_response()
+}
+
+async fn dashboard_tunnel_action(
+    State(dash): State<Arc<Dashboard>>,
+    Path(action): Path<String>,
+) -> Response {
+    act_on_tunnel(&dash.state.dashboard_tunnel, &action).await
+}
+
+async fn act_on_tunnel(tunnel: &Arc<crate::tunnel::TunnelManager>, action: &str) -> Response {
+    let result = match action {
         "start" => tunnel.start().await,
         "stop" => tunnel.stop().await,
         "restart" => tunnel.restart().await,

@@ -244,6 +244,9 @@ struct Ctx {
     /// What this request's input row already put in the ledger, if one was
     /// written.
     ledgered: Option<Ledgered>,
+    /// The request side of a Langfuse span, when this request is being traced.
+    /// `None` is the ordinary case and costs nothing.
+    traced: Option<crate::langfuse::Traced>,
 }
 
 impl Ctx {
@@ -348,6 +351,16 @@ struct Outcome<'a> {
     /// Bytes read from the backend.
     bytes_upstream: u64,
     trace: Option<&'a Trace>,
+    /// The request side of a Langfuse span. Set on every path that can reach a
+    /// traced request, which is every path: a 404 on the model name is exactly
+    /// the kind of thing a trace is opened to explain.
+    traced: Option<&'a crate::langfuse::Traced>,
+    /// What the caller was sent back, in full. `response_preview` is trimmed
+    /// for the request row; this is not, because a trace is read to see the
+    /// answer rather than the first 800 characters of it.
+    answer: &'a str,
+    /// The model's reasoning trace, when the route did not strip it.
+    reasoning: &'a str,
 }
 
 /* ------------------------------------------------------------ dispatch -- */
@@ -379,6 +392,10 @@ pub async fn handle_chat(
     // reads this one value.
     let effort = pricing::effort_of(&body).or(pricing::default_effort(&cfg));
     let user_id = effective_user_id(&cfg, &key, &body, headers);
+    // Decided here, before any work: a request that will not be traced carries
+    // nothing for the rest of its life, and one that will holds the body it
+    // already has by `Arc` rather than a copy of it.
+    let mut traced = state.langfuse.begin(&cfg, body.clone());
 
     let mut record = RequestRecord {
         id: id.clone(),
@@ -441,6 +458,7 @@ pub async fn handle_chat(
                 status: 404,
                 error: &message,
                 trace: Some(&trace),
+                traced: traced.as_ref(),
                 ..Default::default()
             },
         );
@@ -460,6 +478,7 @@ pub async fn handle_chat(
                 status: 403,
                 error: &message,
                 trace: Some(&trace),
+                traced: traced.as_ref(),
                 ..Default::default()
             },
         );
@@ -510,6 +529,7 @@ pub async fn handle_chat(
                     status: 503,
                     error: &message,
                     trace: Some(&trace),
+                    traced: traced.as_ref(),
                     ..Default::default()
                 },
             );
@@ -528,6 +548,7 @@ pub async fn handle_chat(
                     status: 503,
                     error: &message,
                     trace: Some(&trace),
+                    traced: traced.as_ref(),
                     ..Default::default()
                 },
             );
@@ -556,6 +577,13 @@ pub async fn handle_chat(
     // copy of the whole conversation each.
     let mut upstream_body = Arc::new(transform_request(&body, &route, &cfg, &rt, prompt_spec));
     record.inject_ms = round(injecting.elapsed().as_secs_f64() * 1000.0, 3);
+    // The injection, for the trace. Resolved a second time rather than reached
+    // for inside the transform: this runs only on a request that is being
+    // traced, and never on the path every request takes.
+    if let Some(traced) = traced.as_mut() {
+        let (_, text) = crate::relay::transform::resolve_system_prompt(prompt_spec, &cfg);
+        traced.set_injected(&text);
+    }
     trace.timed("inj", record.inject_ms, || {
         format!(
             "rule={} mode={}",
@@ -630,6 +658,7 @@ pub async fn handle_chat(
                 status: 413,
                 error: &message,
                 trace: Some(&trace),
+                traced: traced.as_ref(),
                 ..Default::default()
             },
         );
@@ -712,6 +741,13 @@ pub async fn handle_chat(
         }
     }
 
+    // The body as the backend will receive it — `user` written in, `stream`
+    // settled, the system prompt already injected. Captured here rather than
+    // earlier so a trace shows what actually went out.
+    if let Some(traced) = traced.as_mut() {
+        traced.set_upstream(upstream_body.clone());
+    }
+
     // Requirement 4: the request goes to the backend.
     let sent = state
         .upstream
@@ -739,6 +775,7 @@ pub async fn handle_chat(
                     error: &err.message,
                     started: Some(started),
                     trace: Some(&trace),
+                    traced: traced.as_ref(),
                     ..Default::default()
                 },
             );
@@ -769,6 +806,7 @@ pub async fn handle_chat(
                     started: Some(started),
                     ledgered,
                     trace: Some(&trace),
+                    traced: traced.as_ref(),
                     ..Default::default()
                 },
             );
@@ -815,6 +853,7 @@ pub async fn handle_chat(
                 effort,
                 trace: trace.clone(),
                 ledgered,
+                traced,
             };
 
             if stream_upstream && is_sse {
@@ -1163,6 +1202,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
                     started: Some(ctx.started),
                     ledgered: ctx.ledgered,
                     trace: Some(&ctx.trace),
+                    traced: ctx.traced.as_ref(),
                     ..Default::default()
                 },
             );
@@ -1184,6 +1224,7 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
                     ledgered: ctx.ledgered,
                     bytes_upstream,
                     trace: Some(&ctx.trace),
+                    traced: ctx.traced.as_ref(),
                     ..Default::default()
                 },
             );
@@ -1306,6 +1347,9 @@ async fn pipe_buffered(response: reqwest::Response, ctx: Ctx) -> Response {
                 .unwrap_or(0),
             bytes_upstream,
             trace: Some(&ctx.trace),
+            traced: ctx.traced.as_ref(),
+            answer: &content,
+            reasoning: &reasoning,
         },
     );
     out
@@ -1385,6 +1429,12 @@ fn record_stream_outcome(ctx: &Ctx, pumped: &Pumped, billed: &Usage, charged: &U
             bytes_out: pumped.bytes_out,
             bytes_upstream: pumped.bytes_upstream,
             trace: Some(&ctx.trace),
+            traced: ctx.traced.as_ref(),
+            // What the model said, which is what the caller was sent: the
+            // stream path rewrites as it goes, so `pumped.text` is already the
+            // reshaped answer.
+            answer: &pumped.text,
+            reasoning: &pumped.reasoning,
         },
     );
 }
@@ -1531,6 +1581,20 @@ fn finish(state: &Arc<AppState>, mut record: RequestRecord, out: Outcome<'_>) {
     );
 
     ledger_final(state, &record, out.ledgered);
+
+    // The trace goes out last, and only for a request that opened one. It is a
+    // `try_send` on a bounded channel from here — the span is built and posted
+    // on the exporter's own task, so a slow or unreachable Langfuse cannot
+    // reach back into a request that has already been answered.
+    if let Some(traced) = out.traced {
+        state.langfuse.record(
+            &state.config.current(),
+            traced,
+            &record,
+            out.answer,
+            out.reasoning,
+        );
+    }
 
     if !state.store.insert(record) {
         state

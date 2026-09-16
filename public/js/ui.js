@@ -257,6 +257,37 @@ export function fmtTime(ts) {
  * two places would show every one of them as $0.00 — which reads as free. So
  * small amounts keep their digits and large ones do not carry pointless ones.
  */
+/** A date without a time, for the two dates that go on an invoice. */
+export function fmtDate(ts) {
+  if (!ts) return '—';
+  return new Date(Number(ts)).toLocaleDateString(undefined, {
+    year: 'numeric', month: 'short', day: '2-digit',
+  });
+}
+
+/**
+ * Rupiah, in whole units.
+ *
+ * There is no smaller one in circulation, so a decimal here would be a figure
+ * nobody can transfer.
+ */
+export function fmtIdr(n) {
+  const v = Number(n) || 0;
+  return `Rp ${Math.round(v).toLocaleString('id-ID')}`;
+}
+
+/**
+ * USDT to six decimals, which is the smallest unit a transfer carries.
+ *
+ * Trailing zeros are kept: an amount to pay is read character by character
+ * against a wallet, and a figure that changes width between invoices is a
+ * figure that gets mistyped.
+ */
+export function fmtUsdt(n) {
+  const v = Number(n) || 0;
+  return `${v.toFixed(6)} USDT`;
+}
+
 export function fmtUsd(n) {
   const v = Number(n) || 0;
   if (v === 0) return '$0';

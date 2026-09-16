@@ -64,7 +64,18 @@ CREATE TABLE IF NOT EXISTS invoices (
   note TEXT NOT NULL,
   status TEXT NOT NULL,
   settled_at INTEGER NOT NULL,
-  content_hash TEXT NOT NULL
+  content_hash TEXT NOT NULL,
+  due_at INTEGER NOT NULL DEFAULT 0,
+  issuer TEXT NOT NULL DEFAULT '',
+  idr_per_usdt REAL NOT NULL DEFAULT 0,
+  usd_per_usdt REAL NOT NULL DEFAULT 1,
+  total_idr REAL NOT NULL DEFAULT 0,
+  total_usdt REAL NOT NULL DEFAULT 0,
+  usdt_address TEXT NOT NULL DEFAULT '',
+  usdt_network TEXT NOT NULL DEFAULT '',
+  rate_source TEXT NOT NULL DEFAULT '',
+  payment_instructions TEXT NOT NULL DEFAULT '',
+  hash_version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_invoices_key ON invoices(key_id, to_seq DESC);
 CREATE INDEX IF NOT EXISTS idx_invoices_issued ON invoices(issued_at DESC);
@@ -78,12 +89,40 @@ BEFORE UPDATE OF
   id, number, key_id, key_kind, issued_at, period_start, period_end,
   from_seq, to_seq, currency, requests, input_tokens, output_tokens,
   cached_tokens, reasoning_tokens, subtotal_usd, tax_percent, tax_usd,
-  total_usd, backend_usd, lines, content_hash
+  total_usd, backend_usd, lines, content_hash,
+  due_at, issuer, idr_per_usdt, usd_per_usdt, total_idr, total_usdt,
+  usdt_address, usdt_network, rate_source, hash_version
 ON invoices
 BEGIN
   SELECT RAISE(ABORT, 'an issued invoice cannot be restated: void it and issue another');
 END;
 ";
+
+/// Columns added after the table first shipped.
+///
+/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+/// a database written by an earlier build still has that build's columns. These
+/// are added by [`crate::store::migrate`] on start-up, with the defaults that
+/// make an invoice issued before this change still read correctly: no due date,
+/// no rate, no wallet, and `hash_version` 1 — the canonical form its content
+/// hash was actually computed over.
+pub const ADDED_COLUMNS: [(&str, &str); 11] = [
+    ("due_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("issuer", "TEXT NOT NULL DEFAULT ''"),
+    ("idr_per_usdt", "REAL NOT NULL DEFAULT 0"),
+    ("usd_per_usdt", "REAL NOT NULL DEFAULT 1"),
+    ("total_idr", "REAL NOT NULL DEFAULT 0"),
+    ("total_usdt", "REAL NOT NULL DEFAULT 0"),
+    ("usdt_address", "TEXT NOT NULL DEFAULT ''"),
+    ("usdt_network", "TEXT NOT NULL DEFAULT ''"),
+    ("rate_source", "TEXT NOT NULL DEFAULT ''"),
+    ("payment_instructions", "TEXT NOT NULL DEFAULT ''"),
+    ("hash_version", "INTEGER NOT NULL DEFAULT 1"),
+];
+
+/// The canonical form that covers the payment instruction as well as the
+/// figures. Everything issued from this build on.
+pub const HASH_V2: i64 = 2;
 
 /// The statuses an invoice can be in.
 pub const ISSUED: &str = "issued";
@@ -157,6 +196,18 @@ pub struct Invoice {
     /// it was addressed to after the key has been renamed or deleted.
     pub bill_to: serde_json::Value,
     pub issued_at: i64,
+    /// The last day the customer may pay without the invoice being late:
+    /// `issued_at` plus `billing.dueDays`, frozen here so changing the terms
+    /// never moves a deadline that has already been handed out. 0 on invoices
+    /// issued before there were terms.
+    pub due_at: i64,
+    /// Who the invoice is from, as it stood when it was issued.
+    ///
+    /// Copied rather than read live, for the same reason `bill_to` is: an
+    /// invoice is a statement about a moment. `Null` on invoices issued before
+    /// this was recorded, and those fall back to the live issuer — which is
+    /// what they have always done.
+    pub issuer: serde_json::Value,
     pub period_start: i64,
     pub period_end: i64,
     pub from_seq: i64,
@@ -172,6 +223,26 @@ pub struct Invoice {
     pub tax_usd: f64,
     pub total_usd: f64,
     pub backend_usd: f64,
+    /// What one USDT was worth in rupiah on the day this was issued, and what
+    /// it was worth in US dollars. Both frozen: the relay prices in USD, and
+    /// these two are what turn that into the number the customer transfers.
+    pub idr_per_usdt: f64,
+    pub usd_per_usdt: f64,
+    /// `total_usd / usd_per_usdt`, rounded to the six decimals a USDT transfer
+    /// can actually carry.
+    pub total_usdt: f64,
+    /// `total_usdt * idr_per_usdt`, rounded to whole rupiah — there is no
+    /// smaller unit in circulation.
+    pub total_idr: f64,
+    /// The wallet this invoice asked for, and the chain it is on. Frozen
+    /// because a rotated wallet must not silently redirect an invoice somebody
+    /// is still holding, and because sending USDT over the wrong chain
+    /// destroys it.
+    pub usdt_address: String,
+    pub usdt_network: String,
+    /// Where the rate came from, printed beside it.
+    pub rate_source: String,
+    pub payment_instructions: String,
     pub lines: Vec<InvoiceLine>,
     pub note: String,
     /// `issued`, `paid` or `void`.
@@ -185,6 +256,16 @@ pub struct Invoice {
     /// figures are covered, and SQLite refuses to write them again anyway; the
     /// hash is what catches an edit made around SQLite.
     pub content_hash: String,
+    /// Which canonical form [`content_hash`](Self::content_hash) was computed
+    /// over.
+    ///
+    /// Version 1 predates the payment and due-date fields. Adding those to the
+    /// canonical form unconditionally would have made every invoice already on
+    /// disk fail verification — reporting tampering where there was none, which
+    /// is worse than no check at all, because an integrity check nobody
+    /// believes is one nobody reads. So the form is versioned and each invoice
+    /// is verified against the one it was actually written with.
+    pub hash_version: i64,
 }
 
 impl Invoice {
@@ -208,7 +289,7 @@ impl Invoice {
             })
             .collect::<Vec<_>>()
             .join(",");
-        format!(
+        let base = format!(
             "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:.9}|{:.4}|{:.9}|{:.9}|{:.9}|[{lines}]",
             self.id,
             self.number,
@@ -230,6 +311,27 @@ impl Invoice {
             self.tax_usd,
             self.total_usd,
             self.backend_usd,
+        );
+        if self.hash_version < HASH_V2 {
+            // Exactly the bytes an invoice written before the payment fields
+            // existed was hashed over. Reproduced rather than approximated:
+            // this is what makes those invoices still verify.
+            return base;
+        }
+        // What the customer was told to pay, where, and at what rate. These
+        // belong under the hash for the same reason the total does — they are
+        // the instruction, and an instruction that can be edited after the
+        // fact is not one.
+        format!(
+            "{base}|{}|{:.6}|{:.9}|{:.6}|{:.2}|{}|{}|{}",
+            self.due_at,
+            self.idr_per_usdt,
+            self.usd_per_usdt,
+            self.total_usdt,
+            self.total_idr,
+            self.usdt_address,
+            self.usdt_network,
+            self.rate_source,
         )
     }
 
@@ -465,8 +567,30 @@ pub fn issue(conn: &mut Connection, req: IssueRequest<'_>) -> Result<Issued> {
     }
 
     let tax = round(subtotal * tax_percent / 100.0, 9);
+    let total = round(subtotal + tax, 9);
     let now = crate::util::now_ms();
     let year = crate::util::local_parts(now, &req.tz).year;
+
+    // The payment instruction, frozen. Read once here and copied onto the
+    // invoice, never read live afterwards: the customer is being told an
+    // address, a chain and a rate, and all three can change tomorrow.
+    let pay = &req.billing.payment;
+    // Guarded rather than trusted even though `normalize` already clamps it:
+    // this divides, and a zero reaching it would put an infinity on a bill.
+    let usd_per_usdt = if pay.usd_per_usdt.is_finite() && pay.usd_per_usdt > 0.0 {
+        pay.usd_per_usdt
+    } else {
+        1.0
+    };
+    let idr_per_usdt = if pay.idr_per_usdt.is_finite() && pay.idr_per_usdt > 0.0 {
+        pay.idr_per_usdt
+    } else {
+        0.0
+    };
+    // Six decimals because that is the smallest unit a USDT transfer carries,
+    // and whole rupiah because there is no smaller one in circulation.
+    let total_usdt = round(total / usd_per_usdt, 6);
+    let total_idr = round(total_usdt * idr_per_usdt, 2);
 
     let mut invoice = Invoice {
         id: crate::util::new_id("inv"),
@@ -475,12 +599,21 @@ pub fn issue(conn: &mut Connection, req: IssueRequest<'_>) -> Result<Issued> {
         key_label: key.display_name().to_string(),
         key_kind: key.kind.as_str().to_string(),
         bill_to: serde_json::json!({
+            // The company is the name at the top of the invoice; `name` is the
+            // person it goes to. Blank company means the two are one, and only
+            // `name` is shown.
+            "company": key.billing.company,
             "name": if key.billing.name.is_empty() { key.display_name() } else { &key.billing.name },
             "email": key.billing.email,
             "address": key.billing.address,
             "taxId": key.billing.tax_id,
         }),
         issued_at: now,
+        // Three days by default, and whatever the operator set otherwise.
+        // Frozen: shortening the terms next month must not retroactively make
+        // an invoice somebody is holding overdue.
+        due_at: now + i64::from(req.billing.due_days) * 86_400_000,
+        issuer: serde_json::to_value(&req.billing.issuer).unwrap_or(serde_json::Value::Null),
         // A period runs from where the last one ended, so there is no gap
         // between two invoices even if the key was idle in between.
         period_start: if last_end > 0 {
@@ -504,13 +637,22 @@ pub fn issue(conn: &mut Connection, req: IssueRequest<'_>) -> Result<Issued> {
         subtotal_usd: subtotal,
         tax_percent,
         tax_usd: tax,
-        total_usd: round(subtotal + tax, 9),
+        total_usd: total,
         backend_usd: period.backend_usd,
+        idr_per_usdt,
+        usd_per_usdt,
+        total_usdt,
+        total_idr,
+        usdt_address: pay.usdt_address.clone(),
+        usdt_network: pay.usdt_network.clone(),
+        rate_source: pay.rate_source.clone(),
+        payment_instructions: pay.instructions.clone(),
         lines: period.lines,
         note: req.note,
         status: ISSUED.into(),
         settled_at: 0,
         content_hash: String::new(),
+        hash_version: HASH_V2,
     };
     invoice.content_hash = invoice.hash();
 
@@ -520,10 +662,14 @@ pub fn issue(conn: &mut Connection, req: IssueRequest<'_>) -> Result<Issued> {
            period_start, period_end, from_seq, to_seq, currency, requests,
            input_tokens, output_tokens, cached_tokens, reasoning_tokens,
            subtotal_usd, tax_percent, tax_usd, total_usd, backend_usd,
-           lines, note, status, settled_at, content_hash
+           lines, note, status, settled_at, content_hash,
+           due_at, issuer, idr_per_usdt, usd_per_usdt, total_idr, total_usdt,
+           usdt_address, usdt_network, rate_source, payment_instructions,
+           hash_version
          ) VALUES (
            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-           ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+           ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+           ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
          )",
         rusqlite::params![
             invoice.id,
@@ -553,6 +699,17 @@ pub fn issue(conn: &mut Connection, req: IssueRequest<'_>) -> Result<Issued> {
             invoice.status,
             invoice.settled_at,
             invoice.content_hash,
+            invoice.due_at,
+            invoice.issuer.to_string(),
+            invoice.idr_per_usdt,
+            invoice.usd_per_usdt,
+            invoice.total_idr,
+            invoice.total_usdt,
+            invoice.usdt_address,
+            invoice.usdt_network,
+            invoice.rate_source,
+            invoice.payment_instructions,
+            invoice.hash_version,
         ],
     )?;
     tx.commit()?;
@@ -634,7 +791,10 @@ const SELECT_SQL: &str = "SELECT id, number, key_id, key_label, key_kind, bill_t
        period_start, period_end, from_seq, to_seq, currency, requests,
        input_tokens, output_tokens, cached_tokens, reasoning_tokens,
        subtotal_usd, tax_percent, tax_usd, total_usd, backend_usd,
-       lines, note, status, settled_at, content_hash
+       lines, note, status, settled_at, content_hash,
+       due_at, issuer, idr_per_usdt, usd_per_usdt, total_idr, total_usdt,
+       usdt_address, usdt_network, rate_source, payment_instructions,
+       hash_version
 FROM invoices";
 
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Invoice> {
@@ -666,6 +826,17 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Invoice> {
         status: row.get(24)?,
         settled_at: row.get(25)?,
         content_hash: row.get(26)?,
+        due_at: row.get(27)?,
+        issuer: serde_json::from_str(&row.get::<_, String>(28)?).unwrap_or(serde_json::Value::Null),
+        idr_per_usdt: row.get(29)?,
+        usd_per_usdt: row.get(30)?,
+        total_idr: row.get(31)?,
+        total_usdt: row.get(32)?,
+        usdt_address: row.get(33)?,
+        usdt_network: row.get(34)?,
+        rate_source: row.get(35)?,
+        payment_instructions: row.get(36)?,
+        hash_version: row.get(37)?,
     })
 }
 
@@ -795,6 +966,272 @@ mod tests {
             force: false,
             tz: chrono_tz::UTC,
         }
+    }
+
+    /// Billing that actually says where the money goes: a company, a wallet, a
+    /// chain, and a rate.
+    fn paying() -> BillingConfig {
+        BillingConfig {
+            due_days: 3,
+            issuer: crate::config::Issuer {
+                name: "PT Zeiko Relay Indonesia".into(),
+                email: "billing@zeiko.id".into(),
+                address: "Jakarta Selatan".into(),
+                tax_id: "01.234.567.8-901.000".into(),
+                payment_terms: "USDT only".into(),
+            },
+            payment: crate::config::PaymentConfig {
+                usdt_address: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE".into(),
+                usdt_network: "TRC20".into(),
+                idr_per_usdt: 16_250.0,
+                usd_per_usdt: 1.0,
+                rate_source: "Indodax mid, 2026-09-16".into(),
+                rate_updated_at: 1_760_000_000_000,
+                instructions: "Put the invoice number in the memo.".into(),
+            },
+            ..BillingConfig::default()
+        }
+    }
+
+    /// The deadline is three days after the invoice date, and it is *on* the
+    /// invoice rather than recomputed from today's settings.
+    #[test]
+    fn the_payment_deadline_is_frozen_three_days_after_the_invoice_date() {
+        let mut conn = db();
+        let key = key();
+        let billing = paying();
+        spend(&conn, &key.id, "model-a", 4.0);
+
+        let Issued::Invoice(invoice) = issue(&mut conn, request(&key, &billing)).unwrap() else {
+            panic!("expected an invoice");
+        };
+        assert_eq!(
+            invoice.due_at - invoice.issued_at,
+            3 * 86_400_000,
+            "three days, in milliseconds"
+        );
+
+        // Shortening the terms afterwards must not move a deadline somebody is
+        // already holding.
+        let stricter = BillingConfig {
+            due_days: 1,
+            ..paying()
+        };
+        spend(&conn, &key.id, "model-a", 4.0);
+        let Issued::Invoice(next) = issue(&mut conn, request(&key, &stricter)).unwrap() else {
+            panic!("expected a second invoice");
+        };
+        assert_eq!(next.due_at - next.issued_at, 86_400_000);
+        let reread = get(&conn, &invoice.id).unwrap().unwrap();
+        assert_eq!(reread.due_at, invoice.due_at, "the first deadline moved");
+    }
+
+    /// What the customer is told to send, and where. All of it copied onto the
+    /// invoice, because every one of these can change tomorrow.
+    #[test]
+    fn the_wallet_the_chain_and_the_rate_are_copied_onto_the_invoice() {
+        let mut conn = db();
+        let key = key();
+        spend(&conn, &key.id, "model-a", 10.0);
+
+        let Issued::Invoice(invoice) = issue(&mut conn, request(&key, &paying())).unwrap() else {
+            panic!("expected an invoice");
+        };
+        assert_eq!(invoice.usdt_address, "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE");
+        assert_eq!(invoice.usdt_network, "TRC20");
+        assert_eq!(invoice.idr_per_usdt, 16_250.0);
+        assert_eq!(invoice.total_usd, 10.0);
+        assert_eq!(invoice.total_usdt, 10.0);
+        assert_eq!(invoice.total_idr, 162_500.0);
+        assert_eq!(invoice.issuer["name"], "PT Zeiko Relay Indonesia");
+
+        // Rotate the wallet and move the rate. The invoice already issued says
+        // what it always said.
+        let moved = BillingConfig {
+            payment: crate::config::PaymentConfig {
+                usdt_address: "0xdeadbeef".into(),
+                usdt_network: "BEP20".into(),
+                idr_per_usdt: 99_999.0,
+                ..paying().payment
+            },
+            ..paying()
+        };
+        spend(&conn, &key.id, "model-a", 1.0);
+        let _ = issue(&mut conn, request(&key, &moved)).unwrap();
+
+        let reread = get(&conn, &invoice.id).unwrap().unwrap();
+        assert_eq!(reread.usdt_address, "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE");
+        assert_eq!(reread.usdt_network, "TRC20");
+        assert_eq!(reread.idr_per_usdt, 16_250.0);
+        assert_eq!(reread.total_idr, 162_500.0);
+    }
+
+    /// USDT has broken its peg before. An invoice that assumed one dollar per
+    /// USDT would misprice itself exactly on the day it mattered.
+    #[test]
+    fn the_usd_to_usdt_leg_is_applied_rather_than_assumed_to_be_one() {
+        let mut conn = db();
+        let key = key();
+        let billing = BillingConfig {
+            payment: crate::config::PaymentConfig {
+                usd_per_usdt: 0.98,
+                idr_per_usdt: 16_000.0,
+                ..paying().payment
+            },
+            ..paying()
+        };
+        spend(&conn, &key.id, "model-a", 98.0);
+
+        let Issued::Invoice(invoice) = issue(&mut conn, request(&key, &billing)).unwrap() else {
+            panic!("expected an invoice");
+        };
+        assert_eq!(invoice.total_usd, 98.0);
+        assert_eq!(invoice.total_usdt, 100.0, "98 USD at 0.98 is 100 USDT");
+        assert_eq!(invoice.total_idr, 1_600_000.0);
+    }
+
+    /// A rate of zero is a rate nobody has set yet. It must produce an empty
+    /// figure rather than an infinity or a NaN on a bill.
+    #[test]
+    fn an_unset_rate_produces_no_rupiah_figure_rather_than_nonsense() {
+        let mut conn = db();
+        let key = key();
+        let billing = BillingConfig {
+            payment: crate::config::PaymentConfig {
+                idr_per_usdt: 0.0,
+                usd_per_usdt: 0.0,
+                ..crate::config::PaymentConfig::default()
+            },
+            ..BillingConfig::default()
+        };
+        spend(&conn, &key.id, "model-a", 7.0);
+
+        let Issued::Invoice(invoice) = issue(&mut conn, request(&key, &billing)).unwrap() else {
+            panic!("expected an invoice");
+        };
+        assert!(invoice.total_usdt.is_finite() && invoice.total_idr.is_finite());
+        assert_eq!(invoice.total_usdt, 7.0, "a zero peg falls back to one");
+        assert_eq!(invoice.total_idr, 0.0);
+    }
+
+    /// The tax line and the per-model lines are the detail a customer queries,
+    /// and the rupiah total has to be the *taxed* total rather than the
+    /// subtotal — a bill that converts the wrong number is worse than one that
+    /// does not convert at all.
+    #[test]
+    fn the_rupiah_total_is_taken_from_the_taxed_total() {
+        let mut conn = db();
+        let key = key();
+        let billing = BillingConfig {
+            tax_percent: 11.0,
+            ..paying()
+        };
+        spend(&conn, &key.id, "model-a", 100.0);
+
+        let Issued::Invoice(invoice) = issue(&mut conn, request(&key, &billing)).unwrap() else {
+            panic!("expected an invoice");
+        };
+        assert_eq!(invoice.subtotal_usd, 100.0);
+        assert_eq!(invoice.tax_usd, 11.0);
+        assert_eq!(invoice.total_usd, 111.0);
+        assert_eq!(invoice.total_usdt, 111.0);
+        assert_eq!(invoice.total_idr, 111.0 * 16_250.0);
+    }
+
+    /// The payment instruction is part of what the invoice says, so it is
+    /// under the hash: an address swapped around SQLite has to be as visible
+    /// as a total swapped around SQLite.
+    #[test]
+    fn verification_notices_a_wallet_address_edited_around_sqlite() {
+        let mut conn = db();
+        let key = key();
+        spend(&conn, &key.id, "model-a", 5.0);
+        let Issued::Invoice(invoice) = issue(&mut conn, request(&key, &paying())).unwrap() else {
+            panic!("expected an invoice");
+        };
+        assert!(verify(&conn).unwrap().ok);
+
+        // The trigger refuses this, so go round it the way an attacker would.
+        conn.execute_batch("DROP TRIGGER invoices_amounts_are_final")
+            .unwrap();
+        conn.execute(
+            "UPDATE invoices SET usdt_address = ?2 WHERE id = ?1",
+            rusqlite::params![invoice.id, "0xattacker"],
+        )
+        .unwrap();
+
+        let checked = verify(&conn).unwrap();
+        assert!(!checked.ok, "a redirected payment went unnoticed");
+        assert_eq!(checked.broken.as_deref(), Some(invoice.number.as_str()));
+    }
+
+    /// SQLite refuses the edit outright, which is the first line of defence.
+    #[test]
+    fn the_payment_instruction_on_an_issued_invoice_cannot_be_rewritten() {
+        let mut conn = db();
+        let key = key();
+        spend(&conn, &key.id, "model-a", 5.0);
+        let Issued::Invoice(invoice) = issue(&mut conn, request(&key, &paying())).unwrap() else {
+            panic!("expected an invoice");
+        };
+
+        for (column, value) in [
+            ("usdt_address", "0xattacker"),
+            ("usdt_network", "BEP20"),
+            ("due_at", "0"),
+        ] {
+            let sql = format!("UPDATE invoices SET {column} = ?2 WHERE id = ?1");
+            let err = conn
+                .execute(&sql, rusqlite::params![invoice.id, value])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot be restated"), "{column}: {err}");
+        }
+    }
+
+    /// An invoice written before any of this existed still verifies.
+    ///
+    /// This is the whole reason the canonical form is versioned: hashing the
+    /// new fields unconditionally would have reported every old invoice as
+    /// tampered with, and an integrity check that cries wolf is one nobody
+    /// reads.
+    #[test]
+    fn an_invoice_from_before_the_payment_fields_still_verifies() {
+        let mut conn = db();
+        let key = key();
+        spend(&conn, &key.id, "model-a", 3.0);
+        let Issued::Invoice(mut invoice) = issue(&mut conn, request(&key, &paying())).unwrap()
+        else {
+            panic!("expected an invoice");
+        };
+
+        // Rewrite it as an older build would have written it: version 1, no
+        // payment fields, and the hash that form produces.
+        invoice.hash_version = 1;
+        invoice.due_at = 0;
+        invoice.idr_per_usdt = 0.0;
+        invoice.usd_per_usdt = 1.0;
+        invoice.total_idr = 0.0;
+        invoice.total_usdt = 0.0;
+        invoice.usdt_address = String::new();
+        invoice.usdt_network = String::new();
+        invoice.rate_source = String::new();
+        let legacy_hash = invoice.hash();
+
+        conn.execute_batch("DROP TRIGGER invoices_amounts_are_final")
+            .unwrap();
+        conn.execute(
+            "UPDATE invoices SET hash_version = 1, due_at = 0, idr_per_usdt = 0,
+                    usd_per_usdt = 1, total_idr = 0, total_usdt = 0,
+                    usdt_address = '', usdt_network = '', rate_source = '',
+                    content_hash = ?2
+             WHERE id = ?1",
+            rusqlite::params![invoice.id, legacy_hash],
+        )
+        .unwrap();
+
+        let checked = verify(&conn).unwrap();
+        assert!(checked.ok, "{}", checked.message);
     }
 
     #[test]

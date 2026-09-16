@@ -22,7 +22,13 @@ impl Dash {
         let addr = listener.local_addr().unwrap();
         let app = chtting_relay::server::dashboard::router(relay.state.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            // With connect info, the way `main` serves it — the sign-in
+            // throttle counts per calling address and needs one.
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
         });
         Self {
             addr,
@@ -1264,4 +1270,436 @@ async fn the_api_refuses_to_void_an_invoice_that_is_not_the_newest() {
     // Both periods are billable again — nothing was lost on the way.
     let usage = d.get_json("/api/keys/key_test/usage").await;
     assert_eq!(usage["current"]["requests"], 2);
+}
+
+/// The invoice the dashboard hands the frontend has to carry everything the
+/// document shows: who both parties are, both dates, the models used, the
+/// totals, the rate and the wallet. The frontend derives nothing that could
+/// contradict the issued document.
+#[tokio::test]
+async fn an_issued_invoice_carries_the_whole_document() {
+    let dash = Dash::start(|cfg| {
+        cfg.billing.enabled = true;
+        cfg.billing.due_days = 3;
+        cfg.billing.tax_percent = 11.0;
+        cfg.billing.issuer = chtting_relay::config::Issuer {
+            name: "PT Zeiko Relay Indonesia".into(),
+            email: "billing@zeiko.id".into(),
+            address: "Jakarta Selatan".into(),
+            tax_id: "01.234.567.8-901.000".into(),
+            payment_terms: "USDT only, no refunds".into(),
+        };
+        cfg.billing.payment = chtting_relay::config::PaymentConfig {
+            usdt_address: "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE".into(),
+            usdt_network: "TRC20".into(),
+            idr_per_usdt: 16_250.0,
+            usd_per_usdt: 1.0,
+            rate_source: "Indodax mid".into(),
+            rate_updated_at: 1_760_000_000_000,
+            instructions: "Put the invoice number in the transfer memo.".into(),
+        };
+        cfg.keys[0].billing = chtting_relay::config::KeyBilling {
+            company: "CV Pelanggan Sejahtera".into(),
+            name: "Budi".into(),
+            email: "budi@pelanggan.id".into(),
+            address: "Bandung".into(),
+            tax_id: "09.876.543.2-100.000".into(),
+            ..Default::default()
+        };
+        cfg.pricing.enabled = true;
+        cfg.pricing.input_usd_per_m = 1.0;
+        cfg.pricing.output_usd_per_m = 2.0;
+    })
+    .await;
+
+    // Run something worth billing.
+    for _ in 0..3 {
+        let response = dash
+            .relay
+            .post(
+                "/v1/chat/completions",
+                json!({
+                    "model": "manukmiberai/creative-writer",
+                    "messages": [{"role": "user", "content": "write me something long"}],
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 200);
+    }
+    dash.relay.state.store.flush().await;
+
+    let issued = dash
+        .post(
+            "/api/invoices",
+            json!({ "keyId": "key_test", "force": true }),
+        )
+        .await;
+    assert_eq!(issued.status(), 200);
+    let issued: Value = issued.json().await.unwrap();
+    assert_eq!(issued["ok"], true, "{issued}");
+    let id = issued["invoice"]["id"].as_str().unwrap().to_string();
+
+    let payload = dash.get_json(&format!("/api/invoices/{id}")).await;
+    let inv = &payload["invoice"];
+
+    // 1 — both companies, by name.
+    assert_eq!(payload["issuer"]["name"], "PT Zeiko Relay Indonesia");
+    assert_eq!(inv["billTo"]["company"], "CV Pelanggan Sejahtera");
+    assert_eq!(inv["billTo"]["name"], "Budi");
+    assert_eq!(inv["billTo"]["taxId"], "09.876.543.2-100.000");
+
+    // 2 — the invoice date, and the deadline three days after it.
+    let issued_at = inv["issuedAt"].as_i64().unwrap();
+    let due_at = inv["dueAt"].as_i64().unwrap();
+    assert_eq!(due_at - issued_at, 3 * 86_400_000);
+    assert_eq!(payload["overdue"], false);
+
+    // 3 — which models, and what each came to.
+    let lines = inv["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["model"], "manukmiberai/creative-writer");
+    assert_eq!(lines[0]["requests"], 3);
+    assert!(lines[0]["amountUsd"].as_f64().unwrap() > 0.0);
+
+    // 4 — total consumption.
+    assert_eq!(inv["requests"], 3);
+    assert!(inv["inputTokens"].as_i64().unwrap() > 0);
+    assert!(inv["outputTokens"].as_i64().unwrap() > 0);
+
+    // 5 — the rate, applied to the taxed total rather than the subtotal.
+    assert_eq!(inv["idrPerUsdt"], 16_250.0);
+    assert_eq!(inv["rateSource"], "Indodax mid");
+    let total_usd = inv["totalUsd"].as_f64().unwrap();
+    let subtotal = inv["subtotalUsd"].as_f64().unwrap();
+    assert!((total_usd - subtotal * 1.11).abs() < 1e-6, "{inv}");
+    let total_idr = inv["totalIdr"].as_f64().unwrap();
+    assert!(
+        (total_idr - total_usd * 16_250.0).abs() < 0.01,
+        "rupiah total is not the taxed total: {inv}"
+    );
+
+    // 6 — where the money goes, and over which chain.
+    assert_eq!(inv["usdtAddress"], "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE");
+    assert_eq!(inv["usdtNetwork"], "TRC20");
+    assert_eq!(
+        inv["paymentInstructions"],
+        "Put the invoice number in the transfer memo."
+    );
+
+    // And it still verifies, under the form it was written with.
+    let checked = dash.get_json("/api/invoices/verify").await;
+    assert_eq!(checked["ok"], true, "{checked}");
+    assert_eq!(inv["hashVersion"], 2);
+}
+
+/// Rotating the wallet must not redirect an invoice that has already gone out.
+#[tokio::test]
+async fn rotating_the_wallet_does_not_redirect_an_invoice_already_issued() {
+    let dash = Dash::start(|cfg| {
+        cfg.billing.enabled = true;
+        cfg.billing.payment.usdt_address = "TOriginalAddress".into();
+        cfg.billing.payment.usdt_network = "TRC20".into();
+        cfg.billing.payment.idr_per_usdt = 16_000.0;
+        cfg.pricing.enabled = true;
+        cfg.pricing.input_usd_per_m = 1.0;
+        cfg.pricing.output_usd_per_m = 2.0;
+    })
+    .await;
+
+    dash.relay
+        .post(
+            "/v1/chat/completions",
+            json!({
+                "model": "manukmiberai/creative-writer",
+                "messages": [{"role": "user", "content": "hello"}],
+            }),
+        )
+        .await;
+    dash.relay.state.store.flush().await;
+
+    let issued: Value = dash
+        .post(
+            "/api/invoices",
+            json!({ "keyId": "key_test", "force": true }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = issued["invoice"]["id"].as_str().unwrap().to_string();
+
+    // The operator moves the wallet and the rate.
+    let saved = dash
+        .put(
+            "/api/config",
+            json!({ "billing": { "payment": {
+                "usdtAddress": "0xSomewhereElse",
+                "usdtNetwork": "BEP20",
+                "idrPerUsdt": 99_000.0,
+            } } }),
+        )
+        .await;
+    assert_eq!(saved.status(), 200);
+
+    let payload = dash.get_json(&format!("/api/invoices/{id}")).await;
+    assert_eq!(payload["invoice"]["usdtAddress"], "TOriginalAddress");
+    assert_eq!(payload["invoice"]["usdtNetwork"], "TRC20");
+    assert_eq!(payload["invoice"]["idrPerUsdt"], 16_000.0);
+    assert_eq!(dash.get_json("/api/invoices/verify").await["ok"], true);
+}
+
+/* ------------------------------------------- reaching it from elsewhere -- */
+
+/// The name the dashboard is published at is allowed through the guard, and
+/// every other name is still refused. The guard is widened by one name, not
+/// turned off — a name that resolves to 127.0.0.1 today can resolve elsewhere
+/// tomorrow, which is what the guard is for.
+#[tokio::test]
+async fn a_published_hostname_is_answered_and_nothing_else_is() {
+    let d = Dash::start(|cfg| {
+        cfg.security.dashboard_allowed_hosts = vec!["panel.example.com".into()];
+    })
+    .await;
+
+    for host in [
+        "panel.example.com",
+        "PANEL.EXAMPLE.COM",
+        "panel.example.com:443",
+    ] {
+        let allowed = d
+            .client
+            .get(d.url("/api/state"))
+            .header("host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200, "{host} was refused");
+    }
+
+    for host in [
+        "panel.example.com.attacker.example",
+        "attacker.example",
+        "evil.panel.example.com",
+    ] {
+        let refused = d
+            .client
+            .get(d.url("/api/state"))
+            .header("host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 403, "{host} was answered");
+    }
+}
+
+/// A cross-origin request from the published name's neighbourhood is still a
+/// cross-origin request. Reaching the dashboard remotely must not make it
+/// drivable by any page the browser happens to load.
+#[tokio::test]
+async fn a_cross_origin_post_is_still_refused_at_the_published_hostname() {
+    let d = Dash::start(|cfg| {
+        cfg.security.dashboard_allowed_hosts = vec!["panel.example.com".into()];
+    })
+    .await;
+
+    let refused = d
+        .client
+        .post(d.url("/api/keys/generate"))
+        .header("host", "panel.example.com")
+        .header("origin", "https://attacker.example")
+        .json(&json!({ "label": "stolen" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+
+    // And the page's own origin is fine.
+    let allowed = d
+        .client
+        .post(d.url("/api/keys/generate"))
+        .header("host", "panel.example.com")
+        .header("origin", "https://panel.example.com")
+        .json(&json!({ "label": "mine" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 200);
+}
+
+/// The session cookie has to be marked `Secure` when it was issued over the
+/// tunnel, and must not be when it was issued over plain loopback http — a
+/// `Secure` cookie on `http://127.0.0.1` is a cookie some browsers refuse to
+/// store, which would make local sign-in silently impossible.
+#[tokio::test]
+async fn the_session_cookie_is_secure_exactly_when_it_travelled_over_the_tunnel() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "correct-horse-battery-staple".into();
+        cfg.security.dashboard_allowed_hosts = vec!["panel.example.com".into()];
+    })
+    .await;
+
+    let remote = d
+        .client
+        .post(d.url("/api/login"))
+        .header("host", "panel.example.com")
+        .json(&json!({ "password": "correct-horse-battery-staple" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remote.status(), 200);
+    let cookie = remote
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cookie.contains("Secure"), "{cookie}");
+    assert!(cookie.contains("HttpOnly"), "{cookie}");
+    assert!(cookie.contains("SameSite=Strict"), "{cookie}");
+
+    let local = reqwest::Client::new()
+        .post(d.url("/api/login"))
+        .json(&json!({ "password": "correct-horse-battery-staple" }))
+        .send()
+        .await
+        .unwrap();
+    let cookie = local
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!cookie.contains("Secure"), "{cookie}");
+}
+
+/// A dashboard with no password that is somehow reachable from outside refuses
+/// to hand out a session. The tunnel will not start in that state, so getting
+/// here means something else is forwarding the port — and a password-less
+/// control panel on a public name is not something to answer.
+#[tokio::test]
+async fn a_password_less_dashboard_refuses_to_sign_anybody_in_remotely() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = String::new();
+        cfg.security.dashboard_allowed_hosts = vec!["panel.example.com".into()];
+    })
+    .await;
+
+    let remote = d
+        .client
+        .post(d.url("/api/login"))
+        .header("host", "panel.example.com")
+        .json(&json!({ "password": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remote.status(), 403);
+
+    // Locally it still works, which is the existing behaviour and the reason
+    // this check is about the hostname rather than about the password alone.
+    let local = reqwest::Client::new()
+        .post(d.url("/api/login"))
+        .json(&json!({ "password": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(local.status(), 200);
+}
+
+/// Every response carries the headers that keep the panel out of somebody
+/// else's page and out of every cache between here and the browser.
+#[tokio::test]
+async fn every_response_carries_the_hardening_headers() {
+    let d = Dash::start(|_| {}).await;
+
+    for path in ["/", "/api/state", "/js/app.js"] {
+        let response = d.get(path).await;
+        let headers = response.headers().clone();
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(csp.contains("frame-ancestors 'none'"), "{path}: {csp}");
+        assert!(csp.contains("connect-src 'self'"), "{path}: {csp}");
+        assert!(csp.contains("form-action 'none'"), "{path}: {csp}");
+        // Scripts get no inline grant; styles do, because the frontend sets
+        // style attributes from JavaScript.
+        assert!(csp.contains("script-src 'self';"), "{path}: {csp}");
+        assert!(
+            !csp.contains("script-src 'self' 'unsafe-inline'"),
+            "{path}: {csp}"
+        );
+
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert!(headers
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("no-store"));
+    }
+}
+
+/// The two tunnels are reported and driven separately, and the dashboard one
+/// says why it will not start before anybody presses the button.
+#[tokio::test]
+async fn the_dashboard_tunnel_has_its_own_controls_and_says_why_it_is_blocked() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.port = 8788;
+        cfg.dashboard.tunnel.mode = "quick".into();
+    })
+    .await;
+
+    let status = d.get_json("/api/dashboard-tunnel").await;
+    assert_eq!(status["scope"], "dashboard");
+    assert_eq!(status["publishes"], 8788);
+    assert_eq!(status["minPasswordLength"], 16);
+    assert!(
+        status["blocked"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refusing to publish"),
+        "{status}"
+    );
+
+    // Pressing Start says the same thing rather than publishing anything.
+    let refused = d.post("/api/dashboard-tunnel/start", json!({})).await;
+    assert_eq!(refused.status(), 400);
+    let body: Value = refused.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to publish"),
+        "{body}"
+    );
+
+    // And the relay's own tunnel is untouched by any of it.
+    let relay = d.get_json("/api/tunnel").await;
+    assert_eq!(relay["scope"], "relay");
+}
+
+/// The tunnel routes need a session like everything else — otherwise the one
+/// endpoint that publishes the dashboard to the internet would be the one
+/// endpoint that did not need signing in for.
+#[tokio::test]
+async fn the_tunnel_routes_are_behind_the_password_too() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "correct-horse-battery-staple".into();
+    })
+    .await;
+
+    for path in ["/api/tunnel", "/api/dashboard-tunnel"] {
+        assert_eq!(d.get(path).await.status(), 401, "{path}");
+    }
+    assert_eq!(
+        d.post("/api/dashboard-tunnel/start", json!({}))
+            .await
+            .status(),
+        401
+    );
 }

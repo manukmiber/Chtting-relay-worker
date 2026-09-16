@@ -18,7 +18,13 @@ use std::sync::Arc;
 
 use crate::util::{deep_merge, mask_secret, new_id, write_atomic};
 
-const SECRET_KEYS: [&str; 4] = ["apiKey", "key", "password", "token"];
+/// Field names whose value is a secret, wherever they appear in the config.
+///
+/// `secretKey` is here because Langfuse's is one: a config page that echoed it
+/// back in the clear would put a credential on screen, and — worse — into the
+/// body of every dashboard `GET /api/config`, which is the response most
+/// likely to end up in a screenshot.
+const SECRET_KEYS: [&str; 5] = ["apiKey", "key", "password", "token", "secretKey"];
 
 /* ------------------------------------------------------------- helpers -- */
 
@@ -56,6 +62,7 @@ pub struct Config {
     pub tunnel: TunnelConfig,
     pub openrouter: OpenRouterConfig,
     pub billing: BillingConfig,
+    pub langfuse: LangfuseConfig,
 
     /// `timezone`, already parsed, worked out once when the config is
     /// published.
@@ -99,6 +106,7 @@ impl Default for Config {
             tunnel: TunnelConfig::default(),
             openrouter: OpenRouterConfig::default(),
             billing: BillingConfig::default(),
+            langfuse: LangfuseConfig::default(),
             parsed_tz: None,
         }
     }
@@ -177,11 +185,24 @@ impl Default for ServerConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct DashboardConfig {
     pub enabled: bool,
-    /// Keep this on loopback: the dashboard is never routed through the tunnel.
+    /// Keep this on loopback.
+    ///
+    /// Reaching the dashboard from another device does **not** mean binding it
+    /// to `0.0.0.0` — that publishes it to every device on the Wi-Fi with no
+    /// transport security and no way to take it back. It means `tunnel` below,
+    /// which reaches loopback from the outside over TLS, through one process
+    /// this relay supervises and can stop.
     pub host: String,
     pub port: u16,
     pub password: String,
     pub session_ttl_ms: i64,
+    /// A cloudflared of its own, publishing the dashboard port.
+    ///
+    /// Off by default, and it refuses to start without a password of at least
+    /// [`MIN_REMOTE_PASSWORD`] characters — see [`crate::tunnel`]. The relay's
+    /// own tunnel is configured separately under `tunnel`, and the two never
+    /// share a process, a URL or a hostname.
+    pub tunnel: TunnelConfig,
 }
 
 impl Default for DashboardConfig {
@@ -192,9 +213,22 @@ impl Default for DashboardConfig {
             port: 8788,
             password: String::new(),
             session_ttl_ms: 7 * 24 * 60 * 60 * 1000,
+            tunnel: TunnelConfig::off(),
         }
     }
 }
+
+/// The shortest password the dashboard will accept before it agrees to be
+/// reachable from outside this device.
+///
+/// On loopback a weak password is a speed bump in front of a surface that is
+/// already only reachable by something running on the same machine. Behind a
+/// tunnel it is the entire boundary: the URL is guessable in principle, gets
+/// logged by everything it passes through, and the surface behind it writes
+/// the config, reads every prompt and reveals every client key in the clear.
+/// Sixteen characters is not a policy anybody enjoys; it is the point at which
+/// an online guessing run stops being the cheapest way in.
+pub const MIN_REMOTE_PASSWORD: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -223,6 +257,19 @@ pub struct SecurityConfig {
     /// every app on the phone can reach `127.0.0.1:8788`, and so can a page
     /// the browser is pointed at. Leave this on.
     pub dashboard_origin_guard: bool,
+    /// Hostnames the dashboard answers to besides this machine's own.
+    ///
+    /// The guard above exists because a name that resolves to 127.0.0.1 today
+    /// can resolve elsewhere tomorrow — that is how DNS rebinding turns a page
+    /// into a client of a loopback service. Publishing the dashboard through a
+    /// tunnel means one more name is legitimately its own, so that name is
+    /// named here rather than the check being turned off.
+    ///
+    /// The live tunnel's own hostname is accepted automatically while it is
+    /// running; this is for a named tunnel whose hostname the relay cannot
+    /// read off cloudflared's output, or for a proxy in front of one. Entries
+    /// are compared host-only and case-insensitively; a port is ignored.
+    pub dashboard_allowed_hosts: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -234,6 +281,7 @@ impl Default for SecurityConfig {
             blocked_ips: Vec::new(),
             private_user_id: PRIVATE_ID_FINGERPRINT.into(),
             dashboard_origin_guard: true,
+            dashboard_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -267,8 +315,16 @@ pub struct BillingConfig {
     pub cycle_day: u32,
     /// Run that cycle. Only keys with `billing.autoInvoice` are billed by it.
     pub auto_issue: bool,
+    /// How long the customer has to pay, counted from the invoice date.
+    ///
+    /// Three days by default. Frozen onto each invoice when it is issued, so
+    /// changing the terms never moves a deadline somebody has already been
+    /// given.
+    pub due_days: u32,
     /// Who the invoice is from.
     pub issuer: Issuer,
+    /// Where the money goes, and at what rate.
+    pub payment: PaymentConfig,
 }
 
 impl Default for BillingConfig {
@@ -281,7 +337,168 @@ impl Default for BillingConfig {
             minimum_usd: 0.0,
             cycle_day: 1,
             auto_issue: false,
+            due_days: 3,
             issuer: Issuer::default(),
+            payment: PaymentConfig::default(),
+        }
+    }
+}
+
+/// Where per-request traces go, and how much of a request travels with them.
+///
+/// Off until both keys are set, and then still only for the fraction of
+/// requests `sampleRate` names. See [`crate::langfuse`] for what a span
+/// carries and what it deliberately never does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LangfuseConfig {
+    pub enabled: bool,
+    /// The project's own origin: `https://cloud.langfuse.com`,
+    /// `https://us.cloud.langfuse.com`, or wherever it is self-hosted.
+    pub host: String,
+    /// `pk-lf-…`. Not a secret, and not masked.
+    pub public_key: String,
+    /// `sk-lf-…`. Masked everywhere the config is read back.
+    pub secret_key: String,
+    /// What fraction of *successful* requests leave a trace, 0.0 to 1.0.
+    /// Failures ignore this — see `captureErrors`.
+    pub sample_rate: f64,
+    /// Trace failures at all. On: a 502 is the thing a trace viewer is opened
+    /// to explain, so it is never sampled away, only switched off.
+    pub capture_errors: bool,
+    /// The caller's own request body.
+    pub capture_input: bool,
+    /// What the relay sent back.
+    pub capture_output: bool,
+    /// The system prompt the relay injected, and the body as the backend
+    /// received it. This is the relay's own work rather than the caller's, so
+    /// publishing it to a third party is a separate decision from publishing
+    /// theirs.
+    pub capture_system_prompt: bool,
+    /// The model's reasoning trace, when the route did not strip it. Off by
+    /// default: it is several times the size of the answer and says little
+    /// that the answer does not.
+    pub capture_reasoning: bool,
+    /// The caller's IP address. Off by default — it is personal data, and a
+    /// trace is a third party.
+    pub capture_client_ip: bool,
+    /// Ceiling on every piece of text a span carries. A conversation is
+    /// unbounded; a span is not.
+    pub max_field_chars: usize,
+    /// How many spans go in one POST.
+    pub batch_size: usize,
+    /// How long a partial batch waits for company before it is posted anyway.
+    pub flush_interval_ms: u64,
+    /// Spans that may be waiting to go out. Past this the relay drops them —
+    /// telemetry never slows a request down.
+    pub queue_capacity: usize,
+    pub timeout_ms: u64,
+    /// `production`, `staging`, … Shown as the trace's environment.
+    pub environment: String,
+    /// A version string for the traces, so a regression can be pinned to a
+    /// deploy. Defaults to this binary's own version when left blank.
+    pub release: String,
+    pub tags: Vec<String>,
+}
+
+impl Default for LangfuseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "https://cloud.langfuse.com".into(),
+            public_key: String::new(),
+            secret_key: String::new(),
+            sample_rate: 1.0,
+            capture_errors: true,
+            capture_input: true,
+            capture_output: true,
+            capture_system_prompt: true,
+            capture_reasoning: false,
+            capture_client_ip: false,
+            max_field_chars: 20_000,
+            batch_size: 24,
+            flush_interval_ms: 5_000,
+            queue_capacity: 2_048,
+            timeout_ms: 10_000,
+            environment: "production".into(),
+            release: String::new(),
+            tags: Vec::new(),
+        }
+    }
+}
+
+impl LangfuseConfig {
+    /// Enabled *and* actually able to authenticate. Half a key pair is not a
+    /// key pair, and a relay that tried anyway would post every span into a
+    /// 401 and log a warning per batch for ever.
+    pub fn ready(&self) -> bool {
+        self.enabled
+            && !self.public_key.trim().is_empty()
+            && !self.secret_key.trim().is_empty()
+            && !self.host.trim().is_empty()
+    }
+
+    /// The OTLP trace endpoint under the configured host.
+    ///
+    /// Not the `/api/public/ingestion` one: Langfuse's own API document marks
+    /// that deprecated, and on Langfuse Cloud it stops accepting traces and
+    /// observations when v4-only write mode begins on 2026-11-16.
+    pub fn traces_url(&self) -> String {
+        format!(
+            "{}/api/public/otel/v1/traces",
+            self.host.trim().trim_end_matches('/')
+        )
+    }
+}
+
+/// How an invoice is paid: the wallet, the chain, and the rate that turned a
+/// figure the relay computed in USD into the number the customer transfers.
+///
+/// Every field here is **copied onto the invoice** when it is issued, never
+/// read live. A customer told to send 1 480 000 IDR of USDT to one address must
+/// still see that address and that figure after the operator has rotated the
+/// wallet or the rupiah has moved — an invoice is a statement about a moment,
+/// and these are the parts of it most likely to change underneath one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PaymentConfig {
+    /// The wallet the customer sends USDT to.
+    pub usdt_address: String,
+    /// Which chain that address is on — `TRC20`, `BEP20`, `ERC20`, `SOL`.
+    ///
+    /// Not decoration. USDT exists on several chains, the address formats
+    /// overlap, and sending to the right address over the wrong network
+    /// destroys the money with no way back. It is printed beside the address
+    /// for that reason and for no other.
+    pub usdt_network: String,
+    /// What one USDT is worth in rupiah. The rate the customer is quoted.
+    pub idr_per_usdt: f64,
+    /// What one USDT is worth in US dollars.
+    ///
+    /// Practically one, and deliberately not assumed to be: USDT has broken
+    /// its peg before, and the relay's own arithmetic is in USD. An invoice
+    /// that hard-coded 1.0 would quietly misprice itself on the day it mattered.
+    pub usd_per_usdt: f64,
+    /// Where the rate came from — an exchange, a bank, "set by hand". Printed
+    /// under it so the customer can see it was not invented.
+    pub rate_source: String,
+    /// When the rate was last set, so a stale one is visible as stale.
+    pub rate_updated_at: i64,
+    /// Shown under the payment box: what to put in the transfer memo, how to
+    /// send proof, who to ask. Free text.
+    pub instructions: String,
+}
+
+impl Default for PaymentConfig {
+    fn default() -> Self {
+        Self {
+            usdt_address: String::new(),
+            usdt_network: "TRC20".into(),
+            idr_per_usdt: 0.0,
+            usd_per_usdt: 1.0,
+            rate_source: String::new(),
+            rate_updated_at: 0,
+            instructions: String::new(),
         }
     }
 }
@@ -820,6 +1037,10 @@ impl ClientKey {
 pub struct KeyBilling {
     /// Who the invoice is addressed to. Blank falls back to the key's label.
     pub name: String,
+    /// The customer's registered company, when the contact and the company are
+    /// not the same name. Printed above `name` on the invoice; blank means the
+    /// two are one and only `name` is shown.
+    pub company: String,
     pub email: String,
     pub address: String,
     /// Tax number, VAT id, NPWP — whatever the jurisdiction calls it.
@@ -1130,6 +1351,22 @@ pub struct TunnelConfig {
     pub hostname: String,
     pub config_file: String,
     pub extra_args: Vec<String>,
+}
+
+impl TunnelConfig {
+    /// A tunnel that is switched off and does not start itself.
+    ///
+    /// The relay's own tunnel defaults to on, because a relay whose tunnel has
+    /// to be started by hand is down after every reboot. The dashboard's is the
+    /// opposite case entirely: publishing the control panel is a decision, and
+    /// a default that made it for you would be the wrong one every time.
+    pub fn off() -> Self {
+        Self {
+            mode: "off".into(),
+            auto_start: false,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for TunnelConfig {
@@ -1812,6 +2049,7 @@ pub fn normalize(mut cfg: Config) -> Config {
         .to_string();
 
     normalize_billing(&mut cfg.billing);
+    normalize_langfuse(&mut cfg.langfuse);
 
     for p in &mut cfg.system_prompts {
         if p.id.is_empty() {
@@ -1880,6 +2118,34 @@ fn resolve_tokenizers(cfg: &mut Config) {
     }
 }
 
+/// Clamp the exporter's knobs to values it can actually run with.
+///
+/// A sample rate of NaN, a batch size of zero or a queue of four billion are
+/// all things a config file can say and none of them is a thing the exporter
+/// can do. They are corrected here rather than defended against on the hot
+/// path, so the request side reads the numbers and trusts them.
+fn normalize_langfuse(lf: &mut LangfuseConfig) {
+    lf.host = lf.host.trim().trim_end_matches('/').to_string();
+    if lf.host.is_empty() {
+        lf.host = "https://cloud.langfuse.com".into();
+    }
+    lf.public_key = lf.public_key.trim().to_string();
+    lf.secret_key = lf.secret_key.trim().to_string();
+    lf.environment = lf.environment.trim().to_string();
+    lf.release = lf.release.trim().to_string();
+    lf.tags.retain(|t| !t.trim().is_empty());
+    lf.sample_rate = if lf.sample_rate.is_finite() {
+        lf.sample_rate.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    lf.max_field_chars = lf.max_field_chars.clamp(64, 1_000_000);
+    lf.batch_size = lf.batch_size.clamp(1, 512);
+    lf.flush_interval_ms = lf.flush_interval_ms.clamp(250, 300_000);
+    lf.queue_capacity = lf.queue_capacity.clamp(16, 100_000);
+    lf.timeout_ms = lf.timeout_ms.clamp(500, 120_000);
+}
+
 fn normalize_billing(billing: &mut BillingConfig) {
     if billing.currency.trim().is_empty() {
         billing.currency = "USD".into();
@@ -1897,6 +2163,23 @@ fn normalize_billing(billing: &mut BillingConfig) {
     // The 29th, 30th and 31st are not offered: February would skip them and a
     // customer would be billed eleven times a year without anyone noticing.
     billing.cycle_day = billing.cycle_day.clamp(1, 28);
+    // A year is already absurd for a payment term; anything past it is a typo
+    // rather than a decision.
+    billing.due_days = billing.due_days.min(365);
+
+    let pay = &mut billing.payment;
+    pay.usdt_address = pay.usdt_address.trim().to_string();
+    pay.usdt_network = pay.usdt_network.trim().to_uppercase();
+    pay.rate_source = pay.rate_source.trim().to_string();
+    if !pay.idr_per_usdt.is_finite() || pay.idr_per_usdt < 0.0 {
+        pay.idr_per_usdt = 0.0;
+    }
+    // A zero or negative USD-per-USDT would divide the total by nothing and
+    // put an infinity on an invoice. One is the only safe fallback, and it is
+    // also the true answer almost every day.
+    if !pay.usd_per_usdt.is_finite() || pay.usd_per_usdt <= 0.0 {
+        pay.usd_per_usdt = 1.0;
+    }
 }
 
 /// A readable name for a prompt rule that was saved without one.

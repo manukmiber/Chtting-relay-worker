@@ -7,8 +7,23 @@
 //! * `named` — a token-backed named tunnel bound to your own hostname
 //! * a `config.yml` you manage yourself
 //!
-//! Only the relay port is ever published. The dashboard binds to loopback and
-//! is deliberately not routed through the tunnel.
+//! One manager supervises one cloudflared, publishing one port. There are two
+//! of them: [`Scope::Relay`] publishes the relay port, and [`Scope::Dashboard`]
+//! publishes the dashboard port so the control panel can be reached from
+//! another device.
+//!
+//! They are separate processes with separate configuration and separate URLs,
+//! and neither can publish the other's port — `build_args` reads the port off
+//! its own scope, so there is no configuration in which one tunnel exposes
+//! both. That matters: the relay's URL is meant to be handed out, and the
+//! dashboard's is a way into the config, the prompts and the client keys.
+//!
+//! The dashboard tunnel is off by default and [`TunnelManager::start`] refuses
+//! to start it without a dashboard password of at least
+//! [`MIN_REMOTE_PASSWORD`](crate::config::MIN_REMOTE_PASSWORD) characters. On
+//! loopback a weak password guards a surface only this device can reach; behind
+//! a tunnel it is the only thing between the internet and a `GET` that returns
+//! every client key in the clear.
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
@@ -23,6 +38,24 @@ use crate::config::ConfigStore;
 use crate::logging::Logger;
 
 const MAX_LOG_LINES: usize = 500;
+
+/// Which port a manager publishes, and therefore which config it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The relay itself. Meant to be public; this is the URL you hand out.
+    Relay,
+    /// The dashboard. Meant for you, from your other device, and nobody else.
+    Dashboard,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Relay => "relay",
+            Scope::Dashboard => "dashboard",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -74,6 +107,7 @@ struct Running {
 }
 
 pub struct TunnelManager {
+    scope: Scope,
     config: Arc<ConfigStore>,
     logger: Arc<Logger>,
     inner: Mutex<Inner>,
@@ -85,8 +119,19 @@ pub struct TunnelManager {
 }
 
 impl TunnelManager {
+    /// The relay's own tunnel.
     pub fn new(config: Arc<ConfigStore>, logger: Arc<Logger>) -> Self {
+        Self::scoped(Scope::Relay, config, logger)
+    }
+
+    /// The dashboard's, which publishes the control panel instead.
+    pub fn for_dashboard(config: Arc<ConfigStore>, logger: Arc<Logger>) -> Self {
+        Self::scoped(Scope::Dashboard, config, logger)
+    }
+
+    pub fn scoped(scope: Scope, config: Arc<ConfigStore>, logger: Arc<Logger>) -> Self {
         Self {
+            scope,
             config,
             logger,
             inner: Mutex::new(Inner::default()),
@@ -95,21 +140,102 @@ impl TunnelManager {
         }
     }
 
-    pub fn status(&self) -> serde_json::Value {
-        let inner = self.inner.lock();
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// This manager's own slice of the config.
+    fn settings(&self) -> crate::config::TunnelConfig {
         let cfg = self.config.current();
+        match self.scope {
+            Scope::Relay => cfg.tunnel.clone(),
+            Scope::Dashboard => cfg.dashboard.tunnel.clone(),
+        }
+    }
+
+    /// The one port this manager may publish. Read from the scope rather than
+    /// passed in, so there is no call site that could publish the other one.
+    fn target_port(&self) -> u16 {
+        let cfg = self.config.current();
+        match self.scope {
+            Scope::Relay => cfg.server.port,
+            Scope::Dashboard => cfg.dashboard.port,
+        }
+    }
+
+    /// The hostname this tunnel is reachable at right now, if it is up.
+    ///
+    /// A quick tunnel's name is scraped out of cloudflared's output; a named
+    /// one's is whatever the operator configured, because cloudflared does not
+    /// print it. Used by the dashboard's origin guard to recognise its own
+    /// public name without the guard having to be switched off.
+    pub fn public_host(&self) -> Option<String> {
+        let from_url = {
+            let inner = self.inner.lock();
+            inner
+                .url
+                .split_once("//")
+                .map(|(_, rest)| rest.trim_end_matches('/').to_string())
+                .filter(|h| !h.is_empty())
+        };
+        from_url.or_else(|| {
+            let configured = self.settings().hostname.trim().to_string();
+            (!configured.is_empty()).then_some(configured)
+        })
+    }
+
+    /// Why this tunnel may not be started, if it may not be.
+    ///
+    /// Only the dashboard has an answer here, and it is the password. The
+    /// check lives at `start` rather than in the config validator on purpose:
+    /// a config that *describes* a dashboard tunnel is fine to save, and the
+    /// moment that matters is the moment a process would actually begin
+    /// accepting traffic from the internet.
+    fn refuse_to_publish(&self) -> Option<String> {
+        if self.scope != Scope::Dashboard {
+            return None;
+        }
+        let password = self.config.current().dashboard.password.clone();
+        let len = password.chars().count();
+        if len >= crate::config::MIN_REMOTE_PASSWORD {
+            return None;
+        }
+        Some(format!(
+            "refusing to publish the dashboard: it needs a password of at least {} characters \
+             first (this one is {}). Behind a tunnel that password is the only thing between \
+             the internet and a control panel that writes the config, reads every stored prompt \
+             and reveals every client key. Set one under Settings → Server.",
+            crate::config::MIN_REMOTE_PASSWORD,
+            if len == 0 {
+                "not set".to_string()
+            } else {
+                len.to_string()
+            },
+        ))
+    }
+
+    pub fn status(&self) -> serde_json::Value {
+        let settings = self.settings();
+        let port = self.target_port();
+        let blocked = self.refuse_to_publish();
+        let inner = self.inner.lock();
         let state = inner.state_label.unwrap_or(State::Stopped);
         serde_json::json!({
+            "scope": self.scope.as_str(),
+            "publishes": port,
+            // Why Start would refuse right now, so the dashboard can say so
+            // before somebody presses it rather than after.
+            "blocked": blocked,
             "state": state.label(),
             "url": inner.url,
-            "mode": cfg.tunnel.mode,
+            "mode": settings.mode,
             "pid": inner.pid,
             "startedAt": inner.started_at,
             "uptime_s": if inner.started_at > 0 {
                 (crate::util::now_ms() - inner.started_at) / 1000
             } else { 0 },
             "restarts": inner.restarts,
-            "autoStart": cfg.tunnel.auto_start,
+            "autoStart": settings.auto_start,
             "lastError": inner.last_error,
             "logs": inner.lines.iter().rev().take(200).rev().collect::<Vec<_>>(),
         })
@@ -139,18 +265,18 @@ impl TunnelManager {
     }
 
     fn binary(&self) -> String {
-        let cfg = self.config.current();
-        if cfg.tunnel.binary.is_empty() {
+        let binary = self.settings().binary;
+        if binary.trim().is_empty() {
             "cloudflared".into()
         } else {
-            cfg.tunnel.binary.clone()
+            binary
         }
     }
 
-    /// Only `server.port` is ever published.
+    /// Only this manager's own port is ever published.
     pub fn build_args(&self) -> Vec<String> {
-        let cfg = self.config.current();
-        let t = &cfg.tunnel;
+        let t = self.settings();
+        let t = &t;
         let mut args = vec!["--no-autoupdate".to_string()];
 
         if t.mode == "named" && !t.token.is_empty() {
@@ -177,7 +303,7 @@ impl TunnelManager {
         args.extend([
             "tunnel".into(),
             "--url".into(),
-            format!("http://127.0.0.1:{}", cfg.server.port),
+            format!("http://127.0.0.1:{}", self.target_port()),
             // trycloudflare needs no credentials but does need a protocol it
             // can use on mobile networks; http2 survives carrier NAT better
             // than quic does.
@@ -198,11 +324,16 @@ impl TunnelManager {
             return Ok(self.status());
         }
 
-        let cfg = self.config.current();
-        if cfg.tunnel.mode == "off" {
+        let settings = self.settings();
+        if settings.mode == "off" {
             return Err(anyhow!(
                 "tunnel mode is \"off\"; set it to quick or named first"
             ));
+        }
+        // Checked here and nowhere earlier: this is the last moment before a
+        // process starts accepting traffic from the internet on this port.
+        if let Some(why) = self.refuse_to_publish() {
+            return Err(anyhow!(why));
         }
 
         let check = self.version().await;
@@ -223,7 +354,8 @@ impl TunnelManager {
         }
         self.stopping.store(false, Ordering::SeqCst);
         self.log(&format!(
-            "starting: {} {}",
+            "starting {} tunnel: {} {}",
+            self.scope.as_str(),
             self.binary(),
             args.iter()
                 .map(|a| redact_arg(a))
@@ -327,7 +459,7 @@ impl TunnelManager {
             }
             manager.log(&format!("cloudflared exited ({code})"));
 
-            if !manager.config.current().tunnel.auto_start {
+            if !manager.settings().auto_start {
                 return;
             }
             // Mobile links drop; back off so a hard failure does not spin.
@@ -347,7 +479,10 @@ impl TunnelManager {
                 return;
             }
             if let Err(err) = manager.start().await {
-                manager.logger.warn(format!("tunnel restart failed: {err}"));
+                manager.logger.warn(format!(
+                    "{} tunnel restart failed: {err}",
+                    manager.scope.as_str()
+                ));
             }
         });
     }
@@ -407,7 +542,10 @@ impl TunnelManager {
                 // of failures left it.
                 inner.consecutive_failures = 0;
                 drop(inner);
-                self.logger.info(format!("cloudflared tunnel URL: {url}"));
+                self.logger.info(format!(
+                    "cloudflared {} tunnel URL: {url}",
+                    self.scope.as_str()
+                ));
                 return;
             }
         }
@@ -434,8 +572,15 @@ impl TunnelManager {
         tokio::spawn(async move {
             let mut wait = Duration::from_secs(5);
             loop {
-                let cfg = manager.config.current();
-                if !cfg.tunnel.auto_start || cfg.tunnel.mode == "off" {
+                let settings = manager.settings();
+                if !settings.auto_start || settings.mode == "off" {
+                    return;
+                }
+                // A dashboard tunnel with no password set never comes up on its
+                // own and never will until somebody sets one, so say it once
+                // and stop rather than retrying every two minutes for ever.
+                if let Some(why) = manager.refuse_to_publish() {
+                    manager.logger.warn(why);
                     return;
                 }
                 if manager.running.lock().await.is_some() {
@@ -444,9 +589,10 @@ impl TunnelManager {
                 match manager.start().await {
                     Ok(_) => return,
                     Err(err) => {
-                        manager
-                            .logger
-                            .warn(format!("tunnel not up yet ({err}); retrying in {wait:?}"));
+                        manager.logger.warn(format!(
+                            "{} tunnel not up yet ({err}); retrying in {wait:?}",
+                            manager.scope.as_str()
+                        ));
                         tokio::time::sleep(wait).await;
                         // A phone that has just booted may have no network for
                         // a while; back off, but never stop trying.
@@ -518,6 +664,196 @@ mod tests {
             mode: "quick".into(),
             ..Default::default()
         }
+    }
+
+    /// Build a manager for either scope over a whole config, so the dashboard
+    /// tunnel's own settings and password can be set.
+    async fn manager_for(scope: Scope, build: impl FnOnce(&mut Config)) -> Arc<TunnelManager> {
+        let dir = std::env::temp_dir().join(format!("chtting-tunnel-{}", crate::util::new_id("t")));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let file = dir.join("config.json");
+        let mut cfg = Config::default();
+        build(&mut cfg);
+        tokio::fs::write(&file, serde_json::to_string(&cfg).unwrap())
+            .await
+            .unwrap();
+        let store = Arc::new(ConfigStore::load(&file).await.unwrap());
+        Arc::new(TunnelManager::scoped(
+            scope,
+            store,
+            Logger::console(crate::logging::Level::Silent),
+        ))
+    }
+
+    /// The dashboard tunnel publishes the dashboard port, and only that.
+    ///
+    /// The two managers read their port from their own scope rather than from
+    /// an argument, so there is no configuration in which one publishes the
+    /// other's port — which is the whole reason the scope exists.
+    #[tokio::test]
+    async fn the_dashboard_tunnel_publishes_the_dashboard_port_and_no_other() {
+        let manager = manager_for(Scope::Dashboard, |cfg| {
+            cfg.server.port = 9001;
+            cfg.dashboard.port = 9788;
+            cfg.dashboard.password = "a-long-enough-password".into();
+            cfg.dashboard.tunnel = crate::config::TunnelConfig {
+                mode: "quick".into(),
+                ..Default::default()
+            };
+        })
+        .await;
+
+        let args = manager.build_args();
+        assert!(
+            args.contains(&"http://127.0.0.1:9788".to_string()),
+            "{args:?}"
+        );
+        assert!(
+            !args.join(" ").contains("9001"),
+            "the dashboard tunnel must never publish the relay port: {args:?}"
+        );
+        assert_eq!(manager.status()["scope"], "dashboard");
+        assert_eq!(manager.status()["publishes"], 9788);
+    }
+
+    /// The relay's tunnel reads the relay's settings, not the dashboard's.
+    #[tokio::test]
+    async fn the_two_tunnels_read_their_own_settings() {
+        let build = |cfg: &mut Config| {
+            cfg.server.port = 9001;
+            cfg.dashboard.port = 9788;
+            cfg.dashboard.password = "a-long-enough-password".into();
+            cfg.tunnel = crate::config::TunnelConfig {
+                mode: "named".into(),
+                token: "eyJyZWxheSI".into(),
+                ..Default::default()
+            };
+            cfg.dashboard.tunnel = crate::config::TunnelConfig {
+                mode: "named".into(),
+                token: "eyJkYXNoIn".into(),
+                ..Default::default()
+            };
+        };
+
+        let relay = manager_for(Scope::Relay, build).await;
+        let dash = manager_for(Scope::Dashboard, build).await;
+        assert!(relay.build_args().contains(&"eyJyZWxheSI".to_string()));
+        assert!(dash.build_args().contains(&"eyJkYXNoIn".to_string()));
+        assert!(!relay.build_args().contains(&"eyJkYXNoIn".to_string()));
+        assert!(!dash.build_args().contains(&"eyJyZWxheSI".to_string()));
+    }
+
+    /// The control this whole feature turns on.
+    ///
+    /// Behind a tunnel the dashboard password is the only thing between the
+    /// internet and a `GET` that returns every client key in the clear, so the
+    /// tunnel does not start without a real one.
+    #[tokio::test]
+    async fn the_dashboard_tunnel_refuses_to_start_without_a_real_password() {
+        for password in ["", "hunter2", "short-pass"] {
+            let manager = manager_for(Scope::Dashboard, |cfg| {
+                cfg.dashboard.password = password.into();
+                cfg.dashboard.tunnel = crate::config::TunnelConfig {
+                    mode: "quick".into(),
+                    ..Default::default()
+                };
+            })
+            .await;
+
+            let err = manager.start().await.unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to publish the dashboard"),
+                "{password:?} was accepted: {err}"
+            );
+            assert!(err.contains("16"), "the requirement is not stated: {err}");
+            // And the dashboard can see the refusal before anybody presses
+            // Start, rather than only after.
+            assert!(manager.status()["blocked"].is_string());
+        }
+    }
+
+    /// A long enough password gets past the check — it is the password that is
+    /// refused, not the feature.
+    #[tokio::test]
+    async fn a_long_password_lets_the_dashboard_tunnel_through() {
+        let manager = manager_for(Scope::Dashboard, |cfg| {
+            cfg.dashboard.password = "correct-horse-battery-staple".into();
+            cfg.dashboard.tunnel = crate::config::TunnelConfig {
+                mode: "quick".into(),
+                binary: "definitely-not-installed-cloudflared".into(),
+                ..Default::default()
+            };
+        })
+        .await;
+
+        assert!(manager.status()["blocked"].is_null());
+        // It gets as far as looking for cloudflared, which is past the guard.
+        let err = manager.start().await.unwrap_err().to_string();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    /// The relay's own tunnel has never needed a dashboard password and must
+    /// not start needing one.
+    #[tokio::test]
+    async fn the_relay_tunnel_is_not_held_to_the_dashboard_password() {
+        let manager = manager_for(Scope::Relay, |cfg| {
+            cfg.dashboard.password = String::new();
+            cfg.tunnel = crate::config::TunnelConfig {
+                mode: "quick".into(),
+                binary: "definitely-not-installed-cloudflared".into(),
+                ..Default::default()
+            };
+        })
+        .await;
+        assert!(manager.status()["blocked"].is_null());
+        assert!(manager
+            .start()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+    }
+
+    /// The dashboard tunnel is off unless somebody turns it on. Publishing a
+    /// control panel is a decision, and a default that made it for you would
+    /// be the wrong one every time.
+    #[test]
+    fn the_dashboard_tunnel_is_off_by_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.dashboard.tunnel.mode, "off");
+        assert!(!cfg.dashboard.tunnel.auto_start);
+        // While the relay's own stays on, because a relay whose tunnel has to
+        // be started by hand is down after every reboot.
+        assert_eq!(cfg.tunnel.mode, "quick");
+        assert!(cfg.tunnel.auto_start);
+    }
+
+    /// The origin guard needs to recognise the name the dashboard is published
+    /// at, and a named tunnel's name is only in the config.
+    #[tokio::test]
+    async fn the_public_hostname_falls_back_to_the_configured_one() {
+        let manager = manager_for(Scope::Dashboard, |cfg| {
+            cfg.dashboard.password = "correct-horse-battery-staple".into();
+            cfg.dashboard.tunnel = crate::config::TunnelConfig {
+                mode: "named".into(),
+                hostname: "panel.example.com".into(),
+                ..Default::default()
+            };
+        })
+        .await;
+        assert_eq!(manager.public_host().as_deref(), Some("panel.example.com"));
+
+        // A quick tunnel has no configured name, and nothing to report until
+        // cloudflared has printed one.
+        let quick = manager_for(Scope::Dashboard, |cfg| {
+            cfg.dashboard.password = "correct-horse-battery-staple".into();
+            cfg.dashboard.tunnel = crate::config::TunnelConfig {
+                mode: "quick".into(),
+                ..Default::default()
+            };
+        })
+        .await;
+        assert_eq!(quick.public_host(), None);
     }
 
     #[tokio::test]
