@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::config::{mask_item, unmask_secrets};
+use crate::config::{mask_item, unmask_secrets, MIN_REMOTE_PASSWORD};
+use crate::reset::{Recovery, Verdict};
 use crate::state::AppState;
 use crate::store::{invoice, schema};
 use crate::tokenizer::chat::PROFILE_NAMES;
@@ -166,12 +167,26 @@ impl LoginGuard {
         *self.global.lock() = (0, 0);
         self.per_address.lock().remove(address);
     }
+
+    /// Forget every lockout, everywhere.
+    ///
+    /// For the one event that proves who the operator is by a route this
+    /// throttle knows nothing about: a password reset answered with the code
+    /// off the phone. Making them prove it and then telling them to wait
+    /// thirty seconds would be the counter outliving its own question.
+    fn clear(&self) {
+        *self.global.lock() = (0, 0);
+        self.per_address.lock().clear();
+    }
 }
 
 pub struct Dashboard {
     pub state: Arc<AppState>,
     sessions: Sessions,
     logins: LoginGuard,
+    /// The six-digit code a locked-out operator reads off the phone. Nothing
+    /// is pending most of the time — see [`crate::reset`].
+    recovery: Recovery,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -179,12 +194,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         state,
         sessions: Sessions::default(),
         logins: LoginGuard::default(),
+        recovery: Recovery::default(),
     });
 
     Router::new()
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/session", get(session))
+        .route("/api/password-reset", post(password_reset_start))
+        .route("/api/password-reset/confirm", post(password_reset_confirm))
         .route("/api/state", get(app_state))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/models", get(list_collection).post(upsert_collection))
@@ -480,7 +498,14 @@ async fn guard(State(dash): State<Arc<Dashboard>>, request: Request, next: Next)
         return error(403, message);
     }
     let path = request.uri().path().to_string();
-    let open = path == "/api/login" || path == "/api/session" || !path.starts_with("/api/");
+    // Sign-in and the password reset are the two things somebody with no
+    // session has to be able to reach — the reset especially, since being
+    // unable to sign in is its entire premise.
+    let open = path == "/api/login"
+        || path == "/api/session"
+        || path == "/api/password-reset"
+        || path == "/api/password-reset/confirm"
+        || !path.starts_with("/api/");
     if !open && !authed(&dash, request.headers()) {
         return error(401, "not signed in");
     }
@@ -495,18 +520,37 @@ fn error(status: u16, message: &str) -> Response {
         .into_response()
 }
 
-async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response {
-    // Taken off the request rather than extracted, so a missing `ConnectInfo`
-    // is an address of "unknown" instead of a 500. A server wired up without
-    // connect info — a test, an embedding, a later refactor — must still be
-    // able to sign in; refusing the only route that grants access because of a
-    // detail of how the listener was built is the worst failure this endpoint
-    // could have. Without it every caller shares one bucket, which is what the
-    // throttle was before there were two.
+/// Who is asking, for the throttles and the log.
+///
+/// Taken off the request rather than extracted, so a missing `ConnectInfo` is
+/// an address of "unknown" instead of a 500. A server wired up without connect
+/// info — a test, an embedding, a later refactor — must still be able to sign
+/// in; refusing the only route that grants access because of a detail of how
+/// the listener was built is the worst failure these endpoints could have.
+/// Without it every caller shares one bucket, which is what the throttle was
+/// before there were two.
+///
+/// Behind the tunnel every request arrives from cloudflared on loopback, so the
+/// peer address is the same for everyone and useless as a key. `client_ip` is
+/// the function that already knows when a forwarded address is worth believing
+/// — from a loopback peer, with the header set — and it is the same rule here
+/// as on the relay.
+fn caller_address(request: &Request, trust_proxy_headers: bool) -> String {
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
+    match peer {
+        Some(peer) => crate::server::client_ip(request.headers(), peer, trust_proxy_headers),
+        None => "unknown".to_string(),
+    }
+}
+
+async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response {
+    let caller = caller_address(
+        &request,
+        dash.state.config.current().security.trust_proxy_headers,
+    );
     let headers = request.headers().clone();
     let body = match read_json(request).await {
         Ok(value) => value,
@@ -517,15 +561,6 @@ async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response
     let expected = &cfg.dashboard.password;
     let given = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
     let remote = dash.is_remote(&headers);
-    // Behind the tunnel every request arrives from cloudflared on loopback, so
-    // the peer address is the same for everyone and useless as a throttle key.
-    // `client_ip` is the function that already knows when a forwarded address
-    // is worth believing — from a loopback peer, with the header set — and it
-    // is the same rule here as on the relay.
-    let caller = match peer {
-        Some(peer) => crate::server::client_ip(&headers, peer, cfg.security.trust_proxy_headers),
-        None => "unknown".to_string(),
-    };
 
     if !expected.is_empty() {
         if let Err(wait) = dash.logins.check(&caller) {
@@ -618,6 +653,163 @@ async fn session(State(dash): State<Arc<Dashboard>>, headers: HeaderMap) -> Resp
     .into_response()
 }
 
+/* ---------------------------------------------------- password reset -- */
+
+/// Ask for a code. It is shown on the phone and nowhere else.
+///
+/// Open, like sign-in, because "I cannot sign in" is the entire premise. What
+/// keeps that honest is that the answer carries no secret: the code goes to the
+/// device — the Termux window, and `chtting-relay reset-code` — and what comes
+/// back here is only the name of the challenge it belongs to. Somebody who
+/// found the dashboard tunnel can start resets all day and never see one.
+async fn password_reset_start(State(dash): State<Arc<Dashboard>>, request: Request) -> Response {
+    let cfg = dash.state.config.current();
+    if cfg.dashboard.password.is_empty() {
+        return error(
+            400,
+            "there is no dashboard password to reset — this dashboard is open as it stands",
+        );
+    }
+    let who = caller_address(&request, cfg.security.trust_proxy_headers);
+
+    match dash.recovery.start(&dash.state.paths.data, &who).await {
+        Ok(started) => {
+            dash.state.logger.warn(format!(
+                "dashboard: password reset asked for from {who}; the code is on the device{}",
+                if started.fresh {
+                    ""
+                } else {
+                    " (the one already pending)"
+                },
+            ));
+            Json(json!({
+                "id": started.id,
+                "digits": crate::reset::CODE_DIGITS,
+                "attempts": crate::reset::MAX_ATTEMPTS,
+                "expiresAt": started.expires_at,
+                "expiresInMs": (started.expires_at - crate::util::now_ms()).max(0),
+                // False means "read the code you already have" rather than
+                // "watch for a new one" — nothing was printed this time.
+                "fresh": started.fresh,
+                "where": "the Termux window the relay is running in — or run `chtting-relay reset-code` on the phone",
+            }))
+            .into_response()
+        }
+        Err(wait) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, wait.to_string())],
+            Json(json!({ "error": {
+                "message": format!("a code was issued a moment ago — wait {wait}s for a new one"),
+            } })),
+        )
+            .into_response(),
+    }
+}
+
+/// Answer with the code and set a new password.
+///
+/// The five tries the code gets are spent here, so everything that can be
+/// judged without it — is there a password at all, is the new one long enough
+/// for where this dashboard is reachable from — is judged first. A typo in the
+/// new password must not cost the operator one of the guesses their code has.
+async fn password_reset_confirm(State(dash): State<Arc<Dashboard>>, request: Request) -> Response {
+    let cfg = dash.state.config.current();
+    if cfg.dashboard.password.is_empty() {
+        return error(
+            400,
+            "there is no dashboard password to reset — this dashboard is open as it stands",
+        );
+    }
+    let who = caller_address(&request, cfg.security.trust_proxy_headers);
+    let headers = request.headers().clone();
+    let body = match read_json(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let code = body
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let password = body
+        .get("password")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // The same floor the dashboard tunnel refuses to start under. A reset is
+    // the one way a password changes without passing through the settings
+    // screen, and a panel that is on the internet right now must not be able to
+    // land on a four-character password by coming through this door.
+    let exposed = dash.state.dashboard_tunnel.is_publishing() || dash.is_remote(&headers);
+    let minimum = if exposed { MIN_REMOTE_PASSWORD } else { 1 };
+    if password.chars().count() < minimum {
+        return error(
+            400,
+            &if exposed {
+                format!(
+                    "this dashboard is reachable from outside this device, so the new password \
+                     needs at least {minimum} characters"
+                )
+            } else {
+                "the new password cannot be empty".to_string()
+            },
+        );
+    }
+
+    match dash.recovery.check(&dash.state.paths.data, id, &code).await {
+        Verdict::Wrong { attempts_left } => {
+            dash.state.logger.warn(format!(
+                "dashboard: wrong reset code from {who}; {attempts_left} left before it is cancelled"
+            ));
+            error(
+                401,
+                &format!(
+                    "that is not the code — {} left before it is cancelled",
+                    if attempts_left == 1 {
+                        "one try".to_string()
+                    } else {
+                        format!("{attempts_left} tries")
+                    }
+                ),
+            )
+        }
+        Verdict::Gone => error(
+            410,
+            "that code is spent, expired or no longer the current one — start again and read \
+             the new code off the phone",
+        ),
+        Verdict::Ok => match dash
+            .state
+            .config
+            .update(json!({ "dashboard": { "password": password } }))
+            .await
+        {
+            Err(err) => error(400, &err.to_string()),
+            Ok(_) => {
+                // Every session was opened under the old password, and a reset
+                // is also what somebody reaches for when they think a session
+                // is not theirs. None of them survives it — including the one
+                // asking, which now signs in with the new password like
+                // anybody else.
+                dash.sessions.tokens.write().clear();
+                // Proving it with the code and then being told to wait out a
+                // lockout would be absurd, and being locked out is half the
+                // reason to be here.
+                dash.logins.clear();
+                dash.state.logger.warn(format!(
+                    "dashboard: password reset from {who} with the code from the device; \
+                     every session was signed out"
+                ));
+                Json(json!({ "ok": true })).into_response()
+            }
+        },
+    }
+}
+
 /* -------------------------------------------------------------- state -- */
 
 async fn app_state(State(dash): State<Arc<Dashboard>>) -> Response {
@@ -700,7 +892,8 @@ async fn get_config(State(dash): State<Arc<Dashboard>>) -> Response {
 
 async fn put_config(State(dash): State<Arc<Dashboard>>, Json(patch): Json<Value>) -> Response {
     let state = &dash.state;
-    let current = match serde_json::to_value(&*state.config.current()) {
+    let was = state.config.current();
+    let current = match serde_json::to_value(&*was) {
         Ok(v) => v,
         Err(err) => return error(500, &err.to_string()),
     };
@@ -714,6 +907,12 @@ async fn put_config(State(dash): State<Arc<Dashboard>>, Json(patch): Json<Value>
                 .set_level(crate::logging::Level::parse(&next.logging.level));
             // Tokenizer rules may have changed; drop cached choices.
             state.counter.registry.invalidate(None);
+            // Somebody who has just set a password here is not waiting on a
+            // reset code, and one still sitting on the phone would be a second
+            // way to change what they have only now chosen.
+            if next.dashboard.password != was.dashboard.password {
+                dash.recovery.forget(&state.paths.data).await;
+            }
             Json(state.config.redacted()).into_response()
         }
         Err(err) => error(400, &err.to_string()),

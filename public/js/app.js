@@ -130,6 +130,93 @@ function showLogin(message) {
     message ? h('p.small.muted', { text: message }) : null,
     field('Password', password),
     h('button.primary', { onclick: submit, style: { width: '100%' } }, 'Sign in'),
+    h('button.ghost.sm', {
+      onclick: () => showReset(),
+      style: { width: '100%', marginTop: '8px' },
+    }, 'Forgot password?'),
+  ))));
+}
+
+/**
+ * The way back in when the password is gone.
+ *
+ * There is nothing to send anywhere: the relay puts a six-digit code on the
+ * phone it is running on — in its Termux window, and in the file
+ * `chtting-relay reset-code` prints — and this screen carries it back. So the
+ * copy says exactly where to look rather than "check your messages", because
+ * looking in the wrong place is the whole way this goes wrong.
+ *
+ * The code is worth five tries and then it is cancelled, so a wrong one is
+ * reported with what is left rather than as a flat "no".
+ */
+function showReset() {
+  clear(tabsEl);
+  let challenge = null;
+
+  const where = h('p.small.muted', { text: 'The relay will show a 6-digit code on the phone it is running on.' });
+  const code = h('input.mono', { inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6, placeholder: '000000' });
+  const fresh = h('input', { type: 'password', placeholder: 'new dashboard password' });
+  const again = h('input', { type: 'password', placeholder: 'again, to be sure' });
+  const ask = h('button.primary', { style: { width: '100%' } }, 'Show me the code');
+
+  const entry = h('div', { hidden: true },
+    field('Code from the phone', code),
+    field('New password', fresh),
+    field('Repeat it', again),
+  );
+  const save = h('button.primary', { hidden: true, style: { width: '100%' } }, 'Set the new password');
+
+  ask.addEventListener('click', async () => {
+    ask.disabled = true;
+    try {
+      challenge = await api.startPasswordReset();
+      const minutes = Math.max(1, Math.round(challenge.expiresInMs / 60000));
+      where.textContent = `${challenge.fresh ? 'A' : 'The'} ${challenge.digits}-digit code is on `
+        + `${challenge.where}. It is good for about ${minutes} more minute(s), and for `
+        + `${challenge.attempts} tries.`;
+      entry.hidden = false;
+      save.hidden = false;
+      ask.textContent = 'Ask again';
+      code.focus();
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      ask.disabled = false;
+    }
+  });
+
+  save.addEventListener('click', async () => {
+    if (!challenge) return;
+    if (fresh.value !== again.value) {
+      toast('The two passwords are not the same', 'err');
+      return;
+    }
+    save.disabled = true;
+    try {
+      await api.confirmPasswordReset({ id: challenge.id, code: code.value, password: fresh.value });
+      // Every session went with it, including any this browser was holding.
+      showLogin('Password changed. Sign in with the new one.');
+      toast('Dashboard password reset');
+    } catch (err) {
+      toast(err.message, 'err');
+      code.select();
+    } finally {
+      save.disabled = false;
+    }
+  });
+  code.addEventListener('keydown', (e) => { if (e.key === 'Enter') fresh.focus(); });
+  again.addEventListener('keydown', (e) => { if (e.key === 'Enter') save.click(); });
+
+  clear(view).append(h('div.login', {}, card('Forgot the password', h('div', {},
+    where,
+    h('p.small.muted', { text: 'On the phone: look at the window the relay is running in, or run  chtting-relay reset-code' }),
+    ask,
+    entry,
+    save,
+    h('button.ghost.sm', {
+      onclick: () => showLogin(),
+      style: { width: '100%', marginTop: '8px' },
+    }, 'Back to sign in'),
   ))));
 }
 

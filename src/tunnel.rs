@@ -184,6 +184,18 @@ impl TunnelManager {
         })
     }
 
+    /// Is this tunnel accepting traffic from the internet right now?
+    ///
+    /// `Starting` counts. cloudflared has already been launched by then, and
+    /// the question every caller is really asking is "could somebody out there
+    /// reach this in a moment", which it can.
+    pub fn is_publishing(&self) -> bool {
+        matches!(
+            self.inner.lock().state_label,
+            Some(State::Running | State::Starting)
+        )
+    }
+
     /// Why this tunnel may not be started, if it may not be.
     ///
     /// Only the dashboard has an answer here, and it is the password. The

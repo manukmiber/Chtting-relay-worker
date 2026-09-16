@@ -47,6 +47,13 @@ enum Command {
     },
     /// Check the install and print what is and is not ready.
     Doctor,
+    /// Print the six-digit code the dashboard's "Forgot password" is waiting
+    /// for.
+    ///
+    /// The code is shown on this device and nowhere else — that is what makes
+    /// it proof the person resetting the password is holding the phone. Ask
+    /// for one from the dashboard first; this prints whatever is pending.
+    ResetCode,
     /// Wire the relay into the phone: the keeper that restarts it, home-screen
     /// shortcuts, start-on-boot. The installer runs this; afterwards the
     /// dashboard's Setup screen does the same job with buttons.
@@ -195,6 +202,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             replace,
         } => start(paths, port, no_dashboard, replace).await,
         Command::Doctor => doctor(paths).await,
+        Command::ResetCode => reset_code(paths).await,
         Command::Setup {
             no_service,
             no_shortcuts,
@@ -257,6 +265,11 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
 
     let state = AppState::build(paths, logger.clone()).await?;
     let cfg = state.config.current();
+
+    // A password-reset code only ever lived in the memory of the process that
+    // minted it, so one left on disk by a process that is gone is a code that
+    // cannot work. Clear it before anything can read it.
+    chtting_relay::reset::forget_pending(&state.paths.data).await;
 
     logger.info(format!(
         "chtting-relay {} starting — {} model(s), {} backend(s), {} worker thread(s)",
@@ -747,6 +760,28 @@ async fn shutdown_signal() {
     }
 }
 
+/* -------------------------------------------------------- reset code -- */
+
+/// Show the pending password-reset code.
+///
+/// Read out of `data/run/` rather than asked of the running relay, and that is
+/// deliberate: the relay is normally started by the keeper with its stderr
+/// pointed at `/dev/null`, so the banner it printed when the code was minted
+/// went nowhere. This is the copy that survives — and it needs no port, no
+/// session and no password, only the phone the file is on.
+async fn reset_code(paths: Paths) -> Result<()> {
+    match chtting_relay::reset::pending_notice(&paths.data).await {
+        Some(notice) => print!("{notice}"),
+        None => println!(
+            "Nothing pending — no code has been asked for, or the last one has expired.\n\n\
+             Open the dashboard, choose \"Forgot password?\", then run this again.\n\
+             A code is good for {} minutes once it is issued.",
+            chtting_relay::reset::CODE_TTL_MS / 60_000,
+        ),
+    }
+    Ok(())
+}
+
 /* ------------------------------------------------------------ doctor -- */
 
 async fn doctor(paths: Paths) -> Result<()> {
@@ -794,6 +829,20 @@ async fn doctor(paths: Paths) -> Result<()> {
     println!(
         "  dashboard     {}:{}",
         cfg.dashboard.host, cfg.dashboard.port
+    );
+    println!(
+        "  password      {}",
+        match (
+            cfg.dashboard.password.chars().count(),
+            chtting_relay::reset::pending_notice(&paths.data)
+                .await
+                .is_some(),
+        ) {
+            (0, _) => "not set — the dashboard is open to anything on this device".to_string(),
+            (n, true) =>
+                format!("{n} characters — a reset code is waiting: run `chtting-relay reset-code`"),
+            (n, false) => format!("{n} characters"),
+        }
     );
     println!("  max in flight {}", cfg.server.max_concurrent_requests);
     println!(

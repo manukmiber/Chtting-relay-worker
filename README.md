@@ -1039,6 +1039,65 @@ lewat TLS, lewat satu proses yang relay ini awasi dan bisa hentikan. Lihat
 Beri password lewat Settings kalau HP-mu dipakai orang lain. Secret selalu
 tampil termask, dan menyimpan form tidak akan menimpa key asli dengan masknya.
 
+### Lupa password dashboard
+
+Tidak ada email pemulihan dan tidak ada pertanyaan rahasia — dan memang tidak
+boleh ada. Di balik tunnel, password dashboard itu satu-satunya pagar antara
+siapa pun yang menemukan URL-nya dan panel yang bisa menulis config, membaca
+semua prompt tersimpan, dan membuka semua client key. Jalur pemulihan apa pun
+yang bisa diselesaikan dari dalam browser berarti menyerahkan panel itu ke orang
+yang justru sedang dijaga password tadi.
+
+Yang cuma dipunya pemiliknya adalah HP-nya. Jadi itu yang diminta:
+
+1. Di layar sign-in, tekan **Forgot password?** lalu **Show me the code**.
+2. Relay memunculkan **kode 6 digit di HP** — di jendela Termux tempat relay
+   jalan, dan di file yang dibacakan perintah ini:
+
+   ```bash
+   chtting-relay reset-code
+   ```
+
+   Perintah itu yang dipakai kalau relay-nya dijalankan keeper: stderr-nya ke
+   `/dev/null`, jadi banner-nya tidak muncul di mana pun.
+3. Ketik kodenya di dashboard bersama password baru. Selesai — tinggal sign in
+   dengan password yang baru.
+
+Yang bikin 6 digit cukup bukan panjangnya, tapi jatah tebakannya:
+
+- satu kode hidup dalam satu waktu, 10 menit, acak di seluruh sejuta;
+- **5 kali salah dan kodenya dibatalkan**, bukan sekadar ditolak — jadi satu
+  rangkaian tebakan dapat 5 dari sejuta, dan tebakan yang menghabiskan jatah itu
+  ikut membawa pergi kode yang sedang ditebak;
+- minta kode saat masih ada yang hidup akan mengembalikan kode yang sama, bukan
+  mencetak yang baru, dan kode baru paling cepat 30 detik sekali. Tanpa itu,
+  orang asing bisa membuat terminalmu penuh banner reset — berisik, sekaligus
+  cara menyembunyikan banner yang asli.
+
+Yang ikut terjadi begitu resetnya berhasil:
+
+- **Semua sesi ikut keluar.** Reset juga yang orang cari kalau curiga ada sesi
+  yang bukan miliknya, jadi tidak ada cookie yang selamat — termasuk cookie
+  browser yang baru saja mereset.
+- **Lockout sign-in dibersihkan.** Terkunci karena salah password berkali-kali
+  itu separuh alasan datang ke layar ini; membuktikan diri dengan kode lalu
+  disuruh menunggu 30 detik itu hitungan yang hidup lebih lama dari
+  pertanyaannya sendiri.
+- **Kalau dashboard-nya sedang terpublikasi** — tunnel dashboard hidup, atau
+  request-nya masuk lewat nama yang bukan nama mesin ini — password barunya
+  tetap harus 16 karakter, sama seperti syarat tunnel dashboard boleh menyala.
+  Pintu ini tidak boleh jadi cara panel yang sedang ada di internet berakhir di
+  balik empat karakter.
+- Ganti password lewat Settings juga membuang kode yang masih menggantung, dan
+  kode yang tertinggal di disk dihapus setiap relay start: tantangannya cuma
+  pernah ada di memori proses yang mencetaknya, jadi sesudah restart file itu
+  cuma kode yang tidak akan diterima siapa pun.
+
+Filenya ada di `data/run/password-reset.json` dengan mode 0600. Itu kedengaran
+seperti titik lemahnya dan sebenarnya bukan: `config/config.json` di direktori
+yang sama menyimpan password dashboard-nya sendiri apa adanya, jadi apa pun yang
+bisa membaca yang satu sudah memegang yang lain.
+
 ### Update & restart: `git pull`, build, lalu balik lagi
 
 Relay di HP itu satu clone git plus satu binary hasil build dari clone itu, dan
@@ -1313,6 +1372,7 @@ scripting dan buat kalau dashboard-nya sendiri yang bermasalah.
 chtting-relay start [--port N] [--no-dashboard] [--replace]
 chtting-relay setup                     keeper + shortcut + hook boot
 chtting-relay doctor                    periksa lingkungan dan konfigurasi
+chtting-relay reset-code                kode 6 digit buat reset password dashboard
 chtting-relay config path|show
 chtting-relay key new --label "hp saya" client key baru, ditampilkan sekali
 chtting-relay key list
@@ -1340,6 +1400,7 @@ src/
   tokenizer/     registry vocabulary, penghitungan chat, estimator
   pricing.rs     thinking effort, kartu tarif tiga pita, tier, backend/proxy/profit
   relay/         upstream + fallback, transform, SSE, pacing, trace, handler
+  reset.rs       kode 6 digit di HP buat reset password dashboard
   rotate.rs      ganti instance tiap jam tanpa memutus koneksi
   server/        API publik, dashboard + admin API
   store/         SQLite, buku besar, invoice, quota tracker, rate limiter
@@ -1411,6 +1472,11 @@ tanpa menghapus satu baris pun.
 - Prompt hanya disimpan lokal. Kalau tidak mau disimpan sama sekali, set
   `logging.storeBodies` ke `none`.
 - Client key ditampilkan penuh sekali saat dibuat, sesudah itu selalu termask.
+- **Reset password dashboard butuh HP-nya, bukan email.** Kode 6 digitnya cuma
+  muncul di perangkat ini — jendela Termux dan `chtting-relay reset-code` — dan
+  yang diterima browser cuma nama tantangannya, tidak pernah kodenya. Lima kali
+  salah membatalkan kodenya, resetnya mengeluarkan semua sesi, dan kalau
+  panelnya sedang terpublikasi password barunya tetap wajib 16 karakter.
 - **Dashboard yang dipublikasikan tidak menyala tanpa password 16 karakter.**
   Lihat bagian Cloudflare Tunnel di atas untuk apa saja yang berubah begitu
   panel ini bisa dijangkau dari luar HP.

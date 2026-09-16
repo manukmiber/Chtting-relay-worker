@@ -33,6 +33,10 @@ export const api = {
   session: () => request('GET', '/api/session'),
   login: (password) => request('POST', '/api/login', { password }),
   logout: () => request('POST', '/api/logout'),
+  // Nothing secret comes back from this one: the code it mints is printed on
+  // the phone, and all the browser gets is the name of the challenge.
+  startPasswordReset: () => request('POST', '/api/password-reset', {}),
+  confirmPasswordReset: (body) => request('POST', '/api/password-reset/confirm', body),
 
   state: () => request('GET', '/api/state'),
   config: () => request('GET', '/api/config'),

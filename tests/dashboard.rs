@@ -1809,3 +1809,269 @@ async fn the_tunnel_routes_are_behind_the_password_too() {
         401
     );
 }
+
+/* ------------------------------------------------- forgotten password -- */
+
+/// The code that was just minted, read the way the operator reads it: off the
+/// device, not out of anything the browser was told.
+async fn code_on_the_phone(d: &Dash) -> String {
+    let path = chtting_relay::reset::code_file_in(&d.relay.state.paths.data);
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .expect("the relay wrote a code to the device");
+    serde_json::from_str::<Value>(&raw).unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The whole feature, end to end: locked out, ask for a code, read it off the
+/// phone, choose a new password, sign in with it.
+#[tokio::test]
+async fn a_forgotten_password_is_reset_with_the_code_off_the_phone() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "the-one-i-forgot".into();
+    })
+    .await;
+    assert_eq!(d.get("/api/state").await.status(), 401);
+
+    // Asking needs no session — being unable to sign in is the premise.
+    let started = d.post("/api/password-reset", json!({})).await;
+    assert_eq!(started.status(), 200);
+    let started: Value = started.json().await.unwrap();
+    assert_eq!(started["digits"], 6);
+    assert_eq!(started["fresh"], true);
+
+    let code = code_on_the_phone(&d).await;
+    assert_eq!(code.chars().count(), 6);
+
+    let done = d
+        .post(
+            "/api/password-reset/confirm",
+            json!({ "id": started["id"], "code": code, "password": "a-new-one-entirely" }),
+        )
+        .await;
+    assert_eq!(done.status(), 200);
+
+    // The old password is gone and the new one works.
+    assert_eq!(
+        d.post("/api/login", json!({ "password": "the-one-i-forgot" }))
+            .await
+            .status(),
+        401
+    );
+    assert_eq!(
+        d.post("/api/login", json!({ "password": "a-new-one-entirely" }))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(d.get("/api/state").await.status(), 200);
+
+    // And the code is spent: it is not lying around to be used twice.
+    assert!(!chtting_relay::reset::code_file_in(&d.relay.state.paths.data).exists());
+}
+
+/// The reason this is safe at all: the answer carries the *name* of the
+/// challenge and never the code. Anybody who can reach the dashboard can start
+/// a reset; only somebody holding the phone can finish one.
+#[tokio::test]
+async fn starting_a_reset_tells_the_browser_nothing_it_could_answer_with() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "the-one-i-forgot".into();
+    })
+    .await;
+
+    let body = d.post("/api/password-reset", json!({})).await;
+    let text = body.text().await.unwrap();
+    let code = code_on_the_phone(&d).await;
+    assert!(
+        !text.contains(&code),
+        "the answer handed the browser the code: {text}"
+    );
+
+    // And a stranger guessing gets five tries, not a million, before the code
+    // they were guessing at stops existing.
+    let started: Value = serde_json::from_str(&text).unwrap();
+    let wrong = if code == "111111" { "222222" } else { "111111" };
+    for attempt in 1..=5 {
+        let refused = d
+            .post(
+                "/api/password-reset/confirm",
+                json!({ "id": started["id"], "code": wrong, "password": "attacker-chosen" }),
+            )
+            .await;
+        let expected = if attempt == 5 { 410 } else { 401 };
+        assert_eq!(refused.status(), expected, "attempt {attempt}");
+    }
+
+    // Even the real code is worthless now, and the password never moved.
+    assert_eq!(
+        d.post(
+            "/api/password-reset/confirm",
+            json!({ "id": started["id"], "code": code, "password": "attacker-chosen" }),
+        )
+        .await
+        .status(),
+        410
+    );
+    assert_eq!(
+        d.post("/api/login", json!({ "password": "the-one-i-forgot" }))
+            .await
+            .status(),
+        200
+    );
+}
+
+/// A reset is also what somebody reaches for when they think a session is not
+/// theirs. It would be a poor recovery that left the intruder signed in.
+#[tokio::test]
+async fn a_reset_signs_every_session_out() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "the-one-i-forgot".into();
+    })
+    .await;
+    assert_eq!(
+        d.post("/api/login", json!({ "password": "the-one-i-forgot" }))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(d.get("/api/state").await.status(), 200);
+
+    let started: Value = d
+        .post("/api/password-reset", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let code = code_on_the_phone(&d).await;
+    assert_eq!(
+        d.post(
+            "/api/password-reset/confirm",
+            json!({ "id": started["id"], "code": code, "password": "a-new-one-entirely" }),
+        )
+        .await
+        .status(),
+        200
+    );
+
+    // The cookie this client is still holding was issued under the old
+    // password, so it is not a session any more.
+    assert_eq!(d.get("/api/state").await.status(), 401);
+}
+
+/// Being locked out by the sign-in throttle is half the reason to be on this
+/// screen. Proving it with the code and then being told to wait would be the
+/// counter outliving its own question.
+#[tokio::test]
+async fn a_reset_clears_the_sign_in_lockout() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "the-one-i-forgot".into();
+    })
+    .await;
+
+    let mut locked_out = false;
+    for _ in 0..12 {
+        if d.post("/api/login", json!({ "password": "nope" }))
+            .await
+            .status()
+            == 429
+        {
+            locked_out = true;
+            break;
+        }
+    }
+    assert!(locked_out, "the throttle never engaged");
+
+    // The reset is answered while the lockout is in force...
+    let started: Value = d
+        .post("/api/password-reset", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let code = code_on_the_phone(&d).await;
+    assert_eq!(
+        d.post(
+            "/api/password-reset/confirm",
+            json!({ "id": started["id"], "code": code, "password": "a-new-one-entirely" }),
+        )
+        .await
+        .status(),
+        200
+    );
+
+    // ...and signing in with the new password works immediately.
+    assert_eq!(
+        d.post("/api/login", json!({ "password": "a-new-one-entirely" }))
+            .await
+            .status(),
+        200
+    );
+}
+
+/// The dashboard tunnel refuses to start under a short password. A reset is the
+/// one way a password changes without going through the settings screen, so it
+/// enforces the same floor — otherwise this door is how a panel that is on the
+/// internet right now ends up behind four characters.
+#[tokio::test]
+async fn a_reset_from_outside_cannot_choose_a_short_password() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.password = "correct-horse-battery-staple".into();
+        cfg.security.dashboard_allowed_hosts = vec!["panel.example.com".into()];
+    })
+    .await;
+
+    let started: Value = d
+        .client
+        .post(d.url("/api/password-reset"))
+        .header("host", "panel.example.com")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let code = code_on_the_phone(&d).await;
+
+    let refused = d
+        .client
+        .post(d.url("/api/password-reset/confirm"))
+        .header("host", "panel.example.com")
+        .json(&json!({ "id": started["id"], "code": code, "password": "short" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("16 characters"), "{body}");
+
+    // Refusing it must not have cost the operator their code: the length is
+    // judged before the guess is spent.
+    let done = d
+        .client
+        .post(d.url("/api/password-reset/confirm"))
+        .header("host", "panel.example.com")
+        .json(&json!({
+            "id": started["id"],
+            "code": code,
+            "password": "a-long-enough-replacement",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.status(), 200);
+}
+
+/// With no password there is nothing to reset, and the endpoint says so rather
+/// than printing a code on the phone for a dashboard that is already open.
+#[tokio::test]
+async fn there_is_nothing_to_reset_when_no_password_is_set() {
+    let d = Dash::start(|_| {}).await;
+
+    let refused = d.post("/api/password-reset", json!({})).await;
+    assert_eq!(refused.status(), 400);
+    assert!(!chtting_relay::reset::code_file_in(&d.relay.state.paths.data).exists());
+}

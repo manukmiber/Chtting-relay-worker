@@ -112,6 +112,42 @@ knowing before changing it:
   `no-store`, which re-sends the whole frontend over the tunnel on every
   navigation. API responses get `no-store`; assets get an ETag and a 304.
 
+## The password reset proves the phone, and may never prove anything else
+
+`src/reset.rs` mints a six-digit code and shows it **only on the device**: the
+relay's stderr banner and `chtting-relay reset-code`. The answer to
+`POST /api/password-reset` carries the challenge id and never the code. The
+moment it carries anything a browser could answer with, this stops being a way
+back in and becomes a way in.
+
+- **Six digits is safe because of the guessing budget, not the length.** One
+  live challenge at a time, ten minutes, five wrong answers and the code is
+  destroyed rather than merely refused. Loosening any of those three — an
+  attempt counter that resets, a challenge per browser, a longer TTL — is what
+  turns a million-to-five into a login somebody can guess.
+- **Starting twice hands back the live code instead of minting a new one**, and
+  a genuinely new code is rate-limited to one per 30s. That is the only thing
+  stopping a stranger from filling the operator's terminal with reset banners,
+  which is both noise and a way to hide the real one.
+- **The banner goes to stderr with `eprint!`, not through the logger.** The
+  logger writes `relay.log`, which the dashboard hands to anyone who is signed
+  in, and it obeys `logging.level` — a reset code must be neither hidden by
+  `silent` nor filed where a session can read it.
+- `data/run/password-reset.json` (0600) exists because the keeper starts the
+  relay with stderr pointed at `/dev/null`, so the banner reaches nobody. It is
+  not a new exposure: `config/config.json` in the same directory holds the
+  dashboard password itself in the clear. It is cleared at startup, because the
+  challenge only ever lived in the memory of the process that minted it.
+- **Confirming enforces `config::MIN_REMOTE_PASSWORD` when the dashboard tunnel
+  is up or the request arrived under a non-local `Host`.** `TunnelManager::
+  start` checks that at start only, so without the same check here the reset is
+  the way around it.
+- A successful reset clears **every session and every login lockout**. Sessions
+  were opened under the old password, and being locked out by the sign-in
+  throttle is half the reason to be on that screen.
+- Both routes are in `guard`'s `open` list, like sign-in. They have to be: not
+  being able to sign in is the premise.
+
 ## Langfuse goes over OTLP, and the ingestion endpoint is a trap
 
 `src/langfuse.rs` posts to `POST /api/public/otel/v1/traces`. Do not "simplify"
