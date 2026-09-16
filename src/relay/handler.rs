@@ -237,8 +237,10 @@ struct Ctx {
     user_local: u64,
     /// How the backend's cache hit divides between the relay and the caller.
     cache_basis: CacheBasis,
-    /// This route's price list, global and per-model already merged.
-    pricing: Pricing,
+    /// This route's price list, global and per-model already merged — worked
+    /// out when the config was published rather than on this request. See
+    /// [`crate::config::Model::resolved_pricing`].
+    pricing: Arc<Pricing>,
     effort: Effort,
     trace: Trace,
     /// What this request's input row already put in the ledger, if one was
@@ -849,7 +851,7 @@ pub async fn handle_chat(
                 client_wants_stream,
                 user_local,
                 cache_basis,
-                pricing: pricing::resolve(&cfg.pricing, &route),
+                pricing: cfg.pricing_for(&route),
                 effort,
                 trace: trace.clone(),
                 ledgered,

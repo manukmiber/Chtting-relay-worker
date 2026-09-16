@@ -298,7 +298,9 @@ fn card_of_override(o: &PricingOverride) -> Card {
 /// million. Nothing is derived from a rate card that was never switched on.
 pub fn base_card(model: &Model, cfg: &Config) -> Card {
     let explicit = card_of(&model.openrouter.pricing);
-    let resolved = crate::pricing::resolve(&cfg.pricing, model);
+    // The merge the config already worked out, not a fresh one: listing every
+    // model called this twice per model, and each call cloned two tier lists.
+    let resolved = cfg.pricing_for(model);
     if !resolved.enabled {
         return explicit;
     }
@@ -459,7 +461,9 @@ fn band_rates<'a>(id: &str, pricing: &'a Pricing) -> Option<&'a BandRates> {
 /// three even when two of them are the same number, because "thinking off costs
 /// the same here" is an answer, and an absent band is a question.
 fn bands(model: &Model, cfg: &Config, base: &Card) -> Map<String, Value> {
-    let resolved = crate::pricing::resolve(&cfg.pricing, model);
+    // The merge the config already worked out, not a fresh one: listing every
+    // model called this twice per model, and each call cloned two tier lists.
+    let resolved = cfg.pricing_for(model);
     let mut out = Map::new();
     for (id, name, efforts) in BANDS {
         // A relay billing off per-token strings alone has no bands at all, and

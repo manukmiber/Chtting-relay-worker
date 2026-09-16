@@ -1635,12 +1635,118 @@ async fn every_response_carries_the_hardening_headers() {
         assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
         assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
-        assert!(headers
+    }
+
+    // An API response is the config, the keys and the prompts, so no cache may
+    // keep it.
+    let api = d.get("/api/state").await;
+    assert!(api
+        .headers()
+        .get("cache-control")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("no-store"));
+
+    // The assets carry no secret, and forbidding them a cache would mean
+    // re-sending the whole frontend over the tunnel on every navigation. They
+    // revalidate instead.
+    for path in ["/", "/js/app.js", "/css/app.css"] {
+        let asset = d.get(path).await;
+        let cache = asset
+            .headers()
             .get("cache-control")
             .unwrap()
             .to_str()
             .unwrap()
-            .contains("no-store"));
+            .to_string();
+        assert!(cache.contains("no-cache"), "{path}: {cache}");
+        assert!(!cache.contains("no-store"), "{path}: {cache}");
+        assert!(
+            asset.headers().get("etag").is_some(),
+            "{path} has no validator"
+        );
+    }
+}
+
+/// The assets change exactly when the binary does, so a browser that already
+/// has them gets told so rather than sent them again. Over a tunnel that is the
+/// difference between one 304 and twenty module downloads per navigation.
+#[tokio::test]
+async fn an_unchanged_asset_is_answered_with_a_304_and_no_body() {
+    let d = Dash::start(|_| {}).await;
+
+    let first = d.get("/js/app.js").await;
+    assert_eq!(first.status(), 200);
+    let etag = first
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = first.text().await.unwrap();
+    assert!(!body.is_empty());
+
+    let again = d
+        .client
+        .get(d.url("/js/app.js"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 304);
+    assert_eq!(again.text().await.unwrap(), "", "a 304 carries no body");
+
+    // A cache is allowed to weaken the tag on the way back, and the bodies are
+    // identical either way.
+    let weak = d
+        .client
+        .get(d.url("/js/app.js"))
+        .header("if-none-match", format!("W/{etag}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(weak.status(), 304);
+
+    // A tag from some other build is not a match.
+    let stale = d
+        .client
+        .get(d.url("/js/app.js"))
+        .header("if-none-match", "\"0000000000000000\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 200);
+}
+
+/// A URL the relay could be aimed at itself is refused. The dashboard reaches
+/// the internet on the operator's behalf here, and once it is published that
+/// rests on one password.
+#[tokio::test]
+async fn the_tokenizer_installer_refuses_to_fetch_this_device() {
+    let d = Dash::start(|_| {}).await;
+
+    for url in [
+        "http://127.0.0.1:8788/api/config",
+        "http://localhost:9999/",
+        "http://[::1]:8080/x",
+        "http://169.254.169.254/latest/meta-data/",
+        "file:///data/data/com.termux/files/home/config/config.json",
+    ] {
+        let response = d
+            .post(
+                "/api/tokenizer/install",
+                json!({ "url": url, "as": "probe" }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{url} was not refused");
+        let body: Value = response.json().await.unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("refusing to fetch") || message.contains("only http"),
+            "{url}: {message}"
+        );
     }
 }
 

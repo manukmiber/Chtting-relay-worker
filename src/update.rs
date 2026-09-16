@@ -241,12 +241,16 @@ impl Updater {
         };
 
         let mut args: Vec<&str> = vec!["build"];
-        if self.profile() == "release-small" {
+        match self.profile() {
             // The phone that needed this profile is the phone that cannot
             // afford parallel codegen either.
-            args.extend(["--profile", "release-small", "-j1"]);
-        } else {
-            args.push("--release");
+            "release-small" => args.extend(["--profile", "release-small", "-j1"]),
+            "release" => args.push("--release"),
+            // `release-fast`, or anything added later: rebuild with the same
+            // profile this relay was built with. Rebuilding with a different
+            // one would put the new binary somewhere the keeper does not look,
+            // and leave the running one in place looking updated.
+            other => args.extend(["--profile", other]),
         }
 
         match self.run_command("cargo", &args, repo).await {
@@ -279,14 +283,16 @@ impl Updater {
 
     /// Which profile this relay was built with, read off the path it is running
     /// from: an update should not quietly move a phone that could only manage
-    /// `release-small` onto the profile that ran it out of memory.
+    /// `release-small` onto the profile that ran it out of memory — nor move a
+    /// device that was built `release-fast` back down to `release`, which would
+    /// put the new binary in a directory nothing starts from.
+    ///
+    /// Matched on the directory the executable sits in rather than on the whole
+    /// path, because a checkout at `~/release-fast/chtting-relay` would
+    /// otherwise answer for a profile nobody chose. Longest name first, since
+    /// `release` is a prefix of both of the others.
     fn profile(&self) -> &'static str {
-        let exe = std::env::current_exe().unwrap_or_default();
-        if exe.to_string_lossy().contains("release-small") {
-            "release-small"
-        } else {
-            "release"
-        }
+        profile_for(&std::env::current_exe().unwrap_or_default())
     }
 
     /// Where the build will leave the binary.
@@ -392,8 +398,56 @@ impl Updater {
     }
 }
 
+/// Which build profile a binary at this path was produced by.
+///
+/// Matched on the directory the executable sits in rather than on the whole
+/// path, because a checkout at `~/release-fast/chtting-relay` would otherwise
+/// answer for a profile nobody chose. The list is checked longest-first, since
+/// `release` is a prefix of both of the others.
+///
+/// Anything unrecognised — a `cargo install`, a copied binary, a test harness —
+/// is `release`, which is the profile the instructions name.
+fn profile_for(exe: &Path) -> &'static str {
+    let dir = exe
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for known in ["release-small", "release-fast", "release"] {
+        if dir == known {
+            return known;
+        }
+    }
+    "release"
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// An update rebuilds with the profile the running binary was built with,
+    /// and nothing else. Getting this wrong puts the new binary in a directory
+    /// the keeper never starts from, and leaves the old one running while the
+    /// screen says the update succeeded.
+    #[test]
+    fn the_profile_is_read_off_the_directory_not_the_whole_path() {
+        let p = |path: &str| profile_for(Path::new(path));
+
+        assert_eq!(p("/home/u/app/target/release/chtting-relay"), "release");
+        assert_eq!(
+            p("/home/u/app/target/release-small/chtting-relay"),
+            "release-small"
+        );
+        assert_eq!(
+            p("/home/u/app/target/release-fast/chtting-relay"),
+            "release-fast"
+        );
+        // A checkout that happens to be named after a profile is not a profile.
+        assert_eq!(p("/home/u/release-fast/bin/chtting-relay"), "release");
+        // And `release` must not swallow the two that start with it.
+        assert_eq!(p("/t/release-smallish/chtting-relay"), "release");
+        assert_eq!(p("/usr/local/bin/chtting-relay"), "release");
+        assert_eq!(p(""), "release");
+    }
     use super::*;
     use crate::logging::Level;
 

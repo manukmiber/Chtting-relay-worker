@@ -9,10 +9,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# A small device builds with the release-small profile, which lands elsewhere;
-# take whichever of the two was built most recently.
+# The three build profiles land in three directories: release-fast for a device
+# with cores and memory to spare, release for most, release-small for a phone
+# that would be killed building anything larger. Take whichever was built most
+# recently.
 BIN=""
-for candidate in ./target/release/chtting-relay ./target/release-small/chtting-relay; do
+for candidate in \
+  ./target/release-fast/chtting-relay \
+  ./target/release/chtting-relay \
+  ./target/release-small/chtting-relay
+do
   [ -x "$candidate" ] || continue
   if [ -z "$BIN" ] || [ "$candidate" -nt "$BIN" ]; then BIN="$candidate"; fi
 done

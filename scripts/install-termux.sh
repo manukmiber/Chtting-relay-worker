@@ -21,7 +21,11 @@ ROOT="$(pwd)"
 BIN="$ROOT/target/release/chtting-relay"
 resolve_bin() {
   local newest=""
-  for candidate in "$ROOT/target/release/chtting-relay" "$ROOT/target/release-small/chtting-relay"; do
+  for candidate in \
+    "$ROOT/target/release-fast/chtting-relay" \
+    "$ROOT/target/release/chtting-relay" \
+    "$ROOT/target/release-small/chtting-relay"
+  do
     [ -x "$candidate" ] || continue
     if [ -z "$newest" ] || [ "$candidate" -nt "$newest" ]; then newest="$candidate"; fi
   done

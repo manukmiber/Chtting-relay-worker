@@ -36,24 +36,27 @@ export async function requestsView(ctx) {
   async function load() {
     clear(body).append(h('div.empty', { text: 'Loading…' }));
     try {
-      const { rows, total } = await api.requests({
+      const { rows, total, atLeast } = await api.requests({
         limit: state.limit,
         offset: state.offset,
         model: state.model,
         status: state.status,
         q: state.q,
       });
-      clear(body).append(renderTable(rows), pager(total));
+      clear(body).append(renderTable(rows), pager(total, atLeast));
     } catch (err) {
       clear(body).append(h('div.empty', { text: err.message }));
     }
   }
 
-  function pager(total) {
+  // `atLeast` means the count stopped early rather than scanning the whole
+  // log to produce a number nobody pages to. The pager only ever needed to
+  // know whether there is another page.
+  function pager(total, atLeast) {
     const from = total === 0 ? 0 : state.offset + 1;
     const to = Math.min(total, state.offset + state.limit);
     return h('div.row', { style: { padding: '10px 14px', borderTop: '1px solid var(--border)' } },
-      h('span.small.muted', { text: `${from}–${to} of ${fmtNum(total)}` }),
+      h('span.small.muted', { text: `${from}–${to} of ${atLeast ? '≥ ' : ''}${fmtNum(total)}` }),
       h('div.spacer', { style: { flex: 1 } }),
       h('button.sm', {
         disabled: state.offset === 0,

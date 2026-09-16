@@ -116,3 +116,25 @@ inherits = "release"
 opt-level = "s"
 lto = false
 codegen-units = 1
+
+# The opposite end: a device with cores and memory to spare, where the build can
+# afford to take longer than the phone profile and the binary should be as fast
+# as the toolchain can make it.
+#
+#   cargo build --profile release-fast
+#
+# `fat` LTO and one codegen unit let the optimiser inline across crate
+# boundaries — which is where the wins are here, since the hot paths run through
+# `serde_json`, `tokenizers` and `tiktoken-rs` rather than through this crate.
+# It needs several gigabytes of RAM and a few minutes; on anything smaller than
+# a modern tablet use plain `--release`.
+#
+# To also target the device's own ISA, set the CPU at the same time:
+#
+#   RUSTFLAGS="-C target-cpu=cortex-x925" cargo build --profile release-fast
+#
+# See `scripts/build-android.sh --tune` for what that does and when it is safe.
+[profile.release-fast]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

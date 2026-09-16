@@ -629,6 +629,26 @@ pub struct Model {
     pub resolved_tokenizer: Option<Arc<str>>,
     #[serde(skip)]
     pub resolved_profile: Option<Arc<str>>,
+
+    /// This route's price list with the global one already merged into it,
+    /// decided when the config is published for exactly the same reason.
+    ///
+    /// [`crate::pricing::resolve`] is a pure function of `cfg.pricing` and this
+    /// model's own `pricing`, and it was being run once per request: two
+    /// `Vec<PricingTier>` cloned and concatenated, the refusal-phrase list
+    /// cloned, the currency cloned, and a `Pricing` the size of four rate cards
+    /// built — all to re-answer a question whose inputs had not moved since the
+    /// last save. On a device serving a few hundred callers at once that is
+    /// allocation churn with nothing on the other side of it.
+    ///
+    /// `Arc`, so the request path takes a refcount rather than a copy, and
+    /// holds it across the whole request without borrowing the config.
+    ///
+    /// Set by [`normalize`] and never serialised. `None` means nobody
+    /// normalised this `Model` — only ever one built by hand in a test — and
+    /// [`Config::pricing_for`] then resolves it live, exactly as it always did.
+    #[serde(skip)]
+    pub resolved_pricing: Option<Arc<Pricing>>,
 }
 
 impl Default for Model {
@@ -659,6 +679,7 @@ impl Default for Model {
             openrouter: OpenRouterModel::default(),
             resolved_tokenizer: None,
             resolved_profile: None,
+            resolved_pricing: None,
         }
     }
 }
@@ -1442,6 +1463,18 @@ impl Config {
             .find(|k| crate::util::safe_equal(&k.key, secret))
     }
 
+    /// The price list a route is billed under.
+    ///
+    /// The cached merge when the config went through [`normalize`], which is
+    /// every config the relay actually serves; a live merge otherwise, so a
+    /// `Config` built by hand in a test prices exactly as it always did.
+    pub fn pricing_for(&self, model: &Model) -> Arc<Pricing> {
+        match &model.resolved_pricing {
+            Some(pricing) => pricing.clone(),
+            None => Arc::new(crate::pricing::resolve(&self.pricing, model)),
+        }
+    }
+
     pub fn tz(&self) -> chrono_tz::Tz {
         match self.parsed_tz {
             Some(tz) => tz,
@@ -2078,7 +2111,27 @@ pub fn normalize(mut cfg: Config) -> Config {
     // look an IANA name up again.
     cfg.parsed_tz = Some(crate::util::parse_tz(&cfg.timezone));
     resolve_tokenizers(&mut cfg);
+    resolve_pricing(&mut cfg);
     cfg
+}
+
+/// Merge each route's price list with the global one once, here, rather than
+/// on every request that reads it.
+///
+/// Two passes for the same reason [`resolve_tokenizers`] takes two: the answer
+/// depends on `cfg.pricing` while the place it is written is `cfg.models`.
+///
+/// Runs after `normalize_pricing` has been over both, so what is cached is the
+/// merge of the two lists as they finally stand rather than as they arrived.
+fn resolve_pricing(cfg: &mut Config) {
+    let decided: Vec<Arc<Pricing>> = cfg
+        .models
+        .iter()
+        .map(|m| Arc::new(crate::pricing::resolve(&cfg.pricing, m)))
+        .collect();
+    for (model, pricing) in cfg.models.iter_mut().zip(decided) {
+        model.resolved_pricing = Some(pricing);
+    }
 }
 
 /// Decide each route's vocabulary and chat profile once, here, rather than on
@@ -2860,5 +2913,129 @@ mod tests {
             "Deepseek-v4-flash-0731"
         );
         assert!(cfg.find_model("Deepseek-v4-flash-0731").is_none());
+    }
+
+    /// The cached merge has to be the same answer the live one gives, or the
+    /// optimisation is a pricing bug that only shows up in production.
+    #[test]
+    fn the_cached_price_list_is_the_merge_it_replaced() {
+        let mut cfg = Config {
+            pricing: Pricing {
+                enabled: true,
+                currency: "USD".into(),
+                input_usd_per_m: 1.0,
+                output_usd_per_m: 2.0,
+                margin_percent: 10.0,
+                refusal_phrases: vec!["i cannot".into()],
+                tiers: vec![PricingTier {
+                    id: "global".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            models: vec![Model {
+                id: "m1".into(),
+                // A route that overrides one rate and adds a tier of its own.
+                pricing: Pricing {
+                    output_usd_per_m: 9.0,
+                    tiers: vec![PricingTier {
+                        id: "route".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg = normalize(cfg);
+
+        let model = &cfg.models[0];
+        assert!(
+            model.resolved_pricing.is_some(),
+            "normalize did not resolve the price list"
+        );
+        let cached = cfg.pricing_for(model);
+        let live = crate::pricing::resolve(&cfg.pricing, model);
+
+        assert_eq!(cached.enabled, live.enabled);
+        assert_eq!(cached.input_usd_per_m, live.input_usd_per_m);
+        assert_eq!(cached.output_usd_per_m, live.output_usd_per_m);
+        assert_eq!(cached.margin_percent, live.margin_percent);
+        assert_eq!(cached.refusal_phrases, live.refusal_phrases);
+        assert_eq!(
+            cached
+                .tiers
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            live.tiers.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        );
+        // The route's own override wins, and the global tier still comes first.
+        assert_eq!(cached.output_usd_per_m, 9.0);
+        assert_eq!(cached.input_usd_per_m, 1.0);
+        assert_eq!(cached.tiers.len(), 2);
+    }
+
+    /// A `Model` nobody normalised still prices, because a test builds one by
+    /// hand and the relay must not depend on a cache that is only ever there
+    /// in production.
+    #[test]
+    fn a_model_built_by_hand_still_prices_without_the_cache() {
+        let cfg = Config {
+            pricing: Pricing {
+                enabled: true,
+                input_usd_per_m: 3.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let model = Model {
+            id: "unnormalised".into(),
+            ..Default::default()
+        };
+        assert!(model.resolved_pricing.is_none());
+        assert_eq!(cfg.pricing_for(&model).input_usd_per_m, 3.0);
+    }
+
+    /// Saving the config has to refresh the cache, or an operator who changes
+    /// a rate would keep billing at the old one until the next restart.
+    #[tokio::test]
+    async fn changing_a_rate_republishes_the_cached_price_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        cfg.pricing.enabled = true;
+        cfg.pricing.input_usd_per_m = 1.0;
+        cfg.backends.push(Backend {
+            id: "be1".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            ..Default::default()
+        });
+        cfg.models.push(Model {
+            id: "m1".into(),
+            backend: "be1".into(),
+            upstream_model: "upstream-1".into(),
+            ..Default::default()
+        });
+        tokio::fs::write(&file, serde_json::to_string(&cfg).unwrap())
+            .await
+            .unwrap();
+
+        let store = ConfigStore::load(&file).await.unwrap();
+        let before = store.current();
+        assert_eq!(before.pricing_for(&before.models[0]).input_usd_per_m, 1.0);
+
+        store
+            .update(serde_json::json!({ "pricing": { "inputUsdPerM": 7.5 } }))
+            .await
+            .unwrap();
+
+        let after = store.current();
+        assert_eq!(
+            after.pricing_for(&after.models[0]).input_usd_per_m,
+            7.5,
+            "the cached price list outlived the rate change"
+        );
     }
 }

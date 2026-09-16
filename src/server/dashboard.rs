@@ -35,6 +35,15 @@ static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/public");
 const COOKIE: &str = "chtting_session";
 const COLLECTIONS: [&str; 4] = ["models", "backends", "keys", "systemPrompts"];
 
+/// How far a row count is allowed to run before it gives up and says "at least
+/// this many".
+///
+/// A pager reads one fact off a count — is there another page — and an exact
+/// answer costs a scan of the whole table to produce it. Ten thousand is far
+/// past any page somebody will actually turn to, and bounds the work whatever
+/// the log has grown to.
+const COUNT_CEILING: i64 = 10_000;
+
 #[derive(Default)]
 pub struct Sessions {
     tokens: RwLock<HashMap<String, i64>>,
@@ -255,8 +264,12 @@ pub fn router(state: Arc<AppState>) -> Router {
 ///   being pointed off-site. `'unsafe-inline'` is granted to styles only,
 ///   because the frontend sets `style` attributes from JavaScript; scripts get
 ///   no such grant.
-/// * **`no-store`** — the responses are the config, the keys and the prompts.
-///   A shared or proxied cache holding any of those is the whole problem.
+/// * **`no-store`** — an API response is the config, the keys and the prompts.
+///   A shared or proxied cache holding any of those is the whole problem. It is
+///   *not* applied to the static assets: they carry no secret, and forbidding
+///   them a cache would mean re-downloading the whole frontend over the tunnel
+///   on every navigation. Those set their own validator instead — see
+///   [`static_files`].
 /// * **nosniff** — a JSON body that a browser decides to treat as HTML is a
 ///   cross-site scripting bug in a response that contains client keys.
 /// * **`no-referrer`** — the tunnel URL is a capability in its own right, and
@@ -282,7 +295,6 @@ async fn security_headers(request: Request, next: Next) -> Response {
         ("x-frame-options", "DENY"),
         ("cross-origin-opener-policy", "same-origin"),
         ("cross-origin-resource-policy", "same-origin"),
-        ("cache-control", "no-store, max-age=0"),
     ] {
         if let (Ok(name), Ok(value)) = (
             axum::http::HeaderName::try_from(name),
@@ -291,6 +303,12 @@ async fn security_headers(request: Request, next: Next) -> Response {
             headers.insert(name, value);
         }
     }
+    // Only where the handler has not already said what it wants. `insert` here
+    // would overwrite the static files' own validator with `no-store`, which
+    // is how a hardening header turns into twenty re-downloads per page load.
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store, max-age=0"));
     response
 }
 
@@ -605,10 +623,24 @@ async fn session(State(dash): State<Arc<Dashboard>>, headers: HeaderMap) -> Resp
 async fn app_state(State(dash): State<Arc<Dashboard>>) -> Response {
     let state = &dash.state;
     let cfg = state.config.current();
+    // `max(rowid)` rather than `count(*)`: the row id is the table's own
+    // integer primary key, so SQLite answers this by reading the last page of
+    // the B-tree instead of walking every row in it. On a relay that has served
+    // a few million requests the count was a full index scan, on the request
+    // the dashboard makes before it can draw anything at all.
+    //
+    // They agree until rows are pruned, after which this is the higher number.
+    // What the screen says is "rows written", which is the honest reading of
+    // it and the one an operator is actually asking — `logging.retentionDays`
+    // is what explains the difference, and it is on the same screen.
     let rows = state
         .store
         .read(|conn| {
-            Ok(conn.query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))?)
+            Ok(
+                conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM requests", [], |r| {
+                    r.get::<_, i64>(0)
+                })?,
+            )
         })
         .await
         .unwrap_or(0);
@@ -1248,11 +1280,27 @@ async fn list_requests(
                 format!("WHERE {}", clauses.join(" AND "))
             };
 
+            // Counted with a ceiling on it. The count exists to draw a pager,
+            // and a pager does not need to know that there are 3 141 592 rows —
+            // it needs to know whether there is another page. Counting exactly
+            // meant a full scan of the table on every page turn, and with a
+            // search term it meant two of them, because `LIKE '%x%'` over three
+            // text columns cannot use an index and the page query has to do the
+            // same work again.
+            //
+            // So the count stops at `COUNT_CEILING`, and the response says
+            // whether it stopped. Bounded work, and the pager still has the one
+            // fact it actually reads.
             let total: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM requests {where_clause}"),
+                &format!(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM requests {where_clause} LIMIT {})",
+                    COUNT_CEILING + 1
+                ),
                 rusqlite::params_from_iter(args.iter()),
                 |r| r.get(0),
             )?;
+            let capped = total > COUNT_CEILING;
+            let total = total.min(COUNT_CEILING);
 
             let sql = format!(
                 "SELECT {} FROM requests {where_clause} ORDER BY ts DESC LIMIT ? OFFSET ?",
@@ -1270,7 +1318,10 @@ async fn list_requests(
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
-            Ok(json!({ "rows": rows, "total": total }))
+            // `atLeast` rather than a different field name for the number:
+            // the frontend reads `total` and would otherwise need to learn a
+            // second shape to keep working.
+            Ok(json!({ "rows": rows, "total": total, "atLeast": capped }))
         })
         .await;
 
@@ -1961,6 +2012,109 @@ async fn tokenizer_count(State(dash): State<Arc<Dashboard>>, Json(body): Json<Va
 ///
 /// The Node version shelled out to a helper script; doing it natively is why
 /// the Rust build needs no Node on the phone at all.
+/// May the relay be asked to fetch this URL?
+///
+/// `tokenizer/install` takes a URL from the caller, and that makes it a request
+/// forgery primitive: whatever the relay can reach, this endpoint can be aimed
+/// at. It is behind the session, so the caller is already the operator — but the
+/// dashboard is reachable from another device now, so "already the operator"
+/// rests on one password rather than on already being on the phone.
+///
+/// The check is narrow on purpose, because a vocabulary mirror on the operator's
+/// own LAN is a legitimate thing to point this at. What is refused is the set of
+/// addresses that are only ever interesting to somebody who is not the operator:
+///
+/// * **loopback** — on Android that is every other app on the device, each with
+///   its own unauthenticated localhost API.
+/// * **link-local**, which is where a cloud instance keeps its credentials at
+///   `169.254.169.254`.
+/// * **anything that is not http(s)** — `file://` would read the phone's disk.
+///
+/// The host is resolved first, so a name that points at one of those is refused
+/// too. This is not a full defence against a DNS answer that changes between
+/// here and the request, and does not pretend to be; it closes the case where
+/// the address was never reachable-by-accident in the first place.
+async fn fetchable(url: &str) -> Result<(), String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("\"{url}\" is not a URL the relay can fetch"))?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(format!(
+            "only http and https URLs can be installed from, not \"{scheme}\""
+        ));
+    }
+
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        // Credentials in the URL are not ours to carry around.
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return Err("that URL has no host".into());
+    }
+    let host = host_only(authority);
+    let port: u16 = match authority.rfind(']') {
+        Some(end) => authority[end + 1..].trim_start_matches(':').parse().ok(),
+        None => authority.split_once(':').and_then(|(_, p)| p.parse().ok()),
+    }
+    .unwrap_or(if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    });
+
+    let refuse = |ip: std::net::IpAddr| -> Option<String> {
+        let what = if ip.is_loopback() {
+            "this device itself"
+        } else if ip.is_unspecified() {
+            "an unspecified address"
+        } else if match ip {
+            std::net::IpAddr::V4(v4) => v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        } {
+            "a link-local address, which is where cloud instances keep their credentials"
+        } else {
+            return None;
+        };
+        Some(format!(
+            "refusing to fetch {url}: it resolves to {ip}, {what}. The relay will fetch \
+             from the internet or from your own network, but not from itself."
+        ))
+    };
+
+    // A literal address needs no lookup, and must not get one — resolving it
+    // would only be a chance to be told something different.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match refuse(ip) {
+            Some(why) => Err(why),
+            None => Ok(()),
+        };
+    }
+
+    let resolved = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| format!("looking up {host} timed out"))?
+    .map_err(|err| format!("cannot resolve {host}: {err}"))?;
+
+    let mut any = false;
+    for addr in resolved {
+        any = true;
+        if let Some(why) = refuse(addr.ip()) {
+            return Err(why);
+        }
+    }
+    if !any {
+        return Err(format!("{host} does not resolve to anything"));
+    }
+    Ok(())
+}
+
 async fn tokenizer_install(
     State(dash): State<Arc<Dashboard>>,
     Json(body): Json<Value>,
@@ -2011,6 +2165,10 @@ async fn tokenizer_install(
             400,
             "the name may only contain letters, digits, dot, dash and underscore",
         );
+    }
+
+    if let Err(why) = fetchable(&url).await {
+        return error(400, &why);
     }
 
     let dir = state.counter.registry.dir().to_path_buf();
@@ -2545,6 +2703,47 @@ async fn playground(State(dash): State<Arc<Dashboard>>, Json(body): Json<Value>)
 
 /* ------------------------------------------------------------- static -- */
 
+/// This build's assets, as one tag.
+///
+/// The frontend is twenty-odd files that always ship together, so there is no
+/// value in a tag per file: they change exactly when the binary does. Hashing
+/// them once and reusing the digest means a revalidation costs a string compare
+/// rather than a hash of every byte served.
+///
+/// Computed on first use rather than at compile time because `include_dir` hands
+/// the contents over at runtime, and once because the answer cannot change
+/// inside a process — a new build is a new process.
+fn asset_etag() -> &'static str {
+    static ETAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ETAG.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+
+        /// Every embedded file, depth first. `include_dir`'s `files()` lists one
+        /// directory's own files, so the subdirectories are walked by hand.
+        fn walk<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a include_dir::File<'a>>) {
+            out.extend(dir.files());
+            for child in dir.dirs() {
+                walk(child, out);
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(&ASSETS, &mut files);
+        // Sorted, so two builds of identical files agree whatever order the
+        // directory happens to be walked in.
+        files.sort_by_key(|file| file.path());
+
+        let mut hasher = Sha256::new();
+        for file in files {
+            hasher.update(file.path().to_string_lossy().as_bytes());
+            hasher.update(file.contents());
+        }
+        let digest = hasher.finalize();
+        let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        format!("\"{hex}\"")
+    })
+}
+
 async fn static_files(request: Request) -> Response {
     let path = request.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -2554,36 +2753,65 @@ async fn static_files(request: Request) -> Response {
         .get_file(path)
         .or_else(|| ASSETS.get_file("index.html"));
 
-    match file {
-        Some(file) => {
-            let mime = match file.path().extension().and_then(|e| e.to_str()) {
-                Some("html") => "text/html; charset=utf-8",
-                Some("js") => "text/javascript; charset=utf-8",
-                Some("css") => "text/css; charset=utf-8",
-                Some("json") => "application/json; charset=utf-8",
-                Some("svg") => "image/svg+xml",
-                Some("png") => "image/png",
-                Some("ico") => "image/x-icon",
-                _ => "application/octet-stream",
-            };
-            // The assets are compiled into the binary, so the binary is the
-            // only version of them there is — but a browser that cached the
-            // last build keeps showing it, and on a phone that cache outlives
-            // any number of restarts. `no-cache` still stores the file; it
-            // just makes the browser ask first, which is what a dashboard that
-            // ships with the binary needs to stay in step with it.
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, mime),
-                    (header::CACHE_CONTROL, "no-cache, must-revalidate"),
-                ],
-                Body::from(file.contents()),
-            )
-                .into_response()
-        }
-        None => error(404, "not found"),
+    let Some(file) = file else {
+        return error(404, "not found");
+    };
+
+    let etag = asset_etag();
+    // The assets are compiled into the binary, so the binary is the only
+    // version of them there is — but a browser that cached the last build keeps
+    // showing it, and on a phone that cache outlives any number of restarts. So
+    // `no-cache` stores the file and makes the browser ask first, and the tag is
+    // what lets that question be answered with 304 and an empty body.
+    //
+    // That matters as soon as the dashboard is reachable over a tunnel: without
+    // a validator, "ask first" means re-sending the whole frontend — the shell,
+    // the stylesheet and twenty ES modules — over a mobile uplink on every
+    // single navigation.
+    let matched = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|given| {
+            given == "*"
+                || given.split(',').any(|candidate| {
+                    // A cache may weaken a tag on the way back, so `W/"x"` has
+                    // to match `"x"` — the bodies are identical either way.
+                    candidate.trim().trim_start_matches("W/") == etag
+                })
+        });
+
+    if matched {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "no-cache, must-revalidate"),
+            ],
+        )
+            .into_response();
     }
+
+    let mime = match file.path().extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "no-cache, must-revalidate"),
+            (header::ETAG, etag),
+        ],
+        Body::from(file.contents()),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
