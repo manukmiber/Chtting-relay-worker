@@ -21,7 +21,9 @@
     "host": "127.0.0.1",
     "port": 8788,
     "password": "",
-    "_tunnel_comment": "Publishes THIS port so the dashboard can be opened from another device. Off by default, and it refuses to start until dashboard.password is at least 16 characters \u2014 behind a tunnel that password is the only thing between the internet and a panel that reveals every client key.",
+    "_publishOnRelay_comment": "Answer the panel under /dashboard on the RELAY's port, so the cloudflared already publishing the relay carries both and there is no second one to run. Off by default: the relay URL is the one you hand to callers, so this puts a sign-in page on it. It will not answer without a dashboard.password of at least 16 characters, and only under this machine's own names, the relay tunnel's hostname, or security.dashboardAllowedHosts \u2014 never on the Wi-Fi address the relay port also listens on.",
+  "publishOnRelay": false,
+  "_tunnel_comment": "The other way to reach the panel from another device: a cloudflared of its own, publishing THIS port, for when the panel should have a URL that is not the callers'. Off by default, and it refuses to start until dashboard.password is at least 16 characters. Off by default, and it refuses to start until dashboard.password is at least 16 characters \u2014 behind a tunnel that password is the only thing between the internet and a panel that reveals every client key.",
     "tunnel": {
       "mode": "off",
       "binary": "cloudflared",

@@ -140,9 +140,53 @@ waiting, peak depth, average wait, and how many were turned away.
 | `port` | `8788` | must differ from `server.port` |
 | `password` | `""` | empty means no sign-in; set one if the phone is shared |
 | `sessionTtlMs` | 7 days | how long a sign-in lasts |
+| `publishOnRelay` | `false` | answer the panel at `/dashboard` on the **relay's** port, so one cloudflared publishes both — see below |
 | `tunnel` | off | a cloudflared of its own, publishing the dashboard port — see below |
 
 ### Reaching the dashboard from another device
+
+Two ways, and the first is usually the answer.
+
+#### One tunnel: `publishOnRelay`
+
+The panel answers under `/dashboard/` on the relay's own port, so the
+cloudflared that is already publishing the relay carries it too — one process
+instead of two, which on a phone is 40-odd MB and one URL rather than two.
+
+Switching it on takes effect on the next request; nothing restarts, and
+switching it off is immediate in the same way. Until then — and again
+afterwards — the path answers exactly what any other unknown path answers, word
+for word, so nothing on that URL advertises that a panel exists.
+
+Three things it will not do, whatever the config says:
+
+* **Answer without a real password.** At least 16 characters, the same floor
+  the dashboard tunnel refuses to start under, for the same reason: the relay's
+  URL is the one handed to callers, and this puts a sign-in page on it.
+* **Answer on the Wi-Fi address.** `server.host` is `0.0.0.0`, so the relay port
+  also answers on the phone's LAN address in plain HTTP to every device on the
+  network. The panel is served only under this machine's own names, the relay
+  tunnel's hostname, and `security.dashboardAllowedHosts`. That check does not
+  go through `dashboardOriginGuard`, which is the operator's to switch off.
+* **Come up under `--no-dashboard`.** That is a decision about the run, and it
+  covers both mounts.
+
+It is the same panel, not a copy: one set of sessions, one sign-in throttle, one
+password-reset code. Signing out, or resetting the password, is true at both
+doors at once. The session cookie is scoped to `Path=/dashboard`, so it is not
+attached to the API calls sharing that origin.
+
+```jsonc
+"dashboard": {
+  "password": "correct-horse-battery-staple",   // 16 characters or more
+  "publishOnRelay": true                        // <relay URL>/dashboard/
+}
+```
+
+#### A second tunnel: `dashboard.tunnel`
+
+For when the panel should have a URL of its own — one that can be stopped
+without taking the relay off the air, and that is not the URL your callers hold.
 
 `dashboard.tunnel` takes the same keys as [`tunnel`](#tunnel) and publishes
 `dashboard.port` instead of `server.port`. It is a **second cloudflared
@@ -192,7 +236,7 @@ running past the process that owned it would keep a URL alive pointing at the
 | `trustProxyHeaders` | `true` | read `CF-Connecting-IP` / `X-Forwarded-For` — correct behind the tunnel |
 | `blockedIps` | `[]` | refused outright |
 | `dashboardOriginGuard` | `true` | refuse dashboard requests from another origin or host |
-| `dashboardAllowedHosts` | `[]` | extra hostnames the dashboard answers to |
+| `dashboardAllowedHosts` | `[]` | extra hostnames the dashboard answers to, at either mount |
 | `privateUserId` | `fingerprint` | what a private key's user id looks like upstream: `fingerprint`, `keyId` or `secret` |
 
 `trustProxyHeaders` is honoured only when the connection itself came from this

@@ -8,8 +8,20 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * Where the API lives, relative to the page.
+ *
+ * The panel answers at the root of its own port and under `/dashboard` on the
+ * relay's — one cloudflared for both — and the same bundle has to work either
+ * way. `new URL('.', href)` is the directory the document was loaded from: `/`
+ * in the first case, `/dashboard/` in the second. Every call below is written
+ * with a leading slash for readability and resolved against that here, so no
+ * call site has to know where it is mounted.
+ */
+const base = () => new URL('.', location.href);
+
 async function request(method, path, body) {
-  const res = await fetch(path, {
+  const res = await fetch(new URL(path.replace(/^\//, ''), base()), {
     method,
     headers: body === undefined ? {} : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),

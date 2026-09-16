@@ -1011,11 +1011,12 @@ Di `http://127.0.0.1:8788`, terikat ke localhost. Vanilla JS, tanpa build step,
 tanpa CDN — dan **ikut ter-compile ke dalam binary**, jadi relay bisa dijalankan
 dari direktori mana pun.
 
-Bindingnya tetap localhost walau kamu mau membukanya dari perangkat lain: yang
-dipakai adalah `dashboard.tunnel`, bukan `dashboard.host: "0.0.0.0"`. Bedanya
-besar — `0.0.0.0` menerbitkannya ke semua perangkat di Wi-Fi itu tanpa TLS dan
-tanpa cara menariknya kembali, sementara tunnel menjangkau loopback dari luar
-lewat TLS, lewat satu proses yang relay ini awasi dan bisa hentikan. Lihat
+Bindingnya tetap localhost walau kamu mau membukanya dari perangkat lain, dan
+jangan diganti ke `dashboard.host: "0.0.0.0"`: itu menerbitkannya ke semua
+perangkat di Wi-Fi itu tanpa TLS dan tanpa cara menariknya kembali. Yang dipakai
+adalah salah satu dari dua jalur ber-TLS lewat cloudflared — `/dashboard` di
+tunnel relay yang sudah hidup (`dashboard.publishOnRelay`, satu proses untuk
+dua-duanya) atau `dashboard.tunnel` yang punya URL sendiri. Lihat
 [bagian Cloudflare Tunnel](#membuka-dashboard-dari-perangkat-lain).
 
 | Tab | Isinya |
@@ -1191,6 +1192,53 @@ tertulis ke buffer log yang ditampilkan dashboard.
 
 ### Membuka dashboard dari perangkat lain
 
+Ada dua cara, dan yang pertama biasanya jawabannya.
+
+#### Satu tunnel saja: `dashboard.publishOnRelay`
+
+Panelnya menjawab di **`<URL relay>/dashboard/`** — lewat cloudflared yang sudah
+menerbitkan relay, jadi tidak ada proses kedua yang harus jalan. Di HP itu
+bedanya nyata: satu cloudflared lagi berarti ~40 MB lagi dan satu URL lagi yang
+harus diingat.
+
+Saklarnya ada di tab **Tunnel**, di dalam kartu Relay tunnel — karena memang
+bukan tunnel kedua yang perlu di-start/stop, cuma satu path lagi di tunnel yang
+sudah hidup. Berlaku di request berikutnya: tidak ada yang restart, dan
+mematikannya juga langsung. Selama belum dinyalakan — dan begitu dimatikan lagi
+— path itu menjawab persis seperti path lain yang tidak ada, kata per kata, jadi
+tidak ada apa pun di URL itu yang memberi tahu bahwa ada panel di sini.
+
+Tiga hal yang tidak akan dilakukannya, apa pun isi config-nya:
+
+- **Menjawab tanpa password yang layak.** Minimal 16 karakter, sama seperti
+  syarat tunnel dashboard boleh menyala, dan alasannya sama: URL relay itu URL
+  yang kamu kasih ke pemanggil, dan ini menaruh halaman login di atasnya.
+- **Menjawab di alamat Wi-Fi.** `server.host` itu `0.0.0.0`, jadi port relay juga
+  menjawab di alamat LAN HP-mu, lewat HTTP polos, ke semua perangkat di jaringan
+  itu. Panelnya tidak disajikan di sana: cuma di nama-nama mesin ini sendiri,
+  hostname tunnel relay, dan `security.dashboardAllowedHosts`. Pemeriksaan ini
+  tidak lewat `dashboardOriginGuard` — yang itu boleh kamu matikan, yang ini
+  bukan hakmu untuk melonggarkan.
+- **Ikut menyala di `--no-dashboard`.** Itu keputusan soal run ini, dan berlaku
+  untuk kedua pintu.
+
+Panelnya sama, bukan salinan: satu kumpulan sesi, satu hitungan salah password,
+satu kode reset. Sign out — atau reset password — berlaku di dua pintu sekaligus.
+Cookie sesinya dibatasi ke `Path=/dashboard`, jadi tidak ikut menempel di
+panggilan API yang berbagi origin yang sama.
+
+```jsonc
+"dashboard": {
+  "password": "correct-horse-battery-staple",   // 16 karakter atau lebih
+  "publishOnRelay": true                        // <URL relay>/dashboard/
+}
+```
+
+#### Tunnel kedua: `dashboard.tunnel`
+
+Buat kalau panelnya memang harus punya URL sendiri — yang bisa dimatikan tanpa
+menurunkan relay, dan yang bukan URL yang dipegang pemanggilmu.
+
 Dashboard punya tunnel sendiri: `dashboard.tunnel`, isinya sama persis dengan
 `tunnel` di atas, tapi yang dipublikasikan adalah `dashboard.port`. Dua proses
 cloudflared terpisah, dua URL terpisah, dan tidak ada konfigurasi yang bisa
@@ -1208,7 +1256,8 @@ config, membaca semua prompt tersimpan, dan mengembalikan setiap client key
 dalam bentuk aslinya. Dashboard memberi tahu alasannya sebelum tombol Start
 ditekan, bukan sesudahnya.
 
-Begitu request datang lewat nama publik dan bukan nama lokal, empat hal berubah:
+Begitu request datang lewat nama publik dan bukan nama lokal — lewat tunnel yang
+mana pun — empat hal berubah:
 
 - penjaga origin menerima nama itu — lewat hostname tunnel yang sedang hidup,
   atau `security.dashboardAllowedHosts`. Penjaganya **tidak dimatikan**: daftar
@@ -1478,8 +1527,17 @@ tanpa menghapus satu baris pun.
   salah membatalkan kodenya, resetnya mengeluarkan semua sesi, dan kalau
   panelnya sedang terpublikasi password barunya tetap wajib 16 karakter.
 - **Dashboard yang dipublikasikan tidak menyala tanpa password 16 karakter.**
-  Lihat bagian Cloudflare Tunnel di atas untuk apa saja yang berubah begitu
-  panel ini bisa dijangkau dari luar HP.
+  Berlaku untuk dua-duanya: tunnel dashboard yang terpisah, dan
+  `dashboard.publishOnRelay` yang menempelkan panel di `/dashboard` pada port
+  relay. Lihat bagian Cloudflare Tunnel di atas untuk apa saja yang berubah
+  begitu panel ini bisa dijangkau dari luar HP.
+- **Panel di port relay cuma menjawab di nama tempat ia diterbitkan.** Port relay
+  mendengarkan di `0.0.0.0`, jadi ia juga menjawab di alamat Wi-Fi HP lewat HTTP
+  polos — `/dashboard` tidak disajikan di sana. Yang dijawab cuma nama mesin ini
+  sendiri, hostname tunnel relay, dan `dashboardAllowedHosts`; pemeriksaan itu
+  tidak ikut mati kalau `dashboardOriginGuard` dimatikan. Kalau belum
+  diterbitkan, path-nya menjawab 404 yang sama persis dengan path tak dikenal
+  mana pun.
 - Setiap respons dashboard membawa CSP (`connect-src 'self'`,
   `frame-ancestors 'none'`, `form-action 'none'`), `nosniff`, `no-referrer`, dan
   `X-Frame-Options: DENY`. Respons API juga `no-store` — isinya config, key, dan

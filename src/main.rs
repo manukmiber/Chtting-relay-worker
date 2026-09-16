@@ -329,7 +329,16 @@ async fn start(paths: Paths, port: Option<u16>, no_dashboard: bool, replace: boo
     });
 
     // The local control panel.
+    //
+    // The same panel is also mounted under `/dashboard` on the relay's port, by
+    // `server::public::router`, for the operator who would rather run one
+    // cloudflared than two. That mount reads the config on every request, but
+    // `--no-dashboard` is a decision about this run rather than a setting, so it
+    // has to be told.
     let mut dashboard_task = None;
+    if no_dashboard {
+        state.panel.suppress();
+    }
     if cfg.dashboard.enabled && !no_dashboard {
         let addr: SocketAddr = format!("{}:{}", cfg.dashboard.host, cfg.dashboard.port).parse()?;
         match listen(addr) {

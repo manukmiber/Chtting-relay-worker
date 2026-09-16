@@ -94,6 +94,11 @@ pub struct AppState {
     /// what used to be a Termux command.
     pub updater: Arc<crate::update::Updater>,
     pub paths: Paths,
+    /// Sessions, sign-in throttle and any live password-reset code for the
+    /// control panel. Here rather than on the router because the panel can be
+    /// served from two listeners at once — see
+    /// [`crate::server::dashboard::Panel`].
+    pub panel: Arc<crate::server::dashboard::Panel>,
     pub stats: Arc<Stats>,
     /// How many calls may be in flight upstream at once, and the line waiting
     /// for a slot. Resized live from the dashboard.
@@ -142,6 +147,7 @@ impl AppState {
             host,
             updater,
             paths,
+            panel: Arc::default(),
             stats,
             gate,
         }))

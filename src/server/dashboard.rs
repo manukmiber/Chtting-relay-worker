@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::config::{mask_item, unmask_secrets, MIN_REMOTE_PASSWORD};
@@ -180,22 +181,45 @@ impl LoginGuard {
     }
 }
 
-pub struct Dashboard {
-    pub state: Arc<AppState>,
+/// Everything the control panel keeps between requests.
+///
+/// It lives on [`AppState`] rather than on the router because the panel is
+/// served from two listeners now: its own loopback port, and — when the
+/// operator publishes it — `/dashboard` on the relay's port, so one cloudflared
+/// carries both. They are the same panel. A session, a lockout or a reset code
+/// that were only true on one of them would be a bug in both directions: a
+/// sign-out that does not sign out, a throttle with twice the budget, and a
+/// reset code on the phone that the screen asking for it has never heard of.
+#[derive(Default)]
+pub struct Panel {
     sessions: Sessions,
     logins: LoginGuard,
     /// The six-digit code a locked-out operator reads off the phone. Nothing
     /// is pending most of the time — see [`crate::reset`].
     recovery: Recovery,
+    /// Set by `start --no-dashboard`, which is a decision about this run rather
+    /// than a setting in the config — so it cannot live in the config, and the
+    /// published mount has to read it from somewhere.
+    suppressed: AtomicBool,
+}
+
+impl Panel {
+    /// There is no panel this run, whatever the config says.
+    pub fn suppress(&self) {
+        self.suppressed.store(true, Ordering::Relaxed);
+    }
+
+    fn is_suppressed(&self) -> bool {
+        self.suppressed.load(Ordering::Relaxed)
+    }
+}
+
+pub struct Dashboard {
+    pub state: Arc<AppState>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let dash = Arc::new(Dashboard {
-        state,
-        sessions: Sessions::default(),
-        logins: LoginGuard::default(),
-        recovery: Recovery::default(),
-    });
+    let dash = Arc::new(Dashboard { state });
 
     Router::new()
         .route("/api/login", post(login))
@@ -330,6 +354,151 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
+/* -------------------------------------------- published on the relay -- */
+
+/// Where the panel answers on the relay's own port, once it is published there.
+pub const RELAY_MOUNT: &str = "/dashboard";
+
+/// The same panel, to be mounted under the relay's public port.
+///
+/// One cloudflared rather than two: the tunnel that is already publishing the
+/// relay carries the panel as well, at `<relay URL>/dashboard/`. The panel
+/// itself is unchanged — same routes, same password, same session store, since
+/// all of that lives on [`Panel`] and not on the router — and everything that
+/// makes this safe to put on the URL callers already have is in [`publish_gate`]
+/// wrapped around it.
+pub fn published(state: Arc<AppState>) -> Router {
+    router(state.clone()).layer(middleware::from_fn_with_state(state, publish_gate))
+}
+
+/// Why the panel is not answering on the relay's port, if it is not.
+///
+/// Read on every request rather than at startup, so publishing it and taking it
+/// back are both immediate: the switch in the dashboard means what it says
+/// without a restart, which matters most when it is being switched *off*.
+pub fn blocked_on_relay(state: &AppState) -> Option<String> {
+    if !state.config.current().dashboard.publish_on_relay {
+        return Some(
+            "not published on the relay tunnel — turn it on under Tunnel, or open the panel on \
+             this device at its own port"
+                .into(),
+        );
+    }
+    relay_publish_obstacle(state)
+}
+
+/// What would still stop it if the switch were on.
+///
+/// Apart from the switch itself, so the Tunnel tab can say "this needs a longer
+/// password" *before* somebody flips it rather than after — the same reason
+/// [`crate::tunnel::TunnelManager`] reports its own `blocked`.
+pub fn relay_publish_obstacle(state: &AppState) -> Option<String> {
+    if state.panel.is_suppressed() {
+        return Some("this relay was started with --no-dashboard".into());
+    }
+    let cfg = state.config.current();
+    if !cfg.dashboard.enabled {
+        return Some("the dashboard is switched off".into());
+    }
+    let len = cfg.dashboard.password.chars().count();
+    if len < MIN_REMOTE_PASSWORD {
+        return Some(format!(
+            "the relay's URL is the one handed to callers, so the panel will not answer on it \
+             without a password of at least {MIN_REMOTE_PASSWORD} characters (this one is {}). \
+             Set one under Settings → Server.",
+            if len == 0 {
+                "not set".to_string()
+            } else {
+                len.to_string()
+            },
+        ));
+    }
+    None
+}
+
+/// Refuse anything the published mount must not answer, as a plain 404.
+///
+/// Two checks, and they are not the same check:
+///
+/// * **Is it published at all** — the switch, the password, `--no-dashboard`.
+/// * **Under what name** — the relay listens on `0.0.0.0`, so the same port
+///   answers on the Wi-Fi address of the phone, in plain HTTP, to every device
+///   on the network. The panel is not served there. Only this machine's own
+///   names, the hostname the tunnel is published at, and
+///   `dashboardAllowedHosts` — the same list the origin guard uses, but checked
+///   here whether or not that guard is switched on, because this one is not the
+///   operator's to relax.
+async fn publish_gate(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let refuse = |why: String| {
+        // Debug, not warn: this path is on a URL that gets scanned, and a log
+        // line per probe is how a log stops being read. The operator sees the
+        // same sentence on the Tunnel tab, which is where they are looking.
+        state
+            .logger
+            .debug(format!("dashboard on the relay port: refused — {why}"));
+        // Word for word what the relay answers for any path it does not serve.
+        // "There is a panel here, it is just switched off" is not a sentence to
+        // publish to whoever is knocking.
+        crate::relay::error_response(404, "no route for that path", "not_found", None)
+    };
+
+    if let Some(why) = blocked_on_relay(&state) {
+        return refuse(why);
+    }
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !answers_to(&state, host) {
+        return refuse(format!("not a name the panel answers to: {host:?}"));
+    }
+    next.run(request).await
+}
+
+/// The path prefix this request came in under, before nesting stripped it.
+///
+/// Empty on the panel's own port, `/dashboard` when it is being served under
+/// the relay's. Anything that has to name a URL back to the browser — the
+/// cookie's `Path`, the redirect in [`static_files`] — needs the address the
+/// browser actually used, not the one the router sees afterwards.
+fn mount_prefix(request: &Request) -> String {
+    let inner = request.uri().path().to_string();
+    let Some(original) = original_path(request) else {
+        return String::new();
+    };
+    original
+        .strip_suffix(&inner)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The full path the browser asked for, nesting included.
+fn original_path(request: &Request) -> Option<String> {
+    request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|axum::extract::OriginalUri(uri)| uri.path().to_string())
+}
+
+/// `Path=` for the session cookie: the prefix the panel is served under, or `/`.
+///
+/// Scoped rather than left at `/`, because on the relay's port `/` is also every
+/// path a caller's client hits. The operator's session has no business riding
+/// along on those requests.
+fn cookie_path(request: &Request) -> String {
+    let prefix = mount_prefix(request);
+    if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        prefix
+    }
+}
+
 /* --------------------------------------------------------------- auth -- */
 
 fn password_set(dash: &Dashboard) -> bool {
@@ -415,28 +584,7 @@ impl Dashboard {
     /// still a fixed list rather than "anything". Publishing the dashboard adds
     /// exactly one name to that list: the one the operator published it at.
     fn answers_to(&self, host: &str) -> bool {
-        if is_local_host(host) {
-            return true;
-        }
-        let name = host_only(host);
-        if name.is_empty() {
-            return false;
-        }
-        if self
-            .state
-            .dashboard_tunnel
-            .public_host()
-            .is_some_and(|live| host_only(&live) == name)
-        {
-            return true;
-        }
-        self.state
-            .config
-            .current()
-            .security
-            .dashboard_allowed_hosts
-            .iter()
-            .any(|allowed| host_only(allowed) == name)
+        answers_to(&self.state, host)
     }
 
     /// Did this request arrive over the tunnel rather than from this machine?
@@ -451,6 +599,41 @@ impl Dashboard {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|host| !is_local_host(host))
     }
+}
+
+/// Is this a name the panel is legitimately reachable at?
+///
+/// This machine's own names always; plus the hostname of whichever tunnel is
+/// up and the names `dashboardAllowedHosts` lists. **Both** tunnels count: the
+/// panel has its own, and it also answers under `/dashboard` on the relay's
+/// hostname when the operator has published it there — a request arriving under
+/// that name is the panel's own page talking to itself, not a stranger's.
+///
+/// Still a fixed list rather than "anything", because a name that resolves to
+/// 127.0.0.1 today can resolve somewhere else tomorrow, and that is what DNS
+/// rebinding is. Publishing adds exactly the name it was published at.
+fn answers_to(state: &AppState, host: &str) -> bool {
+    if is_local_host(host) {
+        return true;
+    }
+    let name = host_only(host);
+    if name.is_empty() {
+        return false;
+    }
+    let live = [
+        state.dashboard_tunnel.public_host(),
+        state.tunnel.public_host(),
+    ];
+    if live.iter().flatten().any(|host| host_only(host) == name) {
+        return true;
+    }
+    state
+        .config
+        .current()
+        .security
+        .dashboard_allowed_hosts
+        .iter()
+        .any(|allowed| host_only(allowed) == name)
 }
 
 /// A `host:port` that names this machine.
@@ -479,12 +662,12 @@ fn authed(dash: &Dashboard, headers: &HeaderMap) -> bool {
     // A read lock on the path every request takes; the write is only for the
     // rare case of a token that has actually run out, which happens once per
     // session rather than once per call.
-    match dash.sessions.tokens.read().get(&token) {
+    match dash.state.panel.sessions.tokens.read().get(&token) {
         Some(expiry) if *expiry > now => return true,
         None => return false,
         Some(_) => {}
     }
-    dash.sessions.tokens.write().remove(&token);
+    dash.state.panel.sessions.tokens.write().remove(&token);
     false
 }
 
@@ -551,6 +734,8 @@ async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response
         &request,
         dash.state.config.current().security.trust_proxy_headers,
     );
+    // Both read before the body consumes the request.
+    let cookie_path = cookie_path(&request);
     let headers = request.headers().clone();
     let body = match read_json(request).await {
         Ok(value) => value,
@@ -563,7 +748,7 @@ async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response
     let remote = dash.is_remote(&headers);
 
     if !expected.is_empty() {
-        if let Err(wait) = dash.logins.check(&caller) {
+        if let Err(wait) = dash.state.panel.logins.check(&caller) {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, wait.to_string())],
@@ -574,7 +759,7 @@ async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response
                 .into_response();
         }
         if !safe_equal(given, expected) {
-            dash.logins.failed(&caller);
+            dash.state.panel.logins.failed(&caller);
             dash.state.logger.warn(format!(
                 "dashboard: wrong password from {caller}{}",
                 if remote { " (over the tunnel)" } else { "" }
@@ -591,14 +776,16 @@ async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response
             "this dashboard is reachable from outside and has no password set;              set one before signing in remotely",
         );
     }
-    dash.logins.succeeded(&caller);
+    dash.state.panel.logins.succeeded(&caller);
 
     let token = random_hex(32);
     let ttl = cfg.dashboard.session_ttl_ms.max(60_000);
     // Signing in is the natural moment to clear out what has expired: it is
     // rare, and it is the only thing that grows the set.
-    dash.sessions.sweep();
-    dash.sessions
+    dash.state.panel.sessions.sweep();
+    dash.state
+        .panel
+        .sessions
         .tokens
         .write()
         .insert(token.clone(), crate::util::now_ms() + ttl);
@@ -609,7 +796,7 @@ async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response
     // and would break signing in over plain `http://127.0.0.1` in any browser
     // that does not treat loopback as a secure context.
     let cookie = format!(
-        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path={cookie_path}; Max-Age={}{}",
         ttl / 1000,
         if remote { "; Secure" } else { "" },
     );
@@ -621,16 +808,18 @@ async fn login(State(dash): State<Arc<Dashboard>>, request: Request) -> Response
         .into_response()
 }
 
-async fn logout(State(dash): State<Arc<Dashboard>>, headers: HeaderMap) -> Response {
+async fn logout(State(dash): State<Arc<Dashboard>>, request: Request) -> Response {
+    let cookie_path = cookie_path(&request);
+    let headers = request.headers().clone();
     if let Some(token) = cookie_value(&headers, COOKIE) {
-        dash.sessions.tokens.write().remove(&token);
+        dash.state.panel.sessions.tokens.write().remove(&token);
     }
     // Cleared with the same attributes it was set with. A browser matches a
     // deletion against name, path and domain — and rejects a `Secure` cookie
     // sent over plain http — so the two have to agree or the cookie survives
     // the sign-out in the one place it matters most.
     let cookie = format!(
-        "{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+        "{COOKIE}=; HttpOnly; SameSite=Strict; Path={cookie_path}; Max-Age=0{}",
         if dash.is_remote(&headers) {
             "; Secure"
         } else {
@@ -672,7 +861,13 @@ async fn password_reset_start(State(dash): State<Arc<Dashboard>>, request: Reque
     }
     let who = caller_address(&request, cfg.security.trust_proxy_headers);
 
-    match dash.recovery.start(&dash.state.paths.data, &who).await {
+    match dash
+        .state
+        .panel
+        .recovery
+        .start(&dash.state.paths.data, &who)
+        .await
+    {
         Ok(started) => {
             dash.state.logger.warn(format!(
                 "dashboard: password reset asked for from {who}; the code is on the device{}",
@@ -760,7 +955,13 @@ async fn password_reset_confirm(State(dash): State<Arc<Dashboard>>, request: Req
         );
     }
 
-    match dash.recovery.check(&dash.state.paths.data, id, &code).await {
+    match dash
+        .state
+        .panel
+        .recovery
+        .check(&dash.state.paths.data, id, &code)
+        .await
+    {
         Verdict::Wrong { attempts_left } => {
             dash.state.logger.warn(format!(
                 "dashboard: wrong reset code from {who}; {attempts_left} left before it is cancelled"
@@ -795,11 +996,11 @@ async fn password_reset_confirm(State(dash): State<Arc<Dashboard>>, request: Req
                 // is not theirs. None of them survives it — including the one
                 // asking, which now signs in with the new password like
                 // anybody else.
-                dash.sessions.tokens.write().clear();
+                dash.state.panel.sessions.tokens.write().clear();
                 // Proving it with the code and then being told to wait out a
                 // lockout would be absurd, and being locked out is half the
                 // reason to be here.
-                dash.logins.clear();
+                dash.state.panel.logins.clear();
                 dash.state.logger.warn(format!(
                     "dashboard: password reset from {who} with the code from the device; \
                      every session was signed out"
@@ -911,7 +1112,7 @@ async fn put_config(State(dash): State<Arc<Dashboard>>, Json(patch): Json<Value>
             // reset code, and one still sitting on the phone would be a second
             // way to change what they have only now chosen.
             if next.dashboard.password != was.dashboard.password {
-                dash.recovery.forget(&state.paths.data).await;
+                dash.state.panel.recovery.forget(&state.paths.data).await;
             }
             Json(state.config.redacted()).into_response()
         }
@@ -2447,6 +2648,29 @@ async fn tunnel_status(State(dash): State<Arc<Dashboard>>) -> Response {
     let mut status = dash.state.tunnel.status();
     if let Some(map) = status.as_object_mut() {
         map.insert("cloudflared".into(), dash.state.tunnel.version().await);
+
+        // The panel riding along on this same tunnel, for operators who would
+        // rather run one cloudflared than two. Reported here rather than under
+        // the dashboard tunnel because it *is* this tunnel: same process, same
+        // URL, one path further along.
+        let cfg = dash.state.config.current();
+        let url = map
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        map.insert(
+            "dashboard".into(),
+            json!({
+                "published": cfg.dashboard.publish_on_relay,
+                "path": format!("{RELAY_MOUNT}/"),
+                "url": (!url.is_empty()).then(|| format!("{url}{RELAY_MOUNT}/")),
+                "blocked": relay_publish_obstacle(&dash.state),
+                "passwordLength": cfg.dashboard.password.chars().count(),
+                "minPasswordLength": MIN_REMOTE_PASSWORD,
+            }),
+        );
     }
     Json(status).into_response()
 }
@@ -2944,6 +3168,19 @@ fn asset_etag() -> &'static str {
 }
 
 async fn static_files(request: Request) -> Response {
+    // The shell at `/dashboard` rather than `/dashboard/` would make every
+    // relative URL inside it resolve one level up — `/css/app.css` on the
+    // relay's port, which is the relay's 404 — so the page would come up naked
+    // and the console would fill with JSON. One redirect is what lets the same
+    // markup work at the root of the panel's own port and under a prefix on
+    // another. Only the mount root: a deeper path already has a directory to
+    // resolve against, and redirecting it would invent one.
+    if request.uri().path() == "/" {
+        if let Some(original) = original_path(&request).filter(|p| !p.ends_with('/')) {
+            return axum::response::Redirect::permanent(&format!("{original}/")).into_response();
+        }
+    }
+
     let path = request.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 

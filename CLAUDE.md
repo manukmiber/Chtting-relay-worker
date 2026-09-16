@@ -84,6 +84,41 @@ no "allow on doubt" path: every uncertainty resolves to not starting.
 Start there when debugging "the key doesn't work". End-to-end coverage is
 in `tests/single_instance.rs`, which starts the real binary twice.
 
+## One panel, two mounts: `/dashboard` on the relay port
+
+`dashboard.publishOnRelay` answers the panel under `RELAY_MOUNT` on the **relay's**
+port, so the cloudflared already publishing the relay carries both and there is
+no second process. `server::public::router` always `nest_service`s it;
+`dashboard::publish_gate` decides per request whether it answers at all.
+
+- **The gate is two checks, and they are not interchangeable.**
+  `blocked_on_relay` is the switch, `dashboard.enabled`, `--no-dashboard` and the
+  16-character password; the second is the `Host`, which must be one of this
+  machine's names, a live tunnel's hostname, or `dashboardAllowedHosts`. The
+  relay port is bound to `0.0.0.0`, so without the host check the panel would be
+  served over plain HTTP on the phone's Wi-Fi address. That check deliberately
+  does **not** consult `dashboardOriginGuard` — the operator may switch that off.
+- **A refusal is the relay's own 404, word for word** (`no route for that path`).
+  This path sits on the URL handed to callers; "there is a panel here, it is just
+  off" is not something to publish. The reason goes to the log at `debug` and to
+  the Tunnel tab, not into the response.
+- **Sessions, the login throttle and the reset code live on `AppState` as
+  `Panel`,** not on the router, precisely because there are two routers now. Two
+  copies would mean a sign-out that does not sign out, twice the guessing budget,
+  and a reset code the other door has never heard of.
+- **The frontend is mount-relative and must stay that way.** `index.html` links
+  `css/app.css` and `js/app.js` without a leading slash, and `api.js` resolves
+  every path against `new URL('.', location.href)`. The one redirect in
+  `static_files` (`/dashboard` → `/dashboard/`, mount root only) is what gives
+  those relative URLs a directory to resolve against. An absolute `/api/...`
+  anywhere in `public/` works on the loopback port and breaks on the relay's.
+- **The session cookie's `Path` is the mount**, derived from `OriginalUri` (the
+  axum `original-uri` feature is enabled for exactly this). `Path=/` would attach
+  the operator's session to every API call sharing that origin. `logout` must
+  clear it with the same `Path` or the cookie outlives the sign-out.
+- `openrouter.path` is refused when it collides with the mount: two routes on one
+  path is a startup panic, and no config value may be able to cause one.
+
 ## The dashboard can now be published, which changes what "loopback" bought
 
 `dashboard.tunnel` is a second cloudflared publishing `dashboard.port`. Before
@@ -93,14 +128,16 @@ knowing before changing it:
 
 - **`tunnel::TunnelManager` has a `Scope`.** Each manager reads its port from
   its own scope, never from an argument, so no configuration can make one
-  tunnel publish the other's port. Keep it that way.
+  tunnel publish the other's port. Keep it that way. (`publishOnRelay` does not
+  bend this: it adds a path to the relay's own server, and no tunnel changes
+  which port it publishes.)
 - **`TunnelManager::start` refuses the dashboard scope without a password of
   `config::MIN_REMOTE_PASSWORD` characters.** The check is at start rather than
   at save, because a config that *describes* a dashboard tunnel is fine to
   store; the moment that matters is the moment a process begins accepting from
   the internet.
-- **The origin guard is widened, not disabled.** `Dashboard::answers_to` accepts
-  this machine's names, the live tunnel's hostname, and
+- **The origin guard is widened, not disabled.** `answers_to` accepts this
+  machine's names, **either** tunnel's live hostname, and
   `security.dashboardAllowedHosts`. Do not "fix" a remote-access problem by
   turning `dashboardOriginGuard` off.
 - **The session cookie is `Secure` only for a non-local `Host`.** Setting it

@@ -42,11 +42,32 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(DEFAULT_PROVIDER_PATH, get(provider_models));
 
     let custom = cfg.openrouter.path.trim();
-    if custom.starts_with('/') && custom != DEFAULT_PROVIDER_PATH {
+    // A custom listing path that collides with the panel's mount would be two
+    // routes on one path, which axum answers by panicking at startup — a config
+    // value must never be able to do that. The listing keeps its default; the
+    // log says why, since silently moving somebody's published URL is worse.
+    let collides = custom == super::dashboard::RELAY_MOUNT
+        || custom.starts_with(&format!("{}/", super::dashboard::RELAY_MOUNT));
+    if custom.starts_with('/') && custom != DEFAULT_PROVIDER_PATH && !collides {
         router = router.route(custom, get(provider_models));
+    } else if collides {
+        state.logger.warn(format!(
+            "openrouter.path {custom:?} is where the dashboard is mounted on this port; \
+             the listing stays at {DEFAULT_PROVIDER_PATH}"
+        ));
     }
 
     router
+        // The control panel, on the relay's own port, so the cloudflared that
+        // is already publishing the relay carries the panel too and there is no
+        // second one to run. Always mounted and almost never answering: the
+        // gate inside reads the switch, the password and the `Host` on every
+        // request, so this is a 404 until the operator publishes it — and a 404
+        // again the moment they take it back.
+        .nest_service(
+            super::dashboard::RELAY_MOUNT,
+            super::dashboard::published(state.clone()),
+        )
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(limit))
         // Outermost, so it covers the routes, the fallback and the body limit

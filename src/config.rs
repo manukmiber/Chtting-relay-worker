@@ -196,12 +196,30 @@ pub struct DashboardConfig {
     pub port: u16,
     pub password: String,
     pub session_ttl_ms: i64,
+    /// Answer the panel under `/dashboard` on the **relay's** port, so the
+    /// tunnel that is already up publishes both.
+    ///
+    /// One cloudflared instead of two: on a phone the second process is another
+    /// ~40 MB and another URL to keep track of, and most operators only ever
+    /// wanted to open the panel from their laptop.
+    ///
+    /// Off by default, because it changes who can knock on the panel's door.
+    /// The relay's URL is the one handed to callers; this puts a sign-in page
+    /// on it. What keeps that honest is in [`crate::server::dashboard`]: the
+    /// path is refused outright unless the password is at least
+    /// [`MIN_REMOTE_PASSWORD`] characters, and it is only answered under this
+    /// machine's own names, the relay tunnel's hostname, or
+    /// `security.dashboardAllowedHosts` — never on the Wi-Fi address the relay
+    /// port also listens on.
+    pub publish_on_relay: bool,
     /// A cloudflared of its own, publishing the dashboard port.
     ///
-    /// Off by default, and it refuses to start without a password of at least
-    /// [`MIN_REMOTE_PASSWORD`] characters — see [`crate::tunnel`]. The relay's
-    /// own tunnel is configured separately under `tunnel`, and the two never
-    /// share a process, a URL or a hostname.
+    /// The other way to reach the panel from another device, and the one to
+    /// pick when the panel should have a hostname of its own rather than live
+    /// under the URL callers already have. Off by default, and it refuses to
+    /// start without a password of at least [`MIN_REMOTE_PASSWORD`] characters
+    /// — see [`crate::tunnel`]. The relay's own tunnel is configured separately
+    /// under `tunnel`, and the two never share a process, a URL or a hostname.
     pub tunnel: TunnelConfig,
 }
 
@@ -213,6 +231,7 @@ impl Default for DashboardConfig {
             port: 8788,
             password: String::new(),
             session_ttl_ms: 7 * 24 * 60 * 60 * 1000,
+            publish_on_relay: false,
             tunnel: TunnelConfig::off(),
         }
     }

@@ -2075,3 +2075,326 @@ async fn there_is_nothing_to_reset_when_no_password_is_set() {
     assert_eq!(refused.status(), 400);
     assert!(!chtting_relay::reset::code_file_in(&d.relay.state.paths.data).exists());
 }
+
+/* ------------------------------------------- the panel on the relay port -- */
+
+/// A client with a cookie jar, pointed at the relay's port — where the panel is
+/// mounted under `/dashboard` when the operator publishes it there.
+fn browser() -> reqwest::Client {
+    reqwest::Client::builder()
+        .cookie_store(true)
+        // The redirect is the thing under test in one of these, so never follow
+        // one by accident.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+/// A long enough password for anything that faces the internet.
+const LONG_PASSWORD: &str = "correct-horse-battery-staple";
+
+/// The switch is what publishes it, and until it is flipped the path is not
+/// there at all — answered word for word like any other unknown path, because
+/// this is the URL callers have.
+#[tokio::test]
+async fn the_panel_is_not_on_the_relay_port_until_it_is_published() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.enabled = true;
+        cfg.dashboard.password = LONG_PASSWORD.into();
+    })
+    .await;
+    let relay = &d.relay;
+
+    let refused = browser()
+        .get(relay.url("/dashboard/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 404);
+    let hidden = refused.text().await.unwrap();
+
+    let elsewhere = browser()
+        .get(relay.url("/nothing-here"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        hidden,
+        elsewhere.text().await.unwrap(),
+        "a switched-off panel must not be distinguishable from a path that does not exist"
+    );
+
+    // Published — and it answers, with no restart in between.
+    d.relay
+        .state
+        .config
+        .update(json!({ "dashboard": { "publishOnRelay": true } }))
+        .await
+        .unwrap();
+
+    let page = browser()
+        .get(relay.url("/dashboard/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(page
+        .text()
+        .await
+        .unwrap()
+        .contains("chtting-relay dashboard"));
+}
+
+/// The relay's URL is the one handed to callers. Putting a sign-in page on it
+/// is only safe behind a password that survives being found.
+#[tokio::test]
+async fn publishing_the_panel_needs_a_password_that_holds_up() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.enabled = true;
+        cfg.dashboard.password = "short".into();
+        cfg.dashboard.publish_on_relay = true;
+    })
+    .await;
+
+    assert_eq!(
+        browser()
+            .get(d.relay.url("/dashboard/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "a five-character password must not be published to the internet"
+    );
+
+    // And the operator is told why, on the tab where the switch is.
+    assert_eq!(
+        d.post("/api/login", json!({ "password": "short" }))
+            .await
+            .status(),
+        200
+    );
+    let status = d.get_json("/api/tunnel").await;
+    assert_eq!(status["dashboard"]["published"], true);
+    assert_eq!(status["dashboard"]["minPasswordLength"], 16);
+    assert!(
+        status["dashboard"]["blocked"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("16 characters"),
+        "{status}"
+    );
+}
+
+/// Signing in over the published mount, and the cookie that comes back: scoped
+/// to `/dashboard`, so the operator's session does not ride along on the API
+/// paths that strangers with a client key are calling on the same origin.
+#[tokio::test]
+async fn the_published_panel_signs_in_with_a_cookie_scoped_to_its_mount() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.enabled = true;
+        cfg.dashboard.password = LONG_PASSWORD.into();
+        cfg.dashboard.publish_on_relay = true;
+    })
+    .await;
+    let client = browser();
+
+    assert_eq!(
+        client
+            .get(d.relay.url("/dashboard/api/state"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "the password still applies out here"
+    );
+
+    let signed_in = client
+        .post(d.relay.url("/dashboard/api/login"))
+        .json(&json!({ "password": LONG_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_in.status(), 200);
+    let cookie = signed_in
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cookie.contains("Path=/dashboard"), "{cookie}");
+    assert!(cookie.contains("HttpOnly"), "{cookie}");
+
+    assert_eq!(
+        client
+            .get(d.relay.url("/dashboard/api/state"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // The relay is still a relay: mounting a panel on its port must not have
+    // moved anything a caller uses.
+    assert_eq!(d.relay.get("/v1/models").await.status(), 200);
+}
+
+/// The relay port listens on every interface, so the same port answers on the
+/// phone's Wi-Fi address in plain HTTP to everything on the network. The panel
+/// is not served there — and that check does not go through the origin guard,
+/// which the operator is allowed to switch off.
+#[tokio::test]
+async fn the_published_panel_answers_only_at_the_names_it_was_published_at() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.enabled = true;
+        cfg.dashboard.password = LONG_PASSWORD.into();
+        cfg.dashboard.publish_on_relay = true;
+        cfg.tunnel.hostname = "api.example.com".into();
+        cfg.security.dashboard_origin_guard = false;
+    })
+    .await;
+
+    for host in ["192.168.1.50:8787", "somebody-elses.example"] {
+        let refused = browser()
+            .get(d.relay.url("/dashboard/"))
+            .header("host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 404, "{host} was answered");
+    }
+
+    for host in ["api.example.com", "127.0.0.1"] {
+        let allowed = browser()
+            .get(d.relay.url("/dashboard/"))
+            .header("host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200, "{host} was refused");
+    }
+}
+
+/// Served at `/dashboard`, every relative URL in the shell would resolve one
+/// level up and the page would arrive with no stylesheet and no script. One
+/// redirect is what makes the same markup work at both mounts.
+#[tokio::test]
+async fn the_shell_redirects_so_its_assets_resolve_under_the_prefix() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.enabled = true;
+        cfg.dashboard.password = LONG_PASSWORD.into();
+        cfg.dashboard.publish_on_relay = true;
+    })
+    .await;
+
+    let redirect = browser()
+        .get(d.relay.url("/dashboard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), 308);
+    assert_eq!(
+        redirect.headers().get("location").unwrap(),
+        "/dashboard/",
+        "the shell has to sit on a path its relative URLs can resolve against"
+    );
+
+    // And the assets are where the redirected page will look for them.
+    for asset in ["/dashboard/css/app.css", "/dashboard/js/app.js"] {
+        assert_eq!(
+            browser()
+                .get(d.relay.url(asset))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200,
+            "{asset}"
+        );
+    }
+}
+
+/// `--no-dashboard` is a decision about this run rather than a setting in the
+/// config, so the published mount has to be told rather than reading it.
+#[tokio::test]
+async fn no_dashboard_takes_the_published_mount_with_it() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.enabled = true;
+        cfg.dashboard.password = LONG_PASSWORD.into();
+        cfg.dashboard.publish_on_relay = true;
+    })
+    .await;
+    assert_eq!(
+        browser()
+            .get(d.relay.url("/dashboard/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    d.relay.state.panel.suppress();
+    assert_eq!(
+        browser()
+            .get(d.relay.url("/dashboard/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+
+/// One panel, two doors. A password reset asked for at one of them is the same
+/// reset at the other, and signing everything out means everything.
+#[tokio::test]
+async fn both_mounts_share_one_panel() {
+    let d = Dash::start(|cfg| {
+        cfg.dashboard.enabled = true;
+        cfg.dashboard.password = LONG_PASSWORD.into();
+        cfg.dashboard.publish_on_relay = true;
+    })
+    .await;
+
+    // Signed in on the panel's own port.
+    assert_eq!(
+        d.post("/api/login", json!({ "password": LONG_PASSWORD }))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(d.get("/api/state").await.status(), 200);
+
+    // A reset carried out at the published mount, with the code off the phone.
+    let started: Value = browser()
+        .post(d.relay.url("/dashboard/api/password-reset"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let code = code_on_the_phone(&d).await;
+    assert_eq!(
+        browser()
+            .post(d.relay.url("/dashboard/api/password-reset/confirm"))
+            .json(&json!({
+                "id": started["id"],
+                "code": code,
+                "password": "a-long-enough-replacement",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // The session held on the other port is gone with the rest.
+    assert_eq!(d.get("/api/state").await.status(), 401);
+}

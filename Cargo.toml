@@ -20,7 +20,11 @@ path = "src/main.rs"
 # concurrent callers are spread over every core instead of one event loop.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util", "sync", "fs"] }
 tokio-stream = "0.1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
+# `original-uri` is what lets the dashboard know it is being served under
+# `/dashboard` on the relay's port rather than at the root of its own, which
+# decides the cookie path and the one redirect that makes relative asset URLs
+# resolve.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path", "original-uri"] }
 tower = { version = "0.5", default-features = false }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
