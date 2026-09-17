@@ -23,7 +23,7 @@ do
   if [ -z "$BIN" ] || [ "$candidate" -nt "$BIN" ]; then BIN="$candidate"; fi
 done
 if [ -z "$BIN" ]; then
-  echo "not built yet — run: bash scripts/install-termux.sh" >&2
+  echo "not built yet — run: bash install.sh" >&2
   exit 1
 fi
 

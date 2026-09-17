@@ -109,11 +109,9 @@ jobs:
           cat > dist/NOTES.md <<'EOF'
           Prebuilt binaries for Termux — no Rust toolchain and no Node needed on the phone.
 
-          ```bash
-          bash scripts/install-termux.sh
-          ```
-
-          That downloads the right binary for your device. To grab one by hand:
+          The installer does not use these: `bash install.sh` pulls, upgrades
+          Termux's packages and builds from source, every time. These assets are
+          for skipping that build and dropping a binary in by hand:
 
           | Device | Asset |
           |---|---|

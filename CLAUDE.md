@@ -248,6 +248,42 @@ report every invoice already on disk as tampered with. New fields go behind a
 new version, and `invoice::ADDED_COLUMNS` carries the defaults that make an old
 row read correctly.
 
+## `install.sh` is at the repo root, rewrites itself, and always compiles
+
+One script installs and updates: `bash install.sh` does `git pull --ff-only`
+→ `pkg update` + `pkg upgrade` + build deps → `cargo build` → config, key,
+`setup`, start. Re-running it *is* the update, so there is no second command
+and nothing to keep in sync with one.
+
+- **It re-execs itself after a pull that changed it.** Bash reads a script in
+  blocks rather than all at once, so a `git pull` that rewrites the file the
+  interpreter is still reading runs nonsense from the middle of the new copy.
+  The script sha256s itself before the pull, compares after, and hands over
+  with `CHTTING_INSTALL_REEXEC=1 exec bash "$SELF" "$@"` when the hash moved —
+  which is also what stops that handover being a loop. `$SELF` is resolved to
+  an absolute path *before* the `cd`, because a relative `$0` stops meaning
+  anything once the working directory changes. Do not "simplify" any of those
+  three away.
+- **A failed pull is not a failed install.** A checkout with local commits
+  cannot fast-forward; the script says so and builds what is there. Only the
+  build-dependency install is allowed to end the run — `pkg update` and
+  `pkg upgrade` are best-effort, because a bad mirror is not a reason to refuse
+  to build with the toolchain already on the device.
+- **There is no prebuilt-download path any more, and its absence is deliberate.**
+  The old script asked the GitHub releases API for an asset matching the
+  device's triple, verified a checksum and untarred it. That was the bulk of the
+  script and it is gone: installing compiles. The release workflow still
+  publishes the tarballs, for dropping a binary in by hand — the release notes
+  say so, and they must not go back to claiming the installer uses them.
+- **The profile the script picks is the profile the device keeps.**
+  `release-small` with `-j1` under 4 cores or 4 GB, `release` otherwise. The
+  dashboard's update button rebuilds with whatever profile the *running* binary
+  sits in (`Updater::profile()`), so changing this heuristic changes which
+  directory a phone rebuilds into from then on.
+- Runtime state is what makes the pull safe: `config/config.json`, `data/` and
+  the logs are gitignored, so no pull can touch the live config, the database
+  or the keys.
+
 ## Repo conventions worth knowing
 
 - Rust workspace, single binary `chtting-relay` (`src/main.rs`) +
