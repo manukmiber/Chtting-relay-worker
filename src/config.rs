@@ -462,6 +462,11 @@ impl LangfuseConfig {
     /// Not the `/api/public/ingestion` one: Langfuse's own API document marks
     /// that deprecated, and on Langfuse Cloud it stops accepting traces and
     /// observations when v4-only write mode begins on 2026-11-16.
+    ///
+    /// The endpoint is the same on v3 and v4; what selects v4's ingestion path
+    /// is the `x-langfuse-ingestion-version` header the exporter sends with
+    /// every batch. See [`crate::langfuse`] for why that header is not
+    /// optional in practice.
     pub fn traces_url(&self) -> String {
         format!(
             "{}/api/public/otel/v1/traces",

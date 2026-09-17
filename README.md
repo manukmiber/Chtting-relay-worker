@@ -813,6 +813,37 @@ di Langfuse Cloud endpoint itu berhenti menerima trace saat mode tulis v4-only
 mulai **16 November 2026**. JSON protobuf juga berarti tidak perlu `prost` dan
 tidak perlu codegen saat build — cuma `serde_json` dan `reqwest` yang sudah ada.
 
+Setiap batch membawa header **`x-langfuse-ingestion-version: 4`**. Tanpa header
+itu span-nya tetap diterima, tapi lewat jalur kompatibilitas lama — dan bisa
+**telat sampai lima belas menit** muncul di data model v4 maupun di API
+Observations/Metrics v2. Trace di sini dibaca sewaktu request-nya masih di layar
+orang, jadi telat seperempat jam sama saja dengan hilang. Langfuse versi lama
+yang belum mengenal header itu mengabaikannya, jadi `host` self-hosted lama tidak
+dirugikan.
+
+Yang membuat span-nya benar-benar **berbentuk v4**, bukan cuma lewat jalurnya:
+
+- **Input dan output menempel di observation**, yaitu
+  `langfuse.observation.input` / `…output` — bukan `langfuse.trace.input` /
+  `…output`. Di v4 tidak ada entitas trace terpisah: trace itu kumpulan
+  observation dengan trace id yang sama, dan input/output milik root observation
+  **adalah** input/output keseluruhan trace-nya. Atribut trace yang lama cuma
+  disisakan supaya evaluator LLM-as-a-judge level-trace bikinan sebelum v4 masih
+  jalan; relay ini tidak mengirimnya, jadi **evaluator yang diarahkan ke trace
+  input/output tidak akan jalan** — arahkan ke root observation-nya.
+- **Semua yang dipakai untuk filter ada di span itu sendiri**, tidak di
+  induknya: `langfuse.user.id`, `langfuse.session.id`, `langfuse.trace.name`,
+  `langfuse.trace.tags`, `langfuse.environment`, `langfuse.release`, dan
+  `langfuse.version` (string yang sama dengan `release`, di bawah nama yang
+  dipakai tabel observation untuk mengelompokkan). Satu request = satu span,
+  yang sekaligus root observation **dan** generation pembawa biaya — jadi
+  sekarang gratis, dan itu juga alasan span kedua di sini nanti harus diberi set
+  yang sama, bukan mewarisinya.
+- **Satu span id dikirim sekali saja**, setelah request-nya selesai. v4 tidak
+  menjamin dedup span id yang sudah diterima: mengirim ulang untuk mengoreksi
+  justru membuat observation **kedua** dan menggelembungkan semua hitungan yang
+  diambil darinya.
+
 Yang **tidak pernah** ikut:
 
 - **Key apa pun.** Private key yang `privateUserId`-nya `secret` dikirim sebagai

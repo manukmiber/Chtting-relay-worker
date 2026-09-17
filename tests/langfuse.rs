@@ -23,12 +23,16 @@ use std::time::Duration;
 struct Collector {
     batches: Arc<Mutex<Vec<Value>>>,
     auth: Arc<Mutex<Vec<String>>>,
+    /// `x-langfuse-ingestion-version` as it arrived, per POST. Empty string
+    /// for a POST that did not carry it, which is the failure this records.
+    version: Arc<Mutex<Vec<String>>>,
 }
 
 struct FakeLangfuse {
     url: String,
     batches: Arc<Mutex<Vec<Value>>>,
     auth: Arc<Mutex<Vec<String>>>,
+    version: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeLangfuse {
@@ -36,6 +40,7 @@ impl FakeLangfuse {
         let state = Collector {
             batches: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(Vec::new())),
+            version: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
             .route(
@@ -47,6 +52,13 @@ impl FakeLangfuse {
                         state.auth.lock().push(
                             headers
                                 .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                        state.version.lock().push(
+                            headers
+                                .get("x-langfuse-ingestion-version")
                                 .and_then(|v| v.to_str().ok())
                                 .unwrap_or("")
                                 .to_string(),
@@ -68,6 +80,7 @@ impl FakeLangfuse {
             url: format!("http://{addr}"),
             batches: state.batches,
             auth: state.auth,
+            version: state.version,
         }
     }
 
@@ -231,6 +244,152 @@ async fn a_relayed_request_arrives_at_langfuse_with_input_injection_and_output()
         .unwrap()
     };
     assert_eq!(decoded, "pk-lf-test:sk-lf-secret");
+
+    // And the header that puts the batch on v4's ingestion path. Without it
+    // Langfuse accepts the span and then takes up to fifteen minutes to show
+    // it on the v4 data model and the v2 APIs, which for a trace read while
+    // the request is still on somebody's screen is the same as losing it.
+    assert_eq!(
+        langfuse.version.lock().first().cloned().unwrap_or_default(),
+        "4",
+        "every POST carries x-langfuse-ingestion-version: 4"
+    );
+}
+
+/// v4 has no trace input or output: a trace is just the observations sharing a
+/// trace id, and the root observation's pair is the overall one. The deprecated
+/// attributes survive only for trace-level evaluators written before v4, so
+/// what matters here is that they do not go out at all.
+#[tokio::test]
+async fn the_overall_words_arrive_on_the_root_observation_and_not_on_the_trace() {
+    let langfuse = FakeLangfuse::start().await;
+    let host = langfuse.url.clone();
+
+    let relay = harness(
+        MockConfig {
+            reply: "basalt, mostly".into(),
+            ..Default::default()
+        },
+        move |cfg| {
+            cfg.langfuse = chtting_relay::config::LangfuseConfig {
+                enabled: true,
+                host,
+                public_key: "pk-lf-test".into(),
+                secret_key: "sk-lf-secret".into(),
+                flush_interval_ms: 250,
+                batch_size: 1,
+                release: "v4-canary".into(),
+                ..Default::default()
+            };
+        },
+    )
+    .await;
+
+    let response = relay
+        .post(
+            "/v1/chat/completions",
+            json!({
+                "model": "manukmiberai/creative-writer",
+                "messages": [{"role": "user", "content": "what is the moon made of?"}],
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let spans = langfuse.wait_for(1).await;
+    let span = &spans[0];
+
+    // The root observation carries the overall request and response.
+    assert!(
+        text(span, "langfuse.observation.input").contains("what is the moon made of?"),
+        "{span}"
+    );
+    assert_eq!(text(span, "langfuse.observation.output"), "basalt, mostly");
+    // It is a root: one span, nothing parenting it.
+    assert!(
+        span.get("parentSpanId").is_none(),
+        "the one span of a trace has to be its root"
+    );
+
+    // The deprecated pair never reaches the wire, under any key.
+    let posted = serde_json::to_string(&*langfuse.batches.lock()).unwrap();
+    for deprecated in ["langfuse.trace.input", "langfuse.trace.output"] {
+        assert!(
+            !posted.contains(deprecated),
+            "{deprecated} is deprecated in v4 and was still exported"
+        );
+    }
+
+    // What v4 filters observations by has to be on the observation, including
+    // the version the deploy is pinned to.
+    assert_eq!(text(span, "langfuse.release"), "v4-canary");
+    assert_eq!(text(span, "langfuse.version"), "v4-canary");
+    assert_eq!(text(span, "langfuse.environment"), "production");
+    assert_eq!(text(span, "langfuse.trace.name"), "v1/chat/completions");
+    assert!(!text(span, "langfuse.session.id").is_empty(), "{span}");
+}
+
+/// A span Langfuse has already accepted is never sent again: v4 does not
+/// deduplicate a repeated span id on the read path, so a second copy becomes a
+/// second observation and every count drawn from it is wrong.
+#[tokio::test]
+async fn a_span_id_is_exported_exactly_once() {
+    let langfuse = FakeLangfuse::start().await;
+    let host = langfuse.url.clone();
+
+    let relay = harness(MockConfig::default(), move |cfg| {
+        cfg.langfuse = chtting_relay::config::LangfuseConfig {
+            enabled: true,
+            host,
+            public_key: "pk-lf-test".into(),
+            secret_key: "sk-lf-secret".into(),
+            flush_interval_ms: 250,
+            batch_size: 1,
+            ..Default::default()
+        };
+    })
+    .await;
+
+    for _ in 0..3 {
+        let response = relay
+            .post(
+                "/v1/chat/completions",
+                json!({
+                    "model": "manukmiberai/creative-writer",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 200);
+    }
+
+    let spans = langfuse.wait_for(3).await;
+    assert_eq!(spans.len(), 3, "three requests, three spans");
+
+    let mut ids: Vec<String> = spans
+        .iter()
+        .map(|s| s["spanId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let posted = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), posted, "a span id was exported twice");
+
+    let mut traces: Vec<String> = spans
+        .iter()
+        .map(|s| s["traceId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    traces.sort();
+    traces.dedup();
+    assert_eq!(traces.len(), posted, "two requests shared a trace id");
+
+    // Every batch, not just the first, is on the v4 path.
+    let versions = langfuse.version.lock().clone();
+    assert!(!versions.is_empty());
+    assert!(
+        versions.iter().all(|v| v == "4"),
+        "a POST went out without the v4 ingestion header: {versions:?}"
+    );
 }
 
 /// A trace is a third party. Neither the caller's key nor the backend's may

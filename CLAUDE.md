@@ -203,6 +203,42 @@ Two invariants the tests pin:
   `security.privateUserId: "secret"` is fingerprinted, and `redact_body` strips
   the fields a client key can be written into.
 
+### The span is v4-shaped, and three parts of that are load-bearing
+
+Langfuse v4 is observations-first: no separately ingested trace entity, just
+spans sharing a trace id, and the UI and the v2 APIs query *observations*. What
+that buys is only real if the span keeps these three properties, each pinned by
+a test in `src/langfuse.rs` and `tests/langfuse.rs`:
+
+- **`x-langfuse-ingestion-version: 4` on every POST.** Not optional in
+  practice: without it Langfuse takes the span and then routes it down the
+  legacy compatibility path, where it can be up to fifteen minutes late to the
+  v4 data model and the v2 Observations/Metrics APIs. These traces are read
+  while the request is still on somebody's screen. A Langfuse predating the
+  header ignores it, so a self-hosted `host` on an older version is not a
+  reason to drop it.
+- **Input and output on `langfuse.observation.*`, never `langfuse.trace.*`.**
+  The one span *is* the root observation, so its pair already is the trace's
+  overall pair. `langfuse.trace.input`/`output` are deprecated and alive only
+  for trace-level LLM-as-a-judge evaluators written before v4 — do not add them
+  back to make such an evaluator fire. Migrate the evaluator to the root
+  observation instead; a v4 observation evaluator cannot read siblings or
+  children, so whatever it needs has to be on the one span.
+- **Correlating attributes on the span, not on a parent.** `langfuse.user.id`,
+  `langfuse.session.id`, `langfuse.trace.name`, `langfuse.trace.tags`,
+  `langfuse.environment`, `langfuse.release` and `langfuse.version` are what v4
+  filters and aggregates observations by. One span per trace — which is both
+  the root and the cost-bearing generation, so session cost is right by
+  construction — makes this free today. **A second span added here has to be
+  given the same set**; it will not inherit them, and metadata has to keep
+  using the `langfuse.observation.metadata.<key>` prefix or it lands in the
+  unfilterable `metadata.attributes` catch-all.
+
+And one thing not to do: a span id is exported **once**, after the request has
+ended. v4 does not reliably deduplicate a span id it already accepted, so
+re-exporting one to correct it creates a second observation and inflates every
+count drawn from it.
+
 ## Invoice hashing is versioned — do not add a field to `canonical()` blindly
 
 `Invoice::canonical()` branches on `hash_version`. Version 1 is the byte-for-byte
