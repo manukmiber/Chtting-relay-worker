@@ -54,23 +54,42 @@ Yang keluar dari relay ini tidak menyisakan jejak backend sama sekali:
 pkg install git
 git clone https://github.com/manukmiber/Chtting-relay-worker
 cd Chtting-relay-worker
-bash scripts/install-termux.sh
+bash install.sh
 ```
 
-Tiga baris itu saja. Script-nya **mengunduh binary siap pakai** untuk CPU HP-mu
-kalau rilisnya ada (checksum diverifikasi), membuat config awal, mencetak client
-key pertama, memasang keeper + shortcut layar utama + hook boot, lalu
-menjalankan relay-nya.
+Empat baris, dan **`bash install.sh` itu juga cara update-nya.** Setiap kali
+dijalankan script-nya melakukan urutan yang sama:
 
-Kalau belum ada rilis yang cocok, script otomatis build dari source:
+| | Yang dikerjakan |
+|---|---|
+| **1** | `git pull --ff-only` — ambil commit terbaru |
+| **2** | `pkg update` + `pkg upgrade` — paket Termux naik versi, lalu `rust`, `clang`, `binutils`, `pkg-config` dipastikan ada |
+| **3** | `cargo build` — compile dari source |
+| **4** | config awal, client key pertama, keeper + shortcut layar utama + hook boot, lalu relay-nya jalan |
 
-> **Build dari source lama** — 5 sampai 15 menit di HP, sekali saja. Yang
-> dipasang cuma `rust` dan `clang`; tidak ada cmake, tidak ada Go, tidak ada
-> Node. Kalau core-nya sedikit script otomatis pakai `-j1` supaya tidak
-> kehabisan RAM. Mau memaksa build sendiri: `bash scripts/install-termux.sh --build`.
+Jadi tidak ada perintah update yang harus diingat: **jalankan ulang baris yang
+sama.** Kalau script-nya sendiri ikut berubah waktu di-pull, dia menyerahkan
+prosesnya ke versi baru itu di tengah jalan — bukan meneruskan pakai versi lama
+yang sudah dibaca separuh.
 
-Binary rilis dibuat untuk **arm64** (hampir semua HP sejak ~2016) dan **armv7**
-(HP 32-bit). Keduanya binary Android asli, bukan emulasi.
+> **Compile-nya 5 sampai 15 menit** di HP untuk yang pertama, setelah itu jauh
+> lebih cepat karena `target/` sudah terisi. Yang dipasang cuma `rust` dan
+> `clang`; tidak ada cmake, tidak ada Go, tidak ada Node. Kalau core-nya sedikit
+> atau RAM-nya di bawah 4 GB, script otomatis pakai profil `release-small` dan
+> `-j1` supaya buildnya tidak kena OOM-kill.
+
+Dua pilihan yang ada: `--no-start` (siapkan saja, jangan jalankan) dan
+`--no-pull` (build yang sudah ada di checkout, tanpa jaringan).
+
+`git pull` di situ aman untuk data kamu: `config/config.json`, `data/` dan log
+semuanya ada di `.gitignore`, jadi config hidup, database dan key tidak
+tersentuh. Kalau checkout-mu punya commit atau editan sendiri sehingga tidak
+bisa fast-forward, script-nya bilang dan tetap lanjut build apa yang ada.
+
+Binary rilis di halaman Releases dibuat untuk **arm64** (hampir semua HP sejak
+~2016) dan **armv7** (HP 32-bit) — keduanya binary Android asli, bukan emulasi.
+Installer-nya **tidak** memakai itu; ambil manual kalau memang mau melewati
+compile.
 
 Setelah itu buka **`http://127.0.0.1:8788`** di browser HP. Tab **Setup** yang
 mengurus sisanya — backend, model, tokenizer, tunnel, start/stop/restart,
@@ -1108,6 +1127,10 @@ perintah itu ada di balik satu tombol — di **Overview** dan di **Setup**:
 ```
 git pull --ff-only  →  cargo build  →  exec binary yang baru
 ```
+
+Ini tombol yang setara dengan `bash install.sh` dari terminal, bedanya tombol
+ini tidak menyentuh paket Termux — dia pull, build, lalu restart. Paket naik
+versi cuma lewat `bash install.sh`.
 
 Ketiganya harus ada. `git pull` saja tidak mengubah apa pun yang bisa dilihat
 pemanggil: HTML, CSS, dan JavaScript dashboard **ikut ter-compile ke dalam
