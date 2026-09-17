@@ -11,6 +11,40 @@
 //! project keys and accepts JSON-encoded protobuf (`Content-Type:
 //! application/json`).
 //!
+//! # What makes it v4-ready
+//!
+//! Langfuse v4 is observations-first: there is no separately ingested trace
+//! entity any more, only spans correlated by a trace id, and the queries the
+//! UI and the v2 APIs run read *observations* rather than traces. Four things
+//! follow from that, and this module owes all four.
+//!
+//! * **`x-langfuse-ingestion-version: 4` travels on every POST.** Without it
+//!   Langfuse routes the batch down the legacy compatibility path, where a
+//!   span can take up to fifteen minutes to appear on the v4 data model and
+//!   on the v2 Observations and Metrics APIs. These traces are read while
+//!   somebody is still looking at the request that made one, so that delay is
+//!   the whole value of them gone. A Langfuse too old to know the header
+//!   ignores it, so it is safe to send at a self-hosted host of any version.
+//! * **Input and output sit on the observation, never on the trace.**
+//!   `langfuse.trace.input` and `langfuse.trace.output` are deprecated in v4
+//!   and kept only so that legacy trace-level LLM-as-a-judge evaluators keep
+//!   running. The span sent here *is* the trace's root observation, so
+//!   `langfuse.observation.input`/`output` on it already *are* the overall
+//!   request and response — there is nothing for the deprecated pair to add,
+//!   and adding them back would be starting a dependency on a compatibility
+//!   shim rather than keeping one.
+//! * **Every correlating attribute is on that span.** User, session, trace
+//!   name, tags, release, version and environment are what v4 filters and
+//!   aggregates observations by, and an attribute that exists only on a parent
+//!   is invisible to those queries. One span per trace makes that free — but
+//!   it is exactly why a *second* span added here would have to be given the
+//!   same set rather than inherit it.
+//! * **A span is exported once, after it has ended.** Langfuse v4 does not
+//!   reliably deduplicate a span id it has already accepted; re-exporting one
+//!   to correct it produces a second observation, inflating every count drawn
+//!   from it. Everything a span will ever say is assembled in
+//!   [`Langfuse::record`] and posted exactly once.
+//!
 //! That is also the cheaper of the two here. JSON protobuf means no `prost`,
 //! no build-time code generation and no second HTTP client — `serde_json` and
 //! the `reqwest` already in the tree are the whole dependency list, which on a
@@ -56,6 +90,16 @@ use tokio::sync::mpsc;
 use crate::config::{Config, ConfigStore, LangfuseConfig};
 use crate::logging::Logger;
 use crate::store::RequestRecord;
+
+/// Selects Langfuse's v4 ingestion path for the batch that carries it.
+///
+/// Without this header a directly exported OTLP span goes down the legacy
+/// compatibility path and can be up to fifteen minutes late to the v4 data
+/// model and the v2 Observations and Metrics APIs. A Langfuse that predates
+/// the header ignores it like any other unknown request header, so it costs a
+/// self-hosted deployment on an older version nothing.
+const INGESTION_VERSION_HEADER: &str = "x-langfuse-ingestion-version";
+const INGESTION_VERSION: &str = "4";
 
 /// OTLP span kind: this relay is a client of the backend.
 const SPAN_KIND_CLIENT: i64 = 3;
@@ -431,6 +475,7 @@ impl Exporter {
         let response = client
             .post(lf.traces_url())
             .basic_auth(lf.public_key.trim(), Some(lf.secret_key.trim()))
+            .header(INGESTION_VERSION_HEADER, INGESTION_VERSION)
             .timeout(Duration::from_millis(lf.timeout_ms.clamp(500, 120_000)))
             .json(&payload)
             .send()
@@ -534,6 +579,11 @@ fn otel_span(lf: &LangfuseConfig, span: &Span) -> Value {
     }
     if !span.release.is_empty() {
         attrs.push(attr("langfuse.release", str_value(&span.release)));
+        // The same string under the name v4 groups *observations* by.
+        // `langfuse.release` describes the trace; `langfuse.version` is the
+        // one a query over the observations table can filter on, which is
+        // where "did this regress with the last deploy?" is now asked.
+        attrs.push(attr("langfuse.version", str_value(&span.release)));
     }
     if !span.environment.is_empty() {
         attrs.push(attr("langfuse.environment", str_value(&span.environment)));
@@ -555,13 +605,19 @@ fn otel_span(lf: &LangfuseConfig, span: &Span) -> Value {
     attrs.push(attr("gen_ai.operation.name", str_value("chat")));
 
     /* ---- the words ---- */
+    //
+    // On the observation, and deliberately nowhere else. This span is the
+    // trace's root, and Langfuse reads a root observation's input and output
+    // as the trace's overall pair — so these two already answer "what was
+    // asked, what came back" at both levels. `langfuse.trace.input` and
+    // `langfuse.trace.output` are the deprecated v3 way of saying it, alive
+    // only for trace-level evaluators written before v4; writing them here
+    // would be taking on that shim rather than keeping one.
     if !span.input.is_empty() {
         attrs.push(attr("langfuse.observation.input", str_value(&span.input)));
-        attrs.push(attr("langfuse.trace.input", str_value(&span.input)));
     }
     if !span.output.is_empty() {
         attrs.push(attr("langfuse.observation.output", str_value(&span.output)));
-        attrs.push(attr("langfuse.trace.output", str_value(&span.output)));
     }
 
     /* ---- the numbers ---- */
@@ -907,6 +963,74 @@ mod tests {
         assert_eq!(
             attribute(span, "langfuse.observation.type")["stringValue"],
             "generation"
+        );
+    }
+
+    /// v4 has no trace input or output. The root observation's pair *is* the
+    /// trace's, and the deprecated attributes exist only to keep evaluators
+    /// written before v4 running — so a span that carries them is a span that
+    /// has quietly opted into a compatibility shim.
+    #[test]
+    fn the_overall_words_go_on_the_root_observation_and_not_on_the_trace() {
+        let payload = export_request(&LangfuseConfig::default(), &[span()]);
+        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+
+        // The root observation carries the overall request and response.
+        assert_eq!(
+            attribute(span, "langfuse.observation.input")["stringValue"],
+            "{\"messages\":[]}"
+        );
+        assert_eq!(
+            attribute(span, "langfuse.observation.output")["stringValue"],
+            "hello"
+        );
+        // And this span is a root: nothing parents it, which is what makes
+        // those two the trace's own pair.
+        assert!(
+            span.get("parentSpanId").is_none(),
+            "the one span of a trace has to be its root"
+        );
+
+        for deprecated in ["langfuse.trace.input", "langfuse.trace.output"] {
+            assert!(
+                span["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|a| a["key"] != deprecated),
+                "{deprecated} is deprecated in v4 and must not be sent"
+            );
+        }
+    }
+
+    /// What v4 filters observations by has to be *on the observation*. With one
+    /// span per trace that is free; the test is here so that it stays true if a
+    /// second span is ever added.
+    #[test]
+    fn every_correlating_attribute_rides_on_the_span_itself() {
+        let payload = export_request(&LangfuseConfig::default(), &[span()]);
+        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+
+        assert_eq!(attribute(span, "langfuse.user.id")["stringValue"], "u1");
+        assert_eq!(
+            attribute(span, "langfuse.session.id")["stringValue"],
+            "sess"
+        );
+        assert_eq!(
+            attribute(span, "langfuse.trace.name")["stringValue"],
+            "/v1/chat/completions"
+        );
+        assert_eq!(
+            attribute(span, "langfuse.environment")["stringValue"],
+            "production"
+        );
+        assert_eq!(attribute(span, "langfuse.release")["stringValue"], "2.0.0");
+        // `release` names the deploy on the trace; `version` is the name the
+        // observations table can group by, and it is the same string.
+        assert_eq!(attribute(span, "langfuse.version")["stringValue"], "2.0.0");
+        assert_eq!(
+            attribute(span, "langfuse.trace.tags")["arrayValue"]["values"][0]["stringValue"],
+            "relay"
         );
     }
 

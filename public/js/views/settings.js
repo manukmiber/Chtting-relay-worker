@@ -386,11 +386,17 @@ export async function settingsView(ctx) {
     h('label.switch', {}, i.lfErrors, h('span', { text: 'Trace failures too, whatever the sample rate' })),
     h('label.switch', {}, i.lfIp, h('span', { text: 'The caller’s IP address' })),
     h('p.small.muted', {
-      text: 'Traces go out over OpenTelemetry — Langfuse’s own batch ingestion endpoint '
-        + 'is deprecated and stops accepting traces on Cloud from 16 November 2026. '
-        + 'Nothing is sent on the request path: spans are queued and posted in the '
-        + 'background, and a Langfuse that is down or wrong can never slow a caller '
-        + 'down or fail their request.',
+      text: 'Traces go out over OpenTelemetry, on Langfuse’s v4 ingestion path — its '
+        + 'own batch ingestion endpoint is deprecated and stops accepting traces on '
+        + 'Cloud from 16 November 2026. Nothing is sent on the request path: spans are '
+        + 'queued and posted in the background, and a Langfuse that is down or wrong '
+        + 'can never slow a caller down or fail their request.',
+    }),
+    h('p.small.muted', {
+      text: 'One request is one span, and that span is the trace’s root observation: '
+        + 'its input and output are the overall pair. Langfuse v4 has no trace-level '
+        + 'input or output, so an LLM-as-a-judge evaluator has to be pointed at the '
+        + 'observation rather than the trace.',
     }),
     h('p.small.muted', {
       text: 'Keys never travel. A private key whose upstream identity is the key itself '

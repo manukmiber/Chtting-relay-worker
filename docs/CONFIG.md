@@ -1067,6 +1067,42 @@ It is also the cheaper of the two here. JSON protobuf means no `prost`, no
 build-time code generation and no second HTTP client: `serde_json` and the
 `reqwest` already in the tree are the whole dependency list.
 
+### And on v4's ingestion path, which is a header
+
+Every batch carries `x-langfuse-ingestion-version: 4`. There is nothing to
+configure and no reason to want it off: without that header Langfuse still
+accepts the span, but routes it down the legacy compatibility path, where it can
+be **up to fifteen minutes** late to the v4 data model and to the v2
+Observations and Metrics APIs. These traces get read while somebody is still
+looking at the request that produced one, so a quarter of an hour is the same as
+losing them. A Langfuse old enough not to know the header ignores it like any
+other unknown request header, so a self-hosted `host` on an older version pays
+nothing for it.
+
+What the header does **not** do is make a v3-shaped span v4-ready — that is the
+rest of this section:
+
+* **Input and output live on the observation.** `langfuse.observation.input` and
+  `langfuse.observation.output`, never `langfuse.trace.input`/`output`. v4 has
+  no separate trace entity: a trace is the observations sharing a trace id, and
+  a root observation's input and output *are* the trace's overall pair. The
+  deprecated attributes exist only so that trace-level LLM-as-a-judge
+  evaluators written before v4 keep running; the relay does not send them, so
+  **an evaluator pointed at trace input/output will not fire** — point it at the
+  root observation instead.
+* **Everything a query filters by is on the span itself**, not on a parent:
+  `langfuse.user.id`, `langfuse.session.id`, `langfuse.trace.name`,
+  `langfuse.trace.tags`, `langfuse.environment`, `langfuse.release` and
+  `langfuse.version` (the same string as `release`, under the name the
+  observations table groups by). One request is one span, which is both the
+  root observation and the cost-bearing generation — so this is free today, and
+  it is exactly what a second span added here would have to be given rather
+  than inherit.
+* **A span id is exported once**, after the request has ended. v4 does not
+  reliably deduplicate a span id it has already accepted: re-exporting one to
+  correct it produces a *second* observation and inflates every count drawn
+  from it. Nothing is sent until `record` knows everything the span will say.
+
 ### What a span carries
 
 The four things the backend's own logs cannot tell you:
